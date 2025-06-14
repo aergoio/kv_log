@@ -1,4 +1,4 @@
-package kv3db
+package kv_log
 
 import (
 	"encoding/binary"
@@ -6,7 +6,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/aergoio/kv3db/varint"
+	"github.com/aergoio/kv_log/varint"
 )
 
 const (

@@ -1,4 +1,4 @@
-package kv3db
+package kv_log
 
 import (
 	"bytes"
