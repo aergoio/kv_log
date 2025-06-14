@@ -105,7 +105,7 @@ func TestMultipleKeyValues(t *testing.T) {
 	}()
 
 	// Insert multiple key-value pairs
-	numPairs := 100
+	numPairs := 1000
 	keys := make([][]byte, numPairs)
 	values := make([][]byte, numPairs)
 
@@ -130,7 +130,7 @@ func TestMultipleKeyValues(t *testing.T) {
 	}
 
 	// Update some values
-	for i := 0; i < numPairs; i += 10 {
+	for i := 0; i < numPairs; i += 50 {
 		values[i] = []byte(fmt.Sprintf("updated-value-%d", i))
 		if err := db.Set(keys[i], values[i]); err != nil {
 			t.Fatalf("Failed to update key %d: %v", i, err)
@@ -138,7 +138,7 @@ func TestMultipleKeyValues(t *testing.T) {
 	}
 
 	// Verify updated keys
-	for i := 0; i < numPairs; i += 10 {
+	for i := 0; i < numPairs; i += 50 {
 		result, err := db.Get(keys[i])
 		if err != nil {
 			t.Fatalf("Failed to get updated key %d: %v", i, err)

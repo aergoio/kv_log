@@ -579,14 +579,16 @@ func (db *DB) createIndexPage(salt uint8) (*IndexPage, error) {
 func hashKey(key []byte, salt uint8) uint64 {
 	// Simple FNV-1a hash implementation
 	hash := uint64(14695981039346656037)
+
+	// Process the salt
+	hash ^= uint64(salt)
+	hash *= 1099511628211
+
+	// Process the key
 	for _, b := range key {
 		hash ^= uint64(b)
 		hash *= 1099511628211
 	}
-
-	// Mix in the salt
-	hash ^= uint64(salt)
-	hash *= 1099511628211
 
 	return hash
 }
