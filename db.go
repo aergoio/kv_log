@@ -63,6 +63,8 @@ type Content struct {
 	contentType uint8
 	offset      int64 // File offset where this content is stored
 	data        []byte
+	key         []byte // Parsed key for ContentTypeData
+	value       []byte // Parsed value for ContentTypeData
 }
 
 // IndexPage represents an index page with entries
@@ -219,12 +221,11 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 
 		if content.contentType == ContentTypeData {
 			// It's data content, check if key exists
-			found, existingValue, err := db.findKeyInContent(content, key)
-			if err != nil {
-				return err
-			}
+			existingKey := content.key
+			existingValue := content.value
 
-			if found {
+			// Compare the existing key with the new key
+			if equal(existingKey, key) {
 				// Key exists, check if value is the same
 				if equal(existingValue, value) {
 					// Value is the same, no need to update
@@ -251,12 +252,6 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 				return err
 			}
 
-			// Read the existing key-value pair from the content
-			existingKey, _, err := db.extractKeyValueFromContent(content)
-			if err != nil {
-				return err
-			}
-
 			// Append the new key-value pair at the end of the file
 			newDataOffset, err := db.appendData(key, value)
 			if err != nil {
@@ -279,6 +274,8 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 				if slot1 != slot2 {
 					break
 				}
+
+				debugPrint(" --> hash collision for keys %s and %s \n", string(existingKey), string(key))
 
 				// Slots collided, try a different salt
 				newSalt = generateNewSalt(newSalt)
@@ -342,90 +339,6 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 	return nil
 }
 
-// findKeyInContent finds a key in content data
-func (db *DB) findKeyInContent(content *Content, key []byte) (bool, []byte, error) {
-	// Skip the content type byte
-	offset := 1
-
-	// Read key length
-	keyLength64, bytesRead := varint.Read(content.data[offset:])
-	if bytesRead == 0 || keyLength64 == 0 || keyLength64 > MaxKeyLength {
-		return false, nil, fmt.Errorf("corrupted data content")
-	}
-	keyLength := int(keyLength64)
-	offset += bytesRead
-
-	// Check if we have enough bytes for the key
-	if offset+keyLength > len(content.data) {
-		return false, nil, fmt.Errorf("corrupted data content")
-	}
-
-	// Check if key matches
-	if keyLength == len(key) && equal(content.data[offset:offset+keyLength], key) {
-		offset += keyLength
-
-		// Read value length
-		valueLength64, bytesRead := varint.Read(content.data[offset:])
-		if bytesRead == 0 {
-			return false, nil, fmt.Errorf("corrupted data content")
-		}
-		valueLength := int(valueLength64)
-		offset += bytesRead
-
-		// Read value
-		if offset+valueLength > len(content.data) {
-			return false, nil, fmt.Errorf("corrupted data content")
-		}
-		value := make([]byte, valueLength)
-		copy(value, content.data[offset:offset+valueLength])
-
-		return true, value, nil
-	}
-
-	return false, nil, nil
-}
-
-// extractKeyValueFromContent extracts the key-value pair from content data
-func (db *DB) extractKeyValueFromContent(content *Content) ([]byte, []byte, error) {
-	// Skip the content type byte
-	offset := 1
-
-	// Read key length
-	keyLength64, bytesRead := varint.Read(content.data[offset:])
-	if bytesRead == 0 || keyLength64 == 0 || keyLength64 > MaxKeyLength {
-		return nil, nil, fmt.Errorf("corrupted data content")
-	}
-	keyLength := int(keyLength64)
-	offset += bytesRead
-
-	// Check if we have enough bytes for the key
-	if offset+keyLength > len(content.data) {
-		return nil, nil, fmt.Errorf("corrupted data content")
-	}
-
-	// Extract key
-	key := make([]byte, keyLength)
-	copy(key, content.data[offset:offset+keyLength])
-	offset += keyLength
-
-	// Read value length
-	valueLength64, bytesRead := varint.Read(content.data[offset:])
-	if bytesRead == 0 {
-		return nil, nil, fmt.Errorf("corrupted data content")
-	}
-	valueLength := int(valueLength64)
-	offset += bytesRead
-
-	// Extract value
-	if offset+valueLength > len(content.data) {
-		return nil, nil, fmt.Errorf("corrupted data content")
-	}
-	value := make([]byte, valueLength)
-	copy(value, content.data[offset:offset+valueLength])
-
-	return key, value, nil
-}
-
 // Get retrieves a value for the given key
 func (db *DB) Get(key []byte) ([]byte, error) {
 	db.mu.RLock()
@@ -487,16 +400,10 @@ func (db *DB) getFromIndex(key []byte, indexPage *IndexPage, salt uint8, forcedS
 	}
 
 	if content.contentType == ContentTypeData {
-		// It's data content, search for key
-		found, value, err := db.findKeyInContent(content, key)
-		if err != nil {
-			return nil, err
+		// It's data content, check if key matches
+		if equal(content.key, key) {
+			return content.value, nil
 		}
-
-		if found {
-			return value, nil
-		}
-
 		return nil, fmt.Errorf("key not found")
 
 	} else if content.contentType == ContentTypeIndex {
@@ -801,19 +708,22 @@ func (db *DB) readContent(offset uint64) (*Content, error) {
 	}
 
 	contentType := typeBuffer[0]
-
-	var buffer []byte
-	var n int
-	var err error
+	content := &Content{
+		contentType: contentType,
+		offset:      int64(offset),
+	}
 
 	if contentType == ContentTypeIndex {
 		// For index pages, read exactly PageSize bytes
-		buffer = make([]byte, PageSize)
-		n, err = db.file.ReadAt(buffer, int64(offset))
-	} else if contentType == ContentTypeData {
-		// For data content, use incremental reading approach to handle keys of any size
+		buffer := make([]byte, PageSize)
+		n, err := db.file.ReadAt(buffer, int64(offset))
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("failed to read content: %w", err)
+		}
+		content.data = buffer[:n]
 
-		// Step 1: Read a small chunk to get the key length
+	} else if contentType == ContentTypeData {
+		// Read a small chunk to get the key length
 		initialBuffer := make([]byte, 10) // Enough for type + varint key length in most cases
 		_, err := db.file.ReadAt(initialBuffer, int64(offset))
 		if err != nil && err != io.EOF {
@@ -832,7 +742,7 @@ func (db *DB) readContent(offset uint64) (*Content, error) {
 			return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
 		}
 
-		// Step 2: Read enough to get key + value length
+		// Read enough to get key + value length
 		headerSize := 1 + bytesRead + keyLength + 10 // type + key length varint + key + estimated value length varint
 		headerBuffer := make([]byte, headerSize)
 		headerRead, err := db.file.ReadAt(headerBuffer, int64(offset))
@@ -845,8 +755,11 @@ func (db *DB) readContent(offset uint64) (*Content, error) {
 			return nil, fmt.Errorf("failed to read complete key data")
 		}
 
+		// Calculate key offset
+		keyOffset := 1 + bytesRead
+
 		// Parse value length
-		valueLengthOffset := 1 + bytesRead + keyLength
+		valueLengthOffset := keyOffset + keyLength
 		valueLength64, valueBytesRead := varint.Read(headerBuffer[valueLengthOffset:])
 		if valueBytesRead == 0 {
 			return nil, fmt.Errorf("failed to parse value length")
@@ -857,23 +770,32 @@ func (db *DB) readContent(offset uint64) (*Content, error) {
 			return nil, fmt.Errorf("value length exceeds maximum allowed size: %d", valueLength)
 		}
 
-		// Step 3: Calculate total size and read entire content
-		totalSize := valueLengthOffset + valueBytesRead + valueLength
-		buffer = make([]byte, totalSize)
-		n, err = db.file.ReadAt(buffer, int64(offset))
+		// Calculate value offset
+		valueOffset := valueLengthOffset + valueBytesRead
+
+		// Calculate total size needed
+		totalSize := valueOffset + valueLength
+
+		// Read all data at once
+		buffer := make([]byte, totalSize)
+		n, err := db.file.ReadAt(buffer, int64(offset))
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("failed to read content: %w", err)
+		}
+
+		// Make sure we got all the data
+		if n < totalSize {
+			return nil, fmt.Errorf("failed to read complete content data")
+		}
+
+		// Store the full data buffer
+		content.data = buffer
+
+		// Set key and value as slices that reference the original buffer
+		content.key = buffer[keyOffset:keyOffset+keyLength]
+		content.value = buffer[valueOffset:valueOffset+valueLength]
 	} else {
 		return nil, fmt.Errorf("unknown content type: %c", contentType)
-	}
-
-	if err != nil && err != io.EOF {
-		return nil, fmt.Errorf("failed to read content: %w", err)
-	}
-
-	// Create the content object
-	content := &Content{
-		contentType: contentType,
-		offset:      int64(offset),
-		data:        buffer[:n],
 	}
 
 	return content, nil
