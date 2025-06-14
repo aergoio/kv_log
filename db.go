@@ -644,6 +644,11 @@ func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 	offset := int64(indexPage.pageNum - 1) * PageSize
 	debugPrint("Writing index page to disk %d, offset %d\n", indexPage.pageNum, offset)
 	_, err := db.file.WriteAt(indexPage.data, offset)
+
+	// If the page was written successfully, mark it as clean
+	if err == nil {
+		indexPage.Dirty = false
+	}
 	return err
 }
 
