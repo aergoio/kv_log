@@ -21,10 +21,10 @@ const (
 	IndexHeaderSize = 2
 	// Maximum number of entries in index page
 	MaxIndexEntries = (PageSize - IndexHeaderSize) / 8 // 8 = offset pointer size
-	// Magic number for database identification
-	MagicNumber uint32 = 0x48544854 // "HTHT" in ASCII
-	// Database version
-	Version uint32 = 1
+	// Magic string for database identification (5 bytes)
+	MagicString string = "KVLOG"
+	// Database version (3 bytes as a string)
+	VersionString string = "\x00\x00\x01"
 	// Number of pages in main index
 	DefaultMainIndexPages = 256 // 1 MB / 4096 bytes per page
 	// Initial salt
@@ -429,8 +429,12 @@ func (db *DB) initialize() error {
 
 	// Write file header (8 bytes) in root page (page 1)
 	rootPage := make([]byte, PageSize)
-	binary.LittleEndian.PutUint32(rootPage[0:4], MagicNumber)
-	binary.LittleEndian.PutUint32(rootPage[4:8], Version)
+
+	// Write the 5-byte magic string
+	copy(rootPage[0:5], MagicString)
+
+	// Write the 3-byte version
+	copy(rootPage[5:8], VersionString)
 
 	// The rest of the root page is reserved for future use
 
@@ -468,15 +472,18 @@ func (db *DB) readHeader() error {
 		return err
 	}
 
-	magic := binary.LittleEndian.Uint32(header[0:4])
-	version := binary.LittleEndian.Uint32(header[4:8])
+	// Extract magic string (5 bytes)
+	fileMagic := string(header[0:5])
 
-	if magic != MagicNumber {
+	// Extract version (3 bytes)
+	fileVersion := string(header[5:8])
+
+	if fileMagic != MagicString {
 		return fmt.Errorf("invalid database file format")
 	}
 
-	if version != Version {
-		return fmt.Errorf("unsupported database version: %d", version)
+	if fileVersion != VersionString {
+		return fmt.Errorf("unsupported database version")
 	}
 
 	return nil
