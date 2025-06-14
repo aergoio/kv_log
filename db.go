@@ -68,7 +68,6 @@ type IndexPage struct {
 	Page     // Embed the base Page
 	Salt     uint8
 	Dirty    bool
-	Entries  [MaxIndexEntries]uint32
 }
 
 // Options represents configuration options for the database
@@ -214,9 +213,10 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 	}
 
 	// Check if the slot is already used
-	if indexPage.Entries[slot] != 0 {
+	pageNum := db.readIndexEntry(indexPage, slot)
+	if pageNum != 0 {
 		// Slot is used, check if it's a data page or another index page
-		targetPage, err := db.readPage(indexPage.Entries[slot])
+		targetPage, err := db.readPage(pageNum)
 		if err != nil {
 			return fmt.Errorf("failed to read target page: %w", err)
 		}
@@ -265,8 +265,7 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 	}
 
 	// Update index entry
-	indexPage.Entries[slot] = dataPage.pageNum
-	indexPage.Dirty = true
+	db.writeIndexEntry(indexPage, slot, dataPage.pageNum)
 
 	// Write the index page on the caller function
 	return nil
@@ -467,12 +466,13 @@ func (db *DB) getFromIndex(key []byte, page *Page, salt uint8, forcedSlot ...int
 	}
 
 	// Check if slot has an entry
-	if indexPage.Entries[slot] == 0 {
+	pageNum := db.readIndexEntry(indexPage, slot)
+	if pageNum == 0 {
 		return nil, fmt.Errorf("key not found")
 	}
 
 	// Read the target page
-	targetPage, err := db.readPage(indexPage.Entries[slot])
+	targetPage, err := db.readPage(pageNum)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read target page: %w", err)
 	}
@@ -599,21 +599,7 @@ func (db *DB) parseIndexPage(page *Page) (*IndexPage, error) {
 			pageNum:  page.pageNum,
 			data:     page.data,
 		},
-		Salt:    page.data[1],
-	}
-
-	// Read entries from the data
-	entrySize := 4 // 4 bytes for page number
-
-	// Read all entries from the page
-	for i := 0; i < MaxIndexEntries; i++ {
-		offset := IndexHeaderSize + (i * entrySize)
-		if offset+entrySize > len(indexPage.data) {
-			break
-		}
-
-		pageNum := binary.LittleEndian.Uint32(indexPage.data[offset:offset+4])
-		indexPage.Entries[i] = pageNum
+		Salt: page.data[1],
 	}
 
 	return indexPage, nil
@@ -644,17 +630,6 @@ func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 	// Set page type and salt in the data
 	indexPage.data[0] = PageTypeIndex  // Type identifier
 	indexPage.data[1] = indexPage.Salt // Salt for index pages
-
-	// Write entries
-	entrySize := 4 // 4 bytes for page number
-	for i := 0; i < MaxIndexEntries; i++ {
-		offset := IndexHeaderSize + (i * entrySize)
-		if offset+entrySize > PageSize {
-			return fmt.Errorf("index page overflow")
-		}
-
-		binary.LittleEndian.PutUint32(indexPage.data[offset:offset+4], indexPage.Entries[i])
-	}
 
 	// If page number is 0, allocate a new page number
 	if indexPage.pageNum == 0 {
@@ -995,4 +970,26 @@ func equal(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// readIndexEntry reads an index entry from the specified slot in an index page
+func (db *DB) readIndexEntry(indexPage *IndexPage, slot int) uint32 {
+	if slot < 0 || slot >= MaxIndexEntries {
+		return 0
+	}
+
+	offset := IndexHeaderSize + (slot * 4) // 4 bytes for page number
+	return binary.LittleEndian.Uint32(indexPage.data[offset:offset+4])
+}
+
+// writeIndexEntry writes an index entry to the specified slot in an index page
+func (db *DB) writeIndexEntry(indexPage *IndexPage, slot int, pageNum uint32) {
+	if slot < 0 || slot >= MaxIndexEntries {
+		return
+	}
+
+	offset := IndexHeaderSize + (slot * 4) // 4 bytes for page number
+	binary.LittleEndian.PutUint32(indexPage.data[offset:offset+4], pageNum)
+
+	indexPage.Dirty = true
 }
