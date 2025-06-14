@@ -142,6 +142,12 @@ func (db *DB) Close() error {
 	return nil
 }
 
+// Delete removes a key from the database
+func (db *DB) Delete(key []byte) error {
+	// Call Set with nil value to mark as deleted
+	return db.Set(key, nil)
+}
+
 // Set sets a key-value pair in the database
 func (db *DB) Set(key, value []byte) error {
 	db.mu.Lock()
@@ -210,6 +216,9 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 		return fmt.Errorf("slot index is out of range: %d", slot)
 	}
 
+	// If value is nil, we're deleting the key
+	isDelete := value == nil
+
 	// Check if the slot is already used
 	contentOffset := db.readIndexEntry(indexPage, slot)
 	if contentOffset != 0 {
@@ -220,13 +229,21 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 		}
 
 		if content.contentType == ContentTypeData {
-			// It's data content, check if key exists
+			// It's data content, check the key
 			existingKey := content.key
 			existingValue := content.value
 
 			// Compare the existing key with the new key
 			if equal(existingKey, key) {
-				// Key exists, check if value is the same
+				// Key found
+
+				// If we're deleting, just zero out the index entry
+				if isDelete {
+					db.writeIndexEntry(indexPage, slot, 0)
+					return nil
+				}
+
+				// Check if value is the same
 				if equal(existingValue, value) {
 					// Value is the same, no need to update
 					return nil
@@ -242,6 +259,11 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 				db.writeIndexEntry(indexPage, slot, newOffset)
 
 				// Write the index page on the caller function
+				return nil
+			}
+
+			if isDelete {
+				// Key not found, nothing to do
 				return nil
 			}
 
@@ -324,6 +346,11 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 			// Write the parent index page on the caller function
 			return nil
 		}
+	}
+
+	// For deletion, if we got here the key doesn't exist, so nothing to do
+	if isDelete {
+		return nil
 	}
 
 	// Slot is available, append the data and update the index

@@ -85,6 +85,33 @@ func TestDatabaseBasicOperations(t *testing.T) {
 	if !bytes.Equal(updatedNameVal, []byte("hash-table-tree DB")) {
 		t.Fatalf("Updated value mismatch for 'name': got %s, want %s", string(updatedNameVal), "hash-table-tree DB")
 	}
+
+	// Test deleting a key
+	err = db.Delete([]byte("author"))
+	if err != nil {
+		t.Fatalf("Failed to delete 'author': %v", err)
+	}
+
+	// Verify the key was deleted
+	_, err = db.Get([]byte("author"))
+	if err == nil {
+		t.Fatalf("Expected error when getting deleted key 'author', got nil")
+	}
+
+	// Verify other keys still exist
+	nameVal, err = db.Get([]byte("name"))
+	if err != nil {
+		t.Fatalf("Failed to get 'name' after deletion: %v", err)
+	}
+	if !bytes.Equal(nameVal, []byte("hash-table-tree DB")) {
+		t.Fatalf("Value mismatch for 'name' after deletion: got %s, want %s", string(nameVal), "hash-table-tree DB")
+	}
+
+	// Test deleting a non-existent key (should not error)
+	err = db.Delete([]byte("unknown"))
+	if err != nil {
+		t.Fatalf("Failed to delete non-existent key: %v", err)
+	}
 }
 
 func TestMultipleKeyValues(t *testing.T) {
@@ -146,5 +173,160 @@ func TestMultipleKeyValues(t *testing.T) {
 		if !bytes.Equal(result, values[i]) {
 			t.Fatalf("Updated value mismatch for key %d: got %s, want %s", i, string(result), string(values[i]))
 		}
+	}
+
+	// Delete every third key
+	for i := 0; i < numPairs; i += 3 {
+		if err := db.Delete(keys[i]); err != nil {
+			t.Fatalf("Failed to delete key %d: %v", i, err)
+		}
+	}
+
+	// Verify deleted keys are gone
+	for i := 0; i < numPairs; i += 3 {
+		_, err := db.Get(keys[i])
+		if err == nil {
+			t.Fatalf("Expected error when getting deleted key %d, got nil", i)
+		}
+	}
+
+	// Verify non-deleted keys still exist
+	for i := 1; i < numPairs; i += 3 {
+		result, err := db.Get(keys[i])
+		if err != nil {
+			t.Fatalf("Failed to get key %d after deletions: %v", i, err)
+		}
+		if !bytes.Equal(result, values[i]) {
+			t.Fatalf("Value mismatch for key %d after deletions: got %s, want %s", i, string(result), string(values[i]))
+		}
+	}
+
+	// Test deleting already deleted keys (should not error)
+	for i := 0; i < numPairs; i += 6 {
+		if err := db.Delete(keys[i]); err != nil {
+			t.Fatalf("Failed to delete already deleted key %d: %v", i, err)
+		}
+	}
+}
+
+func TestDeleteOperations(t *testing.T) {
+	// Create a test database
+	dbPath := "test_delete.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+
+	// Open a new database
+	db, err := Open(dbPath, Options{"MainIndexPages": 1})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath) // Clean up after test
+	}()
+
+	// Set up some test data
+	testData := map[string]string{
+		"key1": "value1",
+		"key2": "value2",
+		"key3": "value3",
+		"key4": "value4",
+		"key5": "value5",
+	}
+
+	// Insert all test data
+	for k, v := range testData {
+		err := db.Set([]byte(k), []byte(v))
+		if err != nil {
+			t.Fatalf("Failed to set '%s': %v", k, err)
+		}
+	}
+
+	// Verify all data was inserted correctly
+	for k, v := range testData {
+		result, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to get '%s': %v", k, err)
+		}
+		if !bytes.Equal(result, []byte(v)) {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", k, string(result), v)
+		}
+	}
+
+	// Test 1: Delete a key and verify it's gone
+	err = db.Delete([]byte("key1"))
+	if err != nil {
+		t.Fatalf("Failed to delete 'key1': %v", err)
+	}
+
+	_, err = db.Get([]byte("key1"))
+	if err == nil {
+		t.Fatalf("Expected error when getting deleted key 'key1', got nil")
+	}
+
+	// Test 2: Delete a key, then try to set it again
+	err = db.Delete([]byte("key2"))
+	if err != nil {
+		t.Fatalf("Failed to delete 'key2': %v", err)
+	}
+
+	// Verify key2 is deleted
+	_, err = db.Get([]byte("key2"))
+	if err == nil {
+		t.Fatalf("Expected error when getting deleted key 'key2', got nil")
+	}
+
+	// Set key2 again with a new value
+	err = db.Set([]byte("key2"), []byte("new-value2"))
+	if err != nil {
+		t.Fatalf("Failed to set 'key2' after deletion: %v", err)
+	}
+
+	// Verify key2 has the new value
+	result, err := db.Get([]byte("key2"))
+	if err != nil {
+		t.Fatalf("Failed to get 'key2' after re-setting: %v", err)
+	}
+	if !bytes.Equal(result, []byte("new-value2")) {
+		t.Fatalf("Value mismatch for 'key2' after re-setting: got %s, want %s", string(result), "new-value2")
+	}
+
+	// Test 3: Delete multiple keys
+	keysToDelete := []string{"key3", "key4"}
+	for _, k := range keysToDelete {
+		err := db.Delete([]byte(k))
+		if err != nil {
+			t.Fatalf("Failed to delete '%s': %v", k, err)
+		}
+	}
+
+	// Verify deleted keys are gone
+	for _, k := range keysToDelete {
+		_, err := db.Get([]byte(k))
+		if err == nil {
+			t.Fatalf("Expected error when getting deleted key '%s', got nil", k)
+		}
+	}
+
+	// Verify key5 still exists
+	result, err = db.Get([]byte("key5"))
+	if err != nil {
+		t.Fatalf("Failed to get 'key5' after other deletions: %v", err)
+	}
+	if !bytes.Equal(result, []byte("value5")) {
+		t.Fatalf("Value mismatch for 'key5' after other deletions: got %s, want %s", string(result), "value5")
+	}
+
+	// Test 4: Delete a non-existent key (should not error)
+	err = db.Delete([]byte("nonexistent"))
+	if err != nil {
+		t.Fatalf("Failed to delete non-existent key: %v", err)
+	}
+
+	// Test 5: Delete an already deleted key (should not error)
+	err = db.Delete([]byte("key3"))
+	if err != nil {
+		t.Fatalf("Failed to delete already deleted key: %v", err)
 	}
 }
