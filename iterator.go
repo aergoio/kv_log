@@ -56,6 +56,14 @@ func (it *DBIterator) Next() {
 		// Update the stack
 		it.stack[len(it.stack)-1] = pos
 
+		// Check if the offset is valid
+		if pos.offset < 0 || pos.offset >= it.db.fileSize {
+			// Invalid offset, pop it from the stack and continue
+			it.stack = it.stack[:len(it.stack)-1]
+			it.Next()
+			return
+		}
+
 		// Read the index page
 		indexPage, err := it.db.readIndexPage(pos.offset)
 		if err != nil {
@@ -69,6 +77,14 @@ func (it *DBIterator) Next() {
 		for pos.slot < MaxIndexEntries {
 			contentOffset := it.db.readIndexEntry(indexPage, pos.slot)
 			if contentOffset != 0 {
+				// Check if the offset is valid
+				if contentOffset < 0 || contentOffset >= it.db.fileSize {
+					// Invalid offset, move to the next slot
+					pos.slot++
+					it.stack[len(it.stack)-1] = pos
+					continue
+				}
+
 				// Found an entry, process it
 				content, err := it.db.readContent(contentOffset)
 				if err == nil {
@@ -81,7 +97,7 @@ func (it *DBIterator) Next() {
 					} else if content.contentType == ContentTypeIndex {
 						// It's an index page, push it to the stack
 						it.stack = append(it.stack, iterPos{
-							offset: int64(contentOffset),
+							offset: contentOffset,
 							slot:   -1, // Start at -1 so we'll move to slot 0
 						})
 						// Process this new index page
@@ -123,6 +139,14 @@ func (it *DBIterator) Next() {
 		// Calculate the offset of the current main index page
 		pageOffset := int64(it.currentPage + 1) * PageSize
 
+		// Check if page offset is valid
+		if pageOffset >= it.db.fileSize {
+			// Invalid offset, move to the next page
+			it.currentPage++
+			it.currentSlot = -1 // Start at -1 so we'll move to slot 0
+			continue
+		}
+
 		// Read the index page
 		indexPage, err := it.db.readIndexPage(pageOffset)
 		if err != nil {
@@ -136,6 +160,12 @@ func (it *DBIterator) Next() {
 		contentOffset := it.db.readIndexEntry(indexPage, it.currentSlot)
 		if contentOffset == 0 {
 			// Empty slot, continue
+			continue
+		}
+
+		// Check if content offset is valid
+		if contentOffset < 0 || contentOffset >= it.db.fileSize {
+			// Invalid offset, continue
 			continue
 		}
 
@@ -155,7 +185,7 @@ func (it *DBIterator) Next() {
 		} else if content.contentType == ContentTypeIndex {
 			// It's an index page, push it to the stack
 			it.stack = append(it.stack, iterPos{
-				offset: int64(contentOffset),
+				offset: contentOffset,
 				slot:   -1, // Start at -1 so we'll move to slot 0
 			})
 			// Process this index page
