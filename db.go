@@ -19,7 +19,7 @@ const (
 	// Base header size (just type identifier)
 	BaseHeaderSize = 1
 	// Index page header size (type identifier + salt)
-	IndexHeaderSize = 2
+	IndexHeaderSize = 8
 	// Maximum number of entries in index page
 	MaxIndexEntries = (PageSize - IndexHeaderSize) / 8 // 8 = offset pointer size
 	// Magic string for database identification (6 bytes)
