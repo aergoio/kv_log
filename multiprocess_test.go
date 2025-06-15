@@ -110,9 +110,6 @@ func TestMultiProcessAccess(t *testing.T) {
 	if err == nil {
 		// If readers are using shared locks, writer with exclusive lock should fail
 		t.Errorf("Writer with exclusive lock unexpectedly succeeded: %s", writerOutput.String())
-	} else {
-		// This is expected - writer should fail to acquire exclusive lock
-		t.Logf("Writer with exclusive lock failed as expected: %s", writerOutput.String())
 	}
 
 	// Wait for readers to finish
@@ -158,31 +155,21 @@ func TestMultiProcessAccess(t *testing.T) {
 		// Wait for all processes to finish
 		for i, cmd := range writerCmds {
 			err := cmd.Wait()
-			stdout := cmd.Stdout.(*bytes.Buffer).String()
-			stderr := cmd.Stderr.(*bytes.Buffer).String()
-
 			if err != nil {
-				// Some writers may fail due to lock contention - this is expected
-				t.Logf("Writer %d failed (may be expected due to lock contention): %v", i, err)
-				t.Logf("Writer %d output: %s", i, stdout)
-				t.Logf("Writer %d error: %s", i, stderr)
-			} else {
-				t.Logf("Writer %d completed successfully", i)
+				// Only log failures that are unexpected
+				stdout := cmd.Stdout.(*bytes.Buffer).String()
+				stderr := cmd.Stderr.(*bytes.Buffer).String()
+				t.Errorf("Writer %d failed unexpectedly: %v\nStdout: %s\nStderr: %s", i, err, stdout, stderr)
 			}
 		}
 
 		for i, cmd := range concurrentReaderCmds {
 			err := cmd.Wait()
-			stdout := cmd.Stdout.(*bytes.Buffer).String()
-			stderr := cmd.Stderr.(*bytes.Buffer).String()
-
 			if err != nil {
-				// Some readers may fail due to lock contention - this is expected
-				t.Logf("Reader %d failed (may be expected due to lock contention): %v", i, err)
-				t.Logf("Reader %d output: %s", i, stdout)
-				t.Logf("Reader %d error: %s", i, stderr)
-			} else {
-				t.Logf("Reader %d completed successfully", i)
+				// Only log failures that are unexpected
+				stdout := cmd.Stdout.(*bytes.Buffer).String()
+				stderr := cmd.Stderr.(*bytes.Buffer).String()
+				t.Errorf("Reader %d failed unexpectedly: %v\nStdout: %s\nStderr: %s", i, err, stdout, stderr)
 			}
 		}
 	})
@@ -198,7 +185,7 @@ func TestMultiProcessAccess(t *testing.T) {
 	for i, key := range initialKeys {
 		value, err := finalDB.Get([]byte(key))
 		if err != nil {
-			t.Logf("Note: Key %s might have been deleted during concurrent operations", key)
+			// Key might have been deleted during concurrent operations - this is expected
 			continue
 		}
 
@@ -212,13 +199,9 @@ func TestMultiProcessAccess(t *testing.T) {
 	// Check if the writer-key exists (at least one writer should have succeeded)
 	newValue, err := finalDB.Get([]byte("writer-key"))
 	if err != nil {
-		t.Logf("Note: writer-key not found, possibly no writer succeeded")
-	} else {
-		if !bytes.Contains(newValue, []byte("writer-value")) {
-			t.Fatalf("Value mismatch for writer-key: %s", string(newValue))
-		} else {
-			t.Logf("Found writer-key with value: %s", string(newValue))
-		}
+		t.Errorf("No writer succeeded in writing writer-key")
+	} else if !bytes.Contains(newValue, []byte("writer-value")) {
+		t.Fatalf("Value mismatch for writer-key: %s", string(newValue))
 	}
 }
 

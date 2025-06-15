@@ -144,7 +144,8 @@ func TestConcurrentAccess(t *testing.T) {
 		key := fmt.Sprintf("init-key-%d", i)
 		_, err := db.Get([]byte(key))
 		if err != nil {
-			t.Logf("Note: Key %s was deleted during concurrent operations", key)
+			// Key might have been deleted during concurrent operations - this is expected
+			continue
 		}
 	}
 
@@ -197,8 +198,6 @@ func TestConcurrentReadersWithExclusiveWriter(t *testing.T) {
 	_, err = Open(dbPath, Options{"LockType": LockShared})
 	if err == nil {
 		t.Fatalf("Expected error when opening database with shared lock while exclusive lock is held")
-	} else {
-		t.Logf("Correctly got error when trying to open with shared lock: %v", err)
 	}
 
 	// Try to open the same database with no lock (should succeed for reading)
@@ -223,10 +222,8 @@ func TestConcurrentReadersWithExclusiveWriter(t *testing.T) {
 
 	// Try to write to the database with no lock (should succeed but might corrupt data)
 	err = readerDB.Set([]byte("test-key"), []byte("test-value"))
-	if err != nil {
-		t.Logf("Got error when trying to write with no lock: %v", err)
-	} else {
-		t.Logf("Warning: Write with no lock succeeded, but this might lead to data corruption")
+	if err == nil {
+		t.Errorf("Write with no lock unexpectedly succeeded, this might lead to data corruption")
 	}
 }
 
@@ -285,16 +282,12 @@ func TestReadOnlyMode(t *testing.T) {
 	err = readDB.Set([]byte("new-key"), []byte("new-value"))
 	if err == nil {
 		t.Fatalf("Expected error when writing in read-only mode, but got nil")
-	} else {
-		t.Logf("Correctly got error when trying to write in read-only mode: %v", err)
 	}
 
 	// Try to delete data (should fail)
 	err = readDB.Delete([]byte("key-0"))
 	if err == nil {
 		t.Fatalf("Expected error when deleting in read-only mode, but got nil")
-	} else {
-		t.Logf("Correctly got error when trying to delete in read-only mode: %v", err)
 	}
 
 	// Test multiple read-only connections
