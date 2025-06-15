@@ -746,16 +746,12 @@ func (db *DB) readIndexPage(offset int64) (*IndexPage, error) {
 
 	// Verify CRC32 checksum
 	storedChecksum := binary.BigEndian.Uint32(data[4:8])
-
 	// Zero out the checksum field for calculation
 	binary.BigEndian.PutUint32(data[4:8], 0)
-
 	// Calculate the checksum
 	calculatedChecksum := crc32.ChecksumIEEE(data)
-
 	// Restore the original checksum in the data
 	binary.BigEndian.PutUint32(data[4:8], storedChecksum)
-
 	// Verify the checksum
 	if storedChecksum != calculatedChecksum {
 		return nil, fmt.Errorf("index page checksum mismatch at offset %d: stored=%d, calculated=%d", offset, storedChecksum, calculatedChecksum)
@@ -801,10 +797,8 @@ func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
 	// Zero out the checksum field before calculating
 	binary.BigEndian.PutUint32(indexPage.data[4:8], 0)
-
 	// Calculate checksum of the entire page
 	checksum := crc32.ChecksumIEEE(indexPage.data)
-
 	// Write the checksum at position 4
 	binary.BigEndian.PutUint32(indexPage.data[4:8], checksum)
 
@@ -919,13 +913,7 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 	}
 
 	if contentType == ContentTypeIndex {
-		// For index pages, read exactly PageSize bytes
-		buffer := make([]byte, PageSize)
-		n, err := db.file.ReadAt(buffer, offset)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("failed to read content: %w", err)
-		}
-		content.data = buffer[:n]
+		// Let the caller read the index page
 
 	} else if contentType == ContentTypeData {
 		// Read a small chunk to get the key length
