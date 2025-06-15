@@ -555,6 +555,24 @@ func (db *DB) readIndexPage(offset int64) (*IndexPage, error) {
 	return indexPage, nil
 }
 
+// createIndexPage creates a new empty index page
+func (db *DB) createIndexPage(salt uint8) (*IndexPage, error) {
+
+	data := make([]byte, PageSize)
+	data[0] = ContentTypeIndex // Set content type in header
+	data[1] = salt             // Set salt in header
+
+	indexPage := &IndexPage{
+		Content: Content{
+			contentType: ContentTypeIndex,
+			data:        data,
+		},
+		Salt: salt,
+	}
+
+	return indexPage, nil
+}
+
 // writeIndexPage writes an index page to the database file
 func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 	// Set page type and salt in the data
@@ -599,104 +617,6 @@ func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 		indexPage.Dirty = false
 	}
 	return err
-}
-
-// createIndexPage creates a new empty index page
-func (db *DB) createIndexPage(salt uint8) (*IndexPage, error) {
-
-	data := make([]byte, PageSize)
-	data[0] = ContentTypeIndex // Set content type in header
-	data[1] = salt          // Set salt in header
-
-	indexPage := &IndexPage{
-		Content: Content{
-			contentType: ContentTypeIndex,
-			data:        data,
-		},
-		Salt:    salt,
-	}
-
-	return indexPage, nil
-}
-
-// Utility functions
-
-// hashKey hashes the key with the given salt
-func hashKey(key []byte, salt uint8) uint64 {
-	// Simple FNV-1a hash implementation
-	hash := uint64(14695981039346656037)
-
-	// Process the salt
-	hash ^= uint64(salt)
-	hash *= 1099511628211
-
-	// Process the key
-	for _, b := range key {
-		hash ^= uint64(b)
-		hash *= 1099511628211
-	}
-
-	return hash
-}
-
-// generateNewSalt generates a new salt that's different from the old one
-func generateNewSalt(oldSalt uint8) uint8 {
-	return oldSalt + 1
-}
-
-// equal compares two byte slices
-func equal(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i, v := range a {
-		if v != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// getIndexSlot calculates the slot for a given key in an index page
-func (db *DB) getIndexSlot(key []byte, salt uint8) int {
-	// Hash the key with the salt from the index page
-	hash := hashKey(key, salt)
-	// Calculate slot in the index page
-	return int(hash % uint64(MaxIndexEntries))
-}
-
-// setIndexEntry sets an entry in an index page for a specific key pointing to a content offset
-func (db *DB) setIndexEntry(indexPage *IndexPage, key []byte, contentOffset uint64) (int, error) {
-
-	// Calculate slot for the key
-	slot := db.getIndexSlot(key, indexPage.Salt)
-
-	// Write the entry
-	db.writeIndexEntry(indexPage, slot, contentOffset)
-
-	return slot, nil
-}
-
-// readIndexEntry reads an index entry from the specified slot in an index page
-func (db *DB) readIndexEntry(indexPage *IndexPage, slot int) uint64 {
-	if slot < 0 || slot >= MaxIndexEntries {
-		return 0
-	}
-
-	offset := IndexHeaderSize + (slot * 8) // 8 bytes for offset
-	return binary.LittleEndian.Uint64(indexPage.data[offset:offset+8])
-}
-
-// writeIndexEntry writes an index entry to the specified slot in an index page
-func (db *DB) writeIndexEntry(indexPage *IndexPage, slot int, contentOffset uint64) {
-	if slot < 0 || slot >= MaxIndexEntries {
-		return
-	}
-
-	offset := IndexHeaderSize + (slot * 8) // 8 bytes for offset
-	binary.LittleEndian.PutUint64(indexPage.data[offset:offset+8], contentOffset)
-
-	indexPage.Dirty = true
 }
 
 // appendData appends a key-value pair to the end of the file and returns its offset
@@ -847,4 +767,84 @@ func (db *DB) readContent(offset uint64) (*Content, error) {
 	}
 
 	return content, nil
+}
+
+// Utility functions
+
+// generateNewSalt generates a new salt that's different from the old one
+func generateNewSalt(oldSalt uint8) uint8 {
+	return oldSalt + 1
+}
+
+// hashKey hashes the key with the given salt
+func hashKey(key []byte, salt uint8) uint64 {
+	// Simple FNV-1a hash implementation
+	hash := uint64(14695981039346656037)
+
+	// Process the salt
+	hash ^= uint64(salt)
+	hash *= 1099511628211
+
+	// Process the key
+	for _, b := range key {
+		hash ^= uint64(b)
+		hash *= 1099511628211
+	}
+
+	return hash
+}
+
+// getIndexSlot calculates the slot for a given key in an index page
+func (db *DB) getIndexSlot(key []byte, salt uint8) int {
+	// Hash the key with the salt from the index page
+	hash := hashKey(key, salt)
+	// Calculate slot in the index page
+	return int(hash % uint64(MaxIndexEntries))
+}
+
+// setIndexEntry sets an entry in an index page for a specific key pointing to a content offset
+func (db *DB) setIndexEntry(indexPage *IndexPage, key []byte, contentOffset uint64) (int, error) {
+
+	// Calculate slot for the key
+	slot := db.getIndexSlot(key, indexPage.Salt)
+
+	// Write the entry
+	db.writeIndexEntry(indexPage, slot, contentOffset)
+
+	return slot, nil
+}
+
+// readIndexEntry reads an index entry from the specified slot in an index page
+func (db *DB) readIndexEntry(indexPage *IndexPage, slot int) uint64 {
+	if slot < 0 || slot >= MaxIndexEntries {
+		return 0
+	}
+
+	offset := IndexHeaderSize + (slot * 8) // 8 bytes for offset
+	return binary.LittleEndian.Uint64(indexPage.data[offset:offset+8])
+}
+
+// writeIndexEntry writes an index entry to the specified slot in an index page
+func (db *DB) writeIndexEntry(indexPage *IndexPage, slot int, contentOffset uint64) {
+	if slot < 0 || slot >= MaxIndexEntries {
+		return
+	}
+
+	offset := IndexHeaderSize + (slot * 8) // 8 bytes for offset
+	binary.LittleEndian.PutUint64(indexPage.data[offset:offset+8], contentOffset)
+
+	indexPage.Dirty = true
+}
+
+// equal compares two byte slices
+func equal(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, v := range a {
+		if v != b[i] {
+			return false
+		}
+	}
+	return true
 }
