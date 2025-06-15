@@ -21,10 +21,10 @@ const (
 	IndexHeaderSize = 2
 	// Maximum number of entries in index page
 	MaxIndexEntries = (PageSize - IndexHeaderSize) / 8 // 8 = offset pointer size
-	// Magic string for database identification (5 bytes)
-	MagicString string = "KVLOG"
-	// Database version (3 bytes as a string)
-	VersionString string = "\x00\x00\x01"
+	// Magic string for database identification (6 bytes)
+	MagicString string = "KV_LOG"
+	// Database version (2 bytes as a string)
+	VersionString string = "\x00\x01"
 	// Number of pages in main index
 	DefaultMainIndexPages = 256 // 1 MB / 4096 bytes per page
 	// Initial salt
@@ -457,11 +457,11 @@ func (db *DB) initialize() error {
 	// Write file header in root page (page 1)
 	rootPage := make([]byte, PageSize)
 
-	// Write the 5-byte magic string
-	copy(rootPage[0:5], MagicString)
+	// Write the 6-byte magic string
+	copy(rootPage[0:6], MagicString)
 
-	// Write the 3-byte version
-	copy(rootPage[5:8], VersionString)
+	// Write the 2-byte version
+	copy(rootPage[6:8], VersionString)
 
 	// Write the number of main index pages (4 bytes)
 	binary.BigEndian.PutUint32(rootPage[8:12], uint32(db.mainIndexPages))
@@ -504,11 +504,11 @@ func (db *DB) readHeader() error {
 		return err
 	}
 
-	// Extract magic string (5 bytes)
-	fileMagic := string(header[0:5])
+	// Extract magic string (6 bytes)
+	fileMagic := string(header[0:6])
 
-	// Extract version (3 bytes)
-	fileVersion := string(header[5:8])
+	// Extract version (2 bytes)
+	fileVersion := string(header[6:8])
 
 	if fileMagic != MagicString {
 		return fmt.Errorf("invalid database file format")
