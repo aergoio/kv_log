@@ -55,7 +55,7 @@ func debugPrint(format string, args ...interface{}) {
 type DB struct {
 	filePath       string
 	file           *os.File
-	mu             sync.RWMutex
+	mutex          sync.RWMutex
 	mainIndexPages int
 	fileSize       int64 // Track file size to avoid frequent stat calls
 }
@@ -143,8 +143,8 @@ func Open(path string, options ...Options) (*DB, error) {
 
 // Close closes the database file
 func (db *DB) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
 
 	if db.file != nil {
 		return db.file.Close()
@@ -160,8 +160,8 @@ func (db *DB) Delete(key []byte) error {
 
 // Set sets a key-value pair in the database
 func (db *DB) Set(key, value []byte) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
 
 	// Validate key length
 	keyLen := len(key)
@@ -388,8 +388,8 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 
 // Get retrieves a value for the given key
 func (db *DB) Get(key []byte) ([]byte, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	db.mutex.RLock()
+	defer db.mutex.RUnlock()
 
 	// Validate key length
 	keyLen := len(key)

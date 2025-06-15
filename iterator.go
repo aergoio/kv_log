@@ -42,8 +42,8 @@ func (it *DBIterator) Next() {
 	}
 
 	// Lock the database for reading
-	it.db.mu.RLock()
-	defer it.db.mu.RUnlock()
+	it.db.mutex.RLock()
+	defer it.db.mutex.RUnlock()
 
 	// If we have positions in the stack, process them first (depth-first traversal)
 	if len(it.stack) > 0 {
