@@ -57,6 +57,7 @@ type DB struct {
 	file           *os.File
 	mu             sync.RWMutex
 	mainIndexPages int
+	fileSize       int64 // Track file size to avoid frequent stat calls
 }
 
 // Content represents a piece of content in the database
@@ -109,10 +110,18 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 	}
 
+	// Get initial file size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to get file size: %w", err)
+	}
+
 	db := &DB{
-		file:          file,
-		filePath:      path,
+		file:           file,
+		filePath:       path,
 		mainIndexPages: mainIndexPages,
+		fileSize:       fileInfo.Size(),
 	}
 
 	if !fileExists {
@@ -177,6 +186,11 @@ func (db *DB) Set(key, value []byte) error {
 	// Main index starts at page 2
 	pageOffset := int64(pageNumber + 1) * PageSize
 
+	// Check if page offset is valid
+	if pageOffset >= db.fileSize {
+		return fmt.Errorf("main index page beyond file size")
+	}
+
 	// Read the index page
 	indexPage, err := db.readIndexPage(pageOffset)
 	if err != nil {
@@ -223,6 +237,11 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 	// Check if the slot is already used
 	contentOffset := db.readIndexEntry(indexPage, slot)
 	if contentOffset != 0 {
+		// Check if offset is valid
+		if contentOffset < 0 || contentOffset >= db.fileSize {
+			return fmt.Errorf("index entry points outside file bounds")
+		}
+
 		// Slot is used, read the content at this offset
 		content, err := db.readContent(contentOffset)
 		if err != nil {
@@ -315,14 +334,14 @@ func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...
 			}
 
 			// Update the original index to point to the new index page
-			db.writeIndexEntry(indexPage, slot, uint64(newIndexPage.offset))
+			db.writeIndexEntry(indexPage, slot, newIndexPage.offset)
 
 			// Write the index page on the caller function
 			return nil
 
 		} else if content.contentType == ContentTypeIndex {
 			// It's an index content, parse it
-			childIndexPage, err := db.readIndexPage(int64(contentOffset))
+			childIndexPage, err := db.readIndexPage(contentOffset)
 			if err != nil {
 				return fmt.Errorf("failed to parse index page: %w", err)
 			}
@@ -395,6 +414,11 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	// Main index starts at page 2
 	pageOffset := int64(pageNumber + 1) * PageSize
 
+	// Check if page offset is valid
+	if pageOffset >= db.fileSize {
+		return nil, fmt.Errorf("main index page beyond file size")
+	}
+
 	// Read the index page
 	indexPage, err := db.readIndexPage(pageOffset)
 	if err != nil {
@@ -421,6 +445,11 @@ func (db *DB) getFromIndex(key []byte, indexPage *IndexPage, salt uint8, forcedS
 		return nil, fmt.Errorf("key not found")
 	}
 
+	// Check if offset is valid
+	if contentOffset < 0 || contentOffset >= db.fileSize {
+		return nil, fmt.Errorf("index entry points outside file bounds")
+	}
+
 	// Read the content at the offset
 	content, err := db.readContent(contentOffset)
 	if err != nil {
@@ -436,7 +465,7 @@ func (db *DB) getFromIndex(key []byte, indexPage *IndexPage, salt uint8, forcedS
 
 	} else if content.contentType == ContentTypeIndex {
 		// It's another index page, follow the chain with its salt
-		childIndexPage, err := db.readIndexPage(int64(contentOffset))
+		childIndexPage, err := db.readIndexPage(contentOffset)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read index page: %w", err)
 		}
@@ -532,6 +561,12 @@ func (db *DB) readHeader() error {
 // readIndexPage reads an index page from the given offset
 func (db *DB) readIndexPage(offset int64) (*IndexPage, error) {
 	debugPrint("Reading index page from offset %d\n", offset)
+
+	// Check if offset is valid
+	if offset < 0 || offset >= db.fileSize {
+		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
+	}
+
 	data := make([]byte, PageSize)
 
 	if _, err := db.file.ReadAt(data, offset); err != nil {
@@ -582,13 +617,8 @@ func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 
 	// If offset is 0, append to the end of the file
 	if indexPage.offset == 0 {
-		// Get file size to determine where to append
-		fileInfo, err := db.file.Stat()
-		if err != nil {
-			return fmt.Errorf("failed to get file size: %w", err)
-		}
-
-		fileSize := fileInfo.Size()
+		// Use stored file size to determine where to append
+		fileSize := db.fileSize
 
 		// Align to ContentAlignment if needed
 		remainder := fileSize % ContentAlignment
@@ -599,6 +629,7 @@ func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 				return fmt.Errorf("failed to write padding: %w", err)
 			}
 			fileSize += padding
+			db.fileSize = fileSize
 		}
 
 		// Set the offset for this index page
@@ -613,21 +644,24 @@ func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 	// Write to disk at the specified offset
 	_, err := db.file.WriteAt(indexPage.data, indexPage.offset)
 
-	// If the page was written successfully, mark it as clean
+	// If the page was written successfully
 	if err == nil {
+		// Mark it as clean
 		indexPage.Dirty = false
+
+		// Update file size if this write extended the file
+		newEndOffset := indexPage.offset + PageSize
+		if newEndOffset > db.fileSize {
+			db.fileSize = newEndOffset
+		}
 	}
 	return err
 }
 
 // appendData appends a key-value pair to the end of the file and returns its offset
-func (db *DB) appendData(key, value []byte) (uint64, error) {
-	// Get file size to determine where to append
-	fileInfo, err := db.file.Stat()
-	if err != nil {
-		return 0, fmt.Errorf("failed to get file size: %w", err)
-	}
-	fileSize := fileInfo.Size()
+func (db *DB) appendData(key, value []byte) (int64, error) {
+	// Use stored file size to determine where to append
+	fileSize := db.fileSize
 
 	// Calculate the total size needed
 	keyLenSize := varint.Size(uint64(len(key)))
@@ -662,30 +696,39 @@ func (db *DB) appendData(key, value []byte) (uint64, error) {
 		return 0, fmt.Errorf("failed to write content: %w", err)
 	}
 
+	// Update the file size
+	newFileSize := fileSize + int64(totalSize)
+	db.fileSize = newFileSize
+
 	debugPrint("Appended content at offset %d, size %d\n", fileSize, totalSize)
 
 	// Return the offset where the content was written
-	return uint64(fileSize), nil
+	return fileSize, nil
 }
 
 // readContent reads content from a specific offset in the file
-func (db *DB) readContent(offset uint64) (*Content, error) {
+func (db *DB) readContent(offset int64) (*Content, error) {
+	// Check if offset is valid
+	if offset < 0 || offset >= db.fileSize {
+		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
+	}
+
 	// Read the content type first (1 byte)
 	typeBuffer := make([]byte, 1)
-	if _, err := db.file.ReadAt(typeBuffer, int64(offset)); err != nil {
+	if _, err := db.file.ReadAt(typeBuffer, offset); err != nil {
 		return nil, fmt.Errorf("failed to read content type: %w", err)
 	}
 
 	contentType := typeBuffer[0]
 	content := &Content{
 		contentType: contentType,
-		offset:      int64(offset),
+		offset:      offset,
 	}
 
 	if contentType == ContentTypeIndex {
 		// For index pages, read exactly PageSize bytes
 		buffer := make([]byte, PageSize)
-		n, err := db.file.ReadAt(buffer, int64(offset))
+		n, err := db.file.ReadAt(buffer, offset)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read content: %w", err)
 		}
@@ -694,7 +737,7 @@ func (db *DB) readContent(offset uint64) (*Content, error) {
 	} else if contentType == ContentTypeData {
 		// Read a small chunk to get the key length
 		initialBuffer := make([]byte, 10) // Enough for type + varint key length in most cases
-		_, err := db.file.ReadAt(initialBuffer, int64(offset))
+		_, err := db.file.ReadAt(initialBuffer, offset)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read content header: %w", err)
 		}
@@ -714,7 +757,7 @@ func (db *DB) readContent(offset uint64) (*Content, error) {
 		// Read enough to get key + value length
 		headerSize := 1 + bytesRead + keyLength + 10 // type + key length varint + key + estimated value length varint
 		headerBuffer := make([]byte, headerSize)
-		headerRead, err := db.file.ReadAt(headerBuffer, int64(offset))
+		headerRead, err := db.file.ReadAt(headerBuffer, offset)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read key data: %w", err)
 		}
@@ -745,9 +788,14 @@ func (db *DB) readContent(offset uint64) (*Content, error) {
 		// Calculate total size needed
 		totalSize := valueOffset + valueLength
 
+		// Check if total size exceeds file size
+		if offset + int64(totalSize) > db.fileSize {
+			return nil, fmt.Errorf("content extends beyond file size")
+		}
+
 		// Read all data at once
 		buffer := make([]byte, totalSize)
-		n, err := db.file.ReadAt(buffer, int64(offset))
+		n, err := db.file.ReadAt(buffer, offset)
 		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("failed to read content: %w", err)
 		}
@@ -804,7 +852,7 @@ func (db *DB) getIndexSlot(key []byte, salt uint8) int {
 }
 
 // setIndexEntry sets an entry in an index page for a specific key pointing to a content offset
-func (db *DB) setIndexEntry(indexPage *IndexPage, key []byte, contentOffset uint64) (int, error) {
+func (db *DB) setIndexEntry(indexPage *IndexPage, key []byte, contentOffset int64) (int, error) {
 
 	// Calculate slot for the key
 	slot := db.getIndexSlot(key, indexPage.Salt)
@@ -816,23 +864,23 @@ func (db *DB) setIndexEntry(indexPage *IndexPage, key []byte, contentOffset uint
 }
 
 // readIndexEntry reads an index entry from the specified slot in an index page
-func (db *DB) readIndexEntry(indexPage *IndexPage, slot int) uint64 {
+func (db *DB) readIndexEntry(indexPage *IndexPage, slot int) int64 {
 	if slot < 0 || slot >= MaxIndexEntries {
 		return 0
 	}
 
 	offset := IndexHeaderSize + (slot * 8) // 8 bytes for offset
-	return binary.LittleEndian.Uint64(indexPage.data[offset:offset+8])
+	return int64(binary.LittleEndian.Uint64(indexPage.data[offset:offset+8]))
 }
 
 // writeIndexEntry writes an index entry to the specified slot in an index page
-func (db *DB) writeIndexEntry(indexPage *IndexPage, slot int, contentOffset uint64) {
+func (db *DB) writeIndexEntry(indexPage *IndexPage, slot int, contentOffset int64) {
 	if slot < 0 || slot >= MaxIndexEntries {
 		return
 	}
 
 	offset := IndexHeaderSize + (slot * 8) // 8 bytes for offset
-	binary.LittleEndian.PutUint64(indexPage.data[offset:offset+8], contentOffset)
+	binary.LittleEndian.PutUint64(indexPage.data[offset:offset+8], uint64(contentOffset))
 
 	indexPage.Dirty = true
 }
@@ -840,4 +888,15 @@ func (db *DB) writeIndexEntry(indexPage *IndexPage, slot int, contentOffset uint
 // equal compares two byte slices
 func equal(a, b []byte) bool {
 	return bytes.Equal(a, b)
+}
+
+// RefreshFileSize updates the cached file size from the actual file
+func (db *DB) RefreshFileSize() error {
+	fileInfo, err := db.file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file size: %w", err)
+	}
+
+	db.fileSize = fileInfo.Size()
+	return nil
 }
