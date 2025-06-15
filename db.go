@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"syscall"
 
 	"github.com/aergoio/kv_log/varint"
 )
@@ -45,6 +46,13 @@ const (
 	ContentTypeData  = 'D' // Data content type
 )
 
+// Lock types
+const (
+	LockNone    = 0 // No locking
+	LockShared  = 1 // Shared lock (read-only)
+	LockExclusive = 2 // Exclusive lock (read-write)
+)
+
 // debugPrint prints a message if debug mode is enabled
 func debugPrint(format string, args ...interface{}) {
 	if DebugMode {
@@ -59,6 +67,9 @@ type DB struct {
 	mutex          sync.RWMutex
 	mainIndexPages int
 	fileSize       int64 // Track file size to avoid frequent stat calls
+	fileLocked     bool  // Track if the file is locked
+	lockType       int   // Type of lock currently held
+	readOnly       bool  // Track if the database is opened in read-only mode
 }
 
 // Content represents a piece of content in the database
@@ -88,13 +99,10 @@ func Open(path string, options ...Options) (*DB, error) {
 		fileExists = true
 	}
 
-	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open database file: %w", err)
-	}
-
-	// Set default options
+	// Default options
 	mainIndexPages := DefaultMainIndexPages
+	lockType := LockNone // Default to no lock
+	readOnly := false
 
 	// Parse options
 	var opts Options
@@ -108,6 +116,31 @@ func Open(path string, options ...Options) (*DB, error) {
 			} else {
 				return nil, fmt.Errorf("invalid value for MainIndexPages option")
 			}
+		}
+		if val, ok := opts["LockType"]; ok {
+			if lt, ok := val.(int); ok {
+				lockType = lt
+			}
+		}
+		if val, ok := opts["ReadOnly"]; ok {
+			if ro, ok := val.(bool); ok {
+				readOnly = ro
+			}
+		}
+	}
+
+	// Open file with appropriate flags
+	var file *os.File
+	var err error
+	if readOnly {
+		file, err = os.OpenFile(path, os.O_RDONLY, 0666)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open database file in read-only mode: %w", err)
+		}
+	} else {
+		file, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open database file: %w", err)
 		}
 	}
 
@@ -123,17 +156,29 @@ func Open(path string, options ...Options) (*DB, error) {
 		filePath:       path,
 		mainIndexPages: mainIndexPages,
 		fileSize:       fileInfo.Size(),
+		readOnly:       readOnly,
+		lockType:       LockNone,
 	}
 
-	if !fileExists {
+	// Apply file lock if requested
+	if lockType != LockNone {
+		if err := db.Lock(lockType); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to lock database file: %w", err)
+		}
+	}
+
+	if !fileExists && !readOnly {
 		// Initialize new database
 		if err := db.initialize(); err != nil {
+			db.Unlock()
 			file.Close()
 			return nil, fmt.Errorf("failed to initialize database: %w", err)
 		}
 	} else {
 		// Read existing database header
 		if err := db.readHeader(); err != nil {
+			db.Unlock()
 			file.Close()
 			return nil, fmt.Errorf("failed to read database header: %w", err)
 		}
@@ -142,12 +187,98 @@ func Open(path string, options ...Options) (*DB, error) {
 	return db, nil
 }
 
+// Lock acquires a lock on the database file based on the specified lock type
+func (db *DB) Lock(lockType int) error {
+	var lockFlag int
+
+	if db.fileLocked && db.lockType == lockType {
+		return nil // Already locked with the same lock type
+	}
+
+	// If already locked with a different lock type, unlock first
+	if db.fileLocked {
+		if err := db.Unlock(); err != nil {
+			return err
+		}
+	}
+
+	switch lockType {
+	case LockShared:
+		lockFlag = syscall.LOCK_SH | syscall.LOCK_NB
+		debugPrint("Acquiring shared lock on database file\n")
+	case LockExclusive:
+		lockFlag = syscall.LOCK_EX | syscall.LOCK_NB
+		debugPrint("Acquiring exclusive lock on database file\n")
+	default:
+		return fmt.Errorf("invalid lock type: %d", lockType)
+	}
+
+	err := syscall.Flock(int(db.file.Fd()), lockFlag)
+	if err != nil {
+		if lockType == LockShared {
+			return fmt.Errorf("cannot acquire shared lock (another process may have an exclusive lock): %w", err)
+		}
+		return fmt.Errorf("cannot acquire exclusive lock (file may be in use): %w", err)
+	}
+
+	db.fileLocked = true
+	db.lockType = lockType
+	return nil
+}
+
+// Unlock releases the lock on the database file
+func (db *DB) Unlock() error {
+	if !db.fileLocked {
+		return nil // Not locked
+	}
+
+	err := syscall.Flock(int(db.file.Fd()), syscall.LOCK_UN)
+	if err != nil {
+		return fmt.Errorf("cannot release lock: %w", err)
+	}
+
+	db.fileLocked = false
+	db.lockType = LockNone
+	debugPrint("Database file unlocked\n")
+	return nil
+}
+
+// acquireWriteLock temporarily acquires an exclusive lock for writing
+func (db *DB) acquireWriteLock() error {
+	// If we already have an exclusive lock, nothing to do
+	if db.fileLocked && db.lockType == LockExclusive {
+		return nil
+	}
+
+	// Acquire an exclusive lock
+	return db.Lock(LockExclusive)
+}
+
+// releaseWriteLock releases a temporary write lock
+// If the DB was originally opened with a different lock type, restore it
+func (db *DB) releaseWriteLock(originalLockType int) error {
+	// If the original lock type was none, just unlock
+	if originalLockType == LockNone {
+		return db.Unlock()
+	}
+
+	// Otherwise restore the original lock type
+	return db.Lock(originalLockType)
+}
+
 // Close closes the database file
 func (db *DB) Close() error {
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
 
 	if db.file != nil {
+		// Release lock if acquired
+		if db.fileLocked {
+			if err := db.Unlock(); err != nil {
+				return fmt.Errorf("failed to unlock database file: %w", err)
+			}
+		}
+		// Close the file
 		return db.file.Close()
 	}
 	return nil
@@ -155,14 +286,36 @@ func (db *DB) Close() error {
 
 // Delete removes a key from the database
 func (db *DB) Delete(key []byte) error {
+	// Check if file is opened in read-only mode
+	if db.readOnly {
+		return fmt.Errorf("cannot delete: database opened in read-only mode")
+	}
+
 	// Call Set with nil value to mark as deleted
 	return db.Set(key, nil)
 }
 
 // Set sets a key-value pair in the database
 func (db *DB) Set(key, value []byte) error {
+	// Check if file is opened in read-only mode
+	if db.readOnly {
+		return fmt.Errorf("cannot set: database opened in read-only mode")
+	}
+
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
+
+	// If not already exclusively locked
+	if db.lockType != LockExclusive {
+		// Remember the original lock type
+		originalLockType := db.lockType
+		// Acquire a write lock
+		if err := db.acquireWriteLock(); err != nil {
+			return fmt.Errorf("failed to acquire write lock: %w", err)
+		}
+		// Release the lock on exit
+		defer db.releaseWriteLock(originalLockType)
+	}
 
 	// Validate key length
 	keyLen := len(key)
@@ -482,6 +635,18 @@ func (db *DB) getFromIndex(key []byte, indexPage *IndexPage, salt uint8, forcedS
 
 // initialize creates a new database file structure
 func (db *DB) initialize() error {
+
+	// If not already exclusively locked
+	if db.lockType != LockExclusive {
+		// Remember the original lock type
+		originalLockType := db.lockType
+		// Acquire a write lock
+		if err := db.acquireWriteLock(); err != nil {
+			return fmt.Errorf("failed to acquire write lock for initialization: %w", err)
+		}
+		// Release the lock on exit
+		defer db.releaseWriteLock(originalLockType)
+	}
 
 	debugPrint("Initializing database\n")
 

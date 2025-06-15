@@ -45,6 +45,10 @@ func (it *DBIterator) Next() {
 	it.db.mutex.RLock()
 	defer it.db.mutex.RUnlock()
 
+	// If the database is being modified by another process (no lock or wrong lock type)
+	// we might get inconsistent data, but that's acceptable for read operations
+	// The mutex above protects against concurrent modifications from the same process
+
 	// If we have positions in the stack, process them first (depth-first traversal)
 	if len(it.stack) > 0 {
 		// Get the top position from the stack
