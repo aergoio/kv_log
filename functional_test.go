@@ -382,3 +382,255 @@ func TestMainIndexPagesPersistence(t *testing.T) {
 			string(value), "test_value")
 	}
 }
+
+func TestIterator(t *testing.T) {
+	// Create a test database
+	dbPath := "test_iterator.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+
+	// Open a new database
+	db, err := Open(dbPath, Options{"MainIndexPages": 1})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath) // Clean up after test
+	}()
+
+	// Insert test data
+	testData := map[string]string{
+		"key1": "value1",
+		"key2": "value2",
+		"key3": "value3",
+		"key4": "value4",
+		"key5": "value5",
+	}
+
+	for k, v := range testData {
+		if err := db.Set([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("Failed to set '%s': %v", k, err)
+		}
+	}
+
+	// Create an iterator
+	it := db.Iterator()
+	defer it.Close()
+
+	// Count the number of entries found
+	count := 0
+	foundKeys := make(map[string]bool)
+	foundValues := make(map[string]string)
+
+	// Iterate through all entries
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+
+		// Verify the key-value pair
+		expectedValue, exists := testData[key]
+		if !exists {
+			t.Fatalf("Iterator returned unexpected key: %s", key)
+		}
+		if value != expectedValue {
+			t.Fatalf("Value mismatch for key '%s': got %s, want %s", key, value, expectedValue)
+		}
+
+		// Track found keys and values
+		foundKeys[key] = true
+		foundValues[key] = value
+		count++
+
+		// Move to next entry
+		it.Next()
+	}
+
+	// Verify we found all keys
+	if count != len(testData) {
+		t.Fatalf("Iterator found %d entries, expected %d", count, len(testData))
+	}
+
+	// Verify each key was found
+	for k := range testData {
+		if !foundKeys[k] {
+			t.Fatalf("Key '%s' was not found by iterator", k)
+		}
+	}
+
+	// Test iterator after modifications
+
+	// Delete a key
+	if err := db.Delete([]byte("key3")); err != nil {
+		t.Fatalf("Failed to delete 'key3': %v", err)
+	}
+
+	// Add a new key
+	if err := db.Set([]byte("key6"), []byte("value6")); err != nil {
+		t.Fatalf("Failed to set 'key6': %v", err)
+	}
+
+	// Modify an existing key
+	if err := db.Set([]byte("key1"), []byte("modified1")); err != nil {
+		t.Fatalf("Failed to update 'key1': %v", err)
+	}
+
+	// Create a new iterator
+	modifiedIt := db.Iterator()
+	defer modifiedIt.Close()
+
+	// Reset tracking variables
+	count = 0
+	foundKeys = make(map[string]bool)
+	foundValues = make(map[string]string)
+
+	// Expected data after modifications
+	expectedData := map[string]string{
+		"key1": "modified1", // Modified
+		"key2": "value2",
+		// key3 deleted
+		"key4": "value4",
+		"key5": "value5",
+		"key6": "value6", // New
+	}
+
+	// Iterate through all entries
+	for modifiedIt.Valid() {
+		key := string(modifiedIt.Key())
+		value := string(modifiedIt.Value())
+
+		// Verify the key-value pair
+		expectedValue, exists := expectedData[key]
+		if !exists {
+			t.Fatalf("Iterator returned unexpected key after modifications: %s", key)
+		}
+		if value != expectedValue {
+			t.Fatalf("Value mismatch after modifications for key '%s': got %s, want %s",
+				key, value, expectedValue)
+		}
+
+		// Track found keys and values
+		foundKeys[key] = true
+		foundValues[key] = value
+		count++
+
+		// Move to next entry
+		modifiedIt.Next()
+	}
+
+	// Verify we found all keys
+	if count != len(expectedData) {
+		t.Fatalf("Iterator found %d entries after modifications, expected %d",
+			count, len(expectedData))
+	}
+
+	// Verify each key was found
+	for k := range expectedData {
+		if !foundKeys[k] {
+			t.Fatalf("Key '%s' was not found by iterator after modifications", k)
+		}
+	}
+
+	// Test iterator with empty database
+	emptyDbPath := "test_empty_iterator.db"
+	os.Remove(emptyDbPath)
+
+	emptyDb, err := Open(emptyDbPath, Options{"MainIndexPages": 1})
+	if err != nil {
+		t.Fatalf("Failed to open empty database: %v", err)
+	}
+	defer func() {
+		emptyDb.Close()
+		os.Remove(emptyDbPath)
+	}()
+
+	emptyIt := emptyDb.Iterator()
+	defer emptyIt.Close()
+
+	// Verify the iterator is not valid for an empty database
+	if emptyIt.Valid() {
+		t.Fatalf("Iterator for empty database should not be valid")
+	}
+}
+
+func TestIteratorWithCollisions(t *testing.T) {
+	// Create a test database
+	dbPath := "test_iterator_collisions.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+
+	// Open a new database with minimal index pages to force collisions
+	db, err := Open(dbPath, Options{"MainIndexPages": 1})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath) // Clean up after test
+	}()
+
+	// Insert many key-value pairs to ensure hash collisions
+	numPairs := 1000
+	keys := make([]string, numPairs)
+	values := make([]string, numPairs)
+
+	for i := 0; i < numPairs; i++ {
+		keys[i] = fmt.Sprintf("collision-key-%d", i)
+		values[i] = fmt.Sprintf("collision-value-%d", i)
+
+		if err := db.Set([]byte(keys[i]), []byte(values[i])); err != nil {
+			t.Fatalf("Failed to set key %d: %v", i, err)
+		}
+	}
+
+	// Create a map for verification
+	expectedData := make(map[string]string)
+	for i := 0; i < numPairs; i++ {
+		expectedData[keys[i]] = values[i]
+	}
+
+	// Create an iterator
+	it := db.Iterator()
+	defer it.Close()
+
+	// Count the number of entries found
+	count := 0
+	foundKeys := make(map[string]bool)
+
+	// Iterate through all entries
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+
+		// Verify the key-value pair exists in our expected data
+		expectedValue, exists := expectedData[key]
+		if !exists {
+			t.Fatalf("Iterator returned unexpected key: %s", key)
+		}
+		if value != expectedValue {
+			t.Fatalf("Value mismatch for key '%s': got %s, want %s", key, value, expectedValue)
+		}
+
+		// Track found keys
+		foundKeys[key] = true
+		count++
+
+		// Move to next entry
+		it.Next()
+	}
+
+	// Verify we found all keys
+	if count != numPairs {
+		t.Fatalf("Iterator found %d entries, expected %d", count, numPairs)
+	}
+
+	// Verify each key was found
+	for i := 0; i < numPairs; i++ {
+		key := keys[i]
+		if !foundKeys[key] {
+			t.Fatalf("Key '%s' was not found by iterator", key)
+		}
+	}
+}
