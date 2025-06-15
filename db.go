@@ -15,7 +15,7 @@ import (
 
 const (
 	// Debug mode (set to false to disable debug prints)
-	DebugMode = true
+	DebugMode = false
 	// Page size (4KB)
 	PageSize = 4096
 	// Base header size (just type identifier)
