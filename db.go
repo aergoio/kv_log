@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"sync"
@@ -578,6 +579,23 @@ func (db *DB) readIndexPage(offset int64) (*IndexPage, error) {
 		return nil, fmt.Errorf("not an index page at offset %d", offset)
 	}
 
+	// Verify CRC32 checksum
+	storedChecksum := binary.BigEndian.Uint32(data[4:8])
+
+	// Zero out the checksum field for calculation
+	binary.BigEndian.PutUint32(data[4:8], 0)
+
+	// Calculate the checksum
+	calculatedChecksum := crc32.ChecksumIEEE(data)
+
+	// Restore the original checksum in the data
+	binary.BigEndian.PutUint32(data[4:8], storedChecksum)
+
+	// Verify the checksum
+	if storedChecksum != calculatedChecksum {
+		return nil, fmt.Errorf("index page checksum mismatch at offset %d: stored=%d, calculated=%d", offset, storedChecksum, calculatedChecksum)
+	}
+
 	// Create structured index page
 	indexPage := &IndexPage{
 		Content: Content{
@@ -614,6 +632,16 @@ func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 	// Set page type and salt in the data
 	indexPage.data[0] = ContentTypeIndex  // Type identifier
 	indexPage.data[1] = indexPage.Salt    // Salt for index pages
+
+	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
+	// Zero out the checksum field before calculating
+	binary.BigEndian.PutUint32(indexPage.data[4:8], 0)
+
+	// Calculate checksum of the entire page
+	checksum := crc32.ChecksumIEEE(indexPage.data)
+
+	// Write the checksum at position 4
+	binary.BigEndian.PutUint32(indexPage.data[4:8], checksum)
 
 	// If offset is 0, append to the end of the file
 	if indexPage.offset == 0 {
