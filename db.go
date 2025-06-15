@@ -454,7 +454,7 @@ func (db *DB) initialize() error {
 
 	debugPrint("Initializing database\n")
 
-	// Write file header (8 bytes) in root page (page 1)
+	// Write file header in root page (page 1)
 	rootPage := make([]byte, PageSize)
 
 	// Write the 5-byte magic string
@@ -462,6 +462,9 @@ func (db *DB) initialize() error {
 
 	// Write the 3-byte version
 	copy(rootPage[5:8], VersionString)
+
+	// Write the number of main index pages (4 bytes)
+	binary.BigEndian.PutUint32(rootPage[8:12], uint32(db.mainIndexPages))
 
 	// The rest of the root page is reserved for future use
 
@@ -494,7 +497,9 @@ func (db *DB) initialize() error {
 
 // readHeader reads the database header
 func (db *DB) readHeader() error {
-	header := make([]byte, 8)
+
+	// Read the header (12 bytes) in root page (page 1)
+	header := make([]byte, 12)
 	if _, err := db.file.ReadAt(header, 0); err != nil {
 		return err
 	}
@@ -512,6 +517,13 @@ func (db *DB) readHeader() error {
 	if fileVersion != VersionString {
 		return fmt.Errorf("unsupported database version")
 	}
+
+	// Extract main index pages (4 bytes)
+	mainIndexPages := binary.BigEndian.Uint32(header[8:12])
+	if mainIndexPages == 0 || mainIndexPages > 2<<24 { // 2^24 = 16M pages * 4096 bytes per page = 64GB
+		return fmt.Errorf("invalid number of main index pages: %d", mainIndexPages)
+	}
+	db.mainIndexPages = int(mainIndexPages)
 
 	return nil
 }

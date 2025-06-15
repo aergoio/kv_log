@@ -330,3 +330,55 @@ func TestDeleteOperations(t *testing.T) {
 		t.Fatalf("Failed to delete already deleted key: %v", err)
 	}
 }
+
+func TestMainIndexPagesPersistence(t *testing.T) {
+	// Create a test database with custom mainIndexPages value
+	dbPath := "test_main_index_pages.db"
+	customPages := 4 // Use a non-default value
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+
+	// Open a new database with custom mainIndexPages
+	db, err := Open(dbPath, Options{"MainIndexPages": customPages})
+	if err != nil {
+		t.Fatalf("Failed to open database with custom mainIndexPages: %v", err)
+	}
+
+	// Add some data to ensure file is written
+	err = db.Set([]byte("test_key"), []byte("test_value"))
+	if err != nil {
+		t.Fatalf("Failed to set test key-value: %v", err)
+	}
+
+	// Close the database
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen the database without specifying mainIndexPages
+	reopenedDB, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer func() {
+		reopenedDB.Close()
+		os.Remove(dbPath) // Clean up after test
+	}()
+
+	// Verify the mainIndexPages value was preserved
+	if reopenedDB.mainIndexPages != customPages {
+		t.Fatalf("mainIndexPages not preserved: got %d, want %d",
+			reopenedDB.mainIndexPages, customPages)
+	}
+
+	// Verify data can still be read
+	value, err := reopenedDB.Get([]byte("test_key"))
+	if err != nil {
+		t.Fatalf("Failed to get test key after reopen: %v", err)
+	}
+	if !bytes.Equal(value, []byte("test_value")) {
+		t.Fatalf("Value mismatch after reopen: got %s, want %s",
+			string(value), "test_value")
+	}
+}
