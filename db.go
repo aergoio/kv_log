@@ -53,6 +53,13 @@ const (
 	LockExclusive = 2 // Exclusive lock (read-write)
 )
 
+// Sync modes
+const (
+	SyncFull   = 2 // use fsync() on every commit
+	SyncNormal = 1 // use fsync() only on checkpoint (WAL only)
+	SyncOff    = 0 // do not use fsync()
+)
+
 // debugPrint prints a message if debug mode is enabled
 func debugPrint(format string, args ...interface{}) {
 	if DebugMode {
@@ -70,6 +77,7 @@ type DB struct {
 	fileLocked     bool  // Track if the file is locked
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
+	syncMode       int   // Sync mode for file operations
 }
 
 // Content represents a piece of content in the database
@@ -103,6 +111,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	mainIndexPages := DefaultMainIndexPages
 	lockType := LockNone // Default to no lock
 	readOnly := false
+	syncMode := SyncNormal // Default to normal sync mode
 
 	// Parse options
 	var opts Options
@@ -125,6 +134,15 @@ func Open(path string, options ...Options) (*DB, error) {
 		if val, ok := opts["ReadOnly"]; ok {
 			if ro, ok := val.(bool); ok {
 				readOnly = ro
+			}
+		}
+		if val, ok := opts["SyncMode"]; ok {
+			if sm, ok := val.(int); ok {
+				if sm >= SyncOff && sm <= SyncFull {
+					syncMode = sm
+				} else {
+					return nil, fmt.Errorf("invalid value for SyncMode option")
+				}
 			}
 		}
 	}
@@ -158,6 +176,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		fileSize:       fileInfo.Size(),
 		readOnly:       readOnly,
 		lockType:       LockNone,
+		syncMode:       syncMode,
 	}
 
 	// Apply file lock if requested
@@ -185,6 +204,26 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// SetOption sets a database option after the database is open
+func (db *DB) SetOption(name string, value interface{}) error {
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
+
+	switch name {
+	case "SyncMode":
+		if sm, ok := value.(int); ok {
+			if sm >= SyncOff && sm <= SyncFull {
+				db.syncMode = sm
+				return nil
+			}
+			return fmt.Errorf("invalid value for SyncMode option")
+		}
+		return fmt.Errorf("SyncMode option value must be an integer")
+	default:
+		return fmt.Errorf("unknown or immutable option: %s", name)
+	}
 }
 
 // Lock acquires a lock on the database file based on the specified lock type
