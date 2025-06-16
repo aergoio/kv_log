@@ -60,6 +60,12 @@ const (
 	SyncOff    = 0 // do not use fsync()
 )
 
+// Journal modes
+const (
+	JournalModeWAL = "WAL" // Write-Ahead Logging mode
+	JournalModeOff = "OFF" // No journaling
+)
+
 // debugPrint prints a message if debug mode is enabled
 func debugPrint(format string, args ...interface{}) {
 	if DebugMode {
@@ -69,15 +75,17 @@ func debugPrint(format string, args ...interface{}) {
 
 // DB represents the database instance
 type DB struct {
-	filePath       string
-	file           *os.File
-	mutex          sync.RWMutex
-	mainIndexPages int
-	fileSize       int64 // Track file size to avoid frequent stat calls
-	fileLocked     bool  // Track if the file is locked
-	lockType       int   // Type of lock currently held
-	readOnly       bool  // Track if the database is opened in read-only mode
-	syncMode       int   // Sync mode for file operations
+	filePath        string
+	file            *os.File
+	mutex           sync.RWMutex
+	mainIndexPages  int
+	fileSize        int64  // Track file size to avoid frequent stat calls
+	fileLocked      bool   // Track if the file is locked
+	lockType        int    // Type of lock currently held
+	readOnly        bool   // Track if the database is opened in read-only mode
+	syncMode        int    // Sync mode for file operations
+	journalMode     string // Current journal mode (WAL or OFF)
+	nextJournalMode string // Next journal mode to apply
 }
 
 // Content represents a piece of content in the database
@@ -112,6 +120,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	lockType := LockNone // Default to no lock
 	readOnly := false
 	syncMode := SyncNormal // Default to normal sync mode
+	journalMode := JournalModeWAL // Default to WAL journal mode
 
 	// Parse options
 	var opts Options
@@ -145,6 +154,15 @@ func Open(path string, options ...Options) (*DB, error) {
 				}
 			}
 		}
+		if val, ok := opts["JournalMode"]; ok {
+			if jm, ok := val.(string); ok {
+				if jm == JournalModeWAL || jm == JournalModeOff {
+					journalMode = jm
+				} else {
+					return nil, fmt.Errorf("invalid value for JournalMode option")
+				}
+			}
+		}
 	}
 
 	// Open file with appropriate flags
@@ -170,13 +188,15 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	db := &DB{
-		file:           file,
-		filePath:       path,
-		mainIndexPages: mainIndexPages,
-		fileSize:       fileInfo.Size(),
-		readOnly:       readOnly,
-		lockType:       LockNone,
-		syncMode:       syncMode,
+		file:            file,
+		filePath:        path,
+		mainIndexPages:  mainIndexPages,
+		fileSize:        fileInfo.Size(),
+		readOnly:        readOnly,
+		lockType:        LockNone,
+		syncMode:        syncMode,
+		journalMode:     journalMode,
+		nextJournalMode: journalMode,
 	}
 
 	// Apply file lock if requested
@@ -221,6 +241,15 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			return fmt.Errorf("invalid value for SyncMode option")
 		}
 		return fmt.Errorf("SyncMode option value must be an integer")
+	case "JournalMode":
+		if jm, ok := value.(string); ok {
+			if jm == JournalModeWAL || jm == JournalModeOff {
+				db.nextJournalMode = jm
+				return nil
+			}
+			return fmt.Errorf("invalid value for JournalMode option")
+		}
+		return fmt.Errorf("JournalMode option value must be a string")
 	default:
 		return fmt.Errorf("unknown or immutable option: %s", name)
 	}
