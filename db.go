@@ -86,6 +86,7 @@ type DB struct {
 	syncMode        int    // Sync mode for file operations
 	journalMode     string // Current journal mode (WAL or OFF)
 	nextJournalMode string // Next journal mode to apply
+	walInfo         *WalInfo // WAL file information
 }
 
 // Content represents a piece of content in the database
@@ -220,6 +221,16 @@ func Open(path string, options ...Options) (*DB, error) {
 			db.Unlock()
 			file.Close()
 			return nil, fmt.Errorf("failed to read database header: %w", err)
+		}
+	}
+
+	// Check for existing WAL file if in WAL mode
+	if db.journalMode == JournalModeWAL {
+		// Open existing WAL file if it exists
+		if err := db.openWAL(); err != nil {
+			db.Unlock()
+			file.Close()
+			return nil, fmt.Errorf("failed to open WAL file: %w", err)
 		}
 	}
 
@@ -718,6 +729,10 @@ func (db *DB) initialize() error {
 
 	debugPrint("Initializing database\n")
 
+	// Save the original journal mode and temporarily disable it during initialization
+	originalJournalMode := db.journalMode
+	db.journalMode = JournalModeOff
+
 	// Write file header in root page (page 1)
 	rootPage := make([]byte, PageSize)
 
@@ -737,6 +752,9 @@ func (db *DB) initialize() error {
 		return err
 	}
 
+	// Update file size to include the root page
+	db.fileSize = PageSize
+
 	// Create all pages for the main index, starting at page 2
 	for i := 0; i < db.mainIndexPages; i++ {
 		indexPage := &IndexPage{
@@ -751,6 +769,28 @@ func (db *DB) initialize() error {
 		// Write the index page
 		if err := db.writeIndexPage(indexPage); err != nil {
 			return err
+		}
+	}
+
+	// Update file size after creating all index pages
+	db.fileSize = int64(db.mainIndexPages + 1) * PageSize
+
+	// Sync the file to ensure all writes are persisted
+	if db.syncMode == SyncFull {
+		if err := db.file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync database file: %w", err)
+		}
+	}
+
+	// Restore the original journal mode
+	db.journalMode = originalJournalMode
+
+	// If using WAL and one exists, delete it
+	if db.journalMode == JournalModeWAL {
+		// Delete the WAL file
+		err := DeleteWAL(db)
+		if err != nil {
+			return fmt.Errorf("failed to discard WAL file: %w", err)
 		}
 	}
 
@@ -794,17 +834,29 @@ func (db *DB) readHeader() error {
 
 // readIndexPage reads an index page from the given offset
 func (db *DB) readIndexPage(offset int64) (*IndexPage, error) {
+	var data []byte
+	var err error
+
 	debugPrint("Reading index page from offset %d\n", offset)
 
-	// Check if offset is valid
-	if offset < 0 || offset >= db.fileSize {
-		return nil, fmt.Errorf("offset out of file bounds: %d", offset)
+	if db.journalMode == JournalModeWAL {
+		// Read from WAL file
+		data, err = db.readFromWAL(offset)
+		if err != nil {
+			return nil, err
+		}
 	}
-
-	data := make([]byte, PageSize)
-
-	if _, err := db.file.ReadAt(data, offset); err != nil {
-		return nil, err
+	// If WAL is not used, or not found in WAL
+	if data == nil {
+		data = make([]byte, PageSize)
+		// Check if offset is valid
+		if offset < 0 || offset >= db.fileSize {
+			return nil, fmt.Errorf("offset out of file bounds: %d", offset)
+		}
+		// Read from main db file
+		if _, err := db.file.ReadAt(data, offset); err != nil {
+			return nil, err
+		}
 	}
 
 	// Check if it's an index page
@@ -892,6 +944,17 @@ func (db *DB) writeIndexPage(indexPage *IndexPage) error {
 
 		// Print some debug info
 		debugPrint("Writing index page to end of file at offset %d\n", indexPage.offset)
+
+	// If it is an internal existing index page, write to WAL file
+	} else if db.journalMode == JournalModeWAL {
+		// Write to WAL file
+		err := db.writeToWAL(indexPage)
+		if err != nil {
+			return err
+		}
+		indexPage.Dirty = false
+		return nil
+
 	} else {
 		debugPrint("Writing index page to disk at offset %d\n", indexPage.offset)
 	}
