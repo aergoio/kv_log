@@ -669,6 +669,9 @@ func (db *DB) initialize() error {
 		return err
 	}
 
+	// Update file size to include the root page
+	db.fileSize = PageSize
+
 	// Create all pages for the main index, starting at page 2
 	for i := 0; i < db.mainIndexPages; i++ {
 		indexPage := &IndexPage{
