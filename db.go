@@ -41,6 +41,8 @@ const (
 	RadixEntrySize = 5 // 4 bytes page number + 1 byte sub-page index
 	// Number of entries in each sub-page
 	EntriesPerSubPage = 256
+	// Size of each sub-page including the empty suffix offset
+	SubPageSize = EntriesPerSubPage * RadixEntrySize + 8 // 256 entries * 5 bytes + 8 bytes for empty suffix offset
 )
 
 // Content types
@@ -76,7 +78,7 @@ type DB struct {
 	fileLocked     bool  // Track if the files are locked
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
-	pageCache      map[uint32]*CacheEntry // Cache for all page types
+	pageCache      map[uint32]*Page // Cache for all page types
 	lastRadixPage  *RadixPage // Last radix page with available sub-pages
 }
 
@@ -121,8 +123,8 @@ type LeafPage struct {
 	Entries     []LeafEntry // Parsed entries
 }
 
-// CacheEntry represents a generic page in the cache
-type CacheEntry struct {
+// Page represents a generic page in the cache
+type Page struct {
 	PageType   byte
 	RadixPage  *RadixPage
 	LeafPage   *LeafPage
@@ -144,6 +146,13 @@ func Open(path string, options ...Options) (*DB, error) {
 	indexFileExists := false
 	if _, err := os.Stat(indexPath); err == nil {
 		indexFileExists = true
+	}
+
+	if !mainFileExists && indexFileExists {
+		// Remove index file
+		if err := os.Remove(indexPath); err != nil {
+			return nil, fmt.Errorf("failed to remove index file: %w", err)
+		}
 	}
 
 	// Default options
@@ -222,7 +231,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		indexFileSize:  indexFileInfo.Size(),
 		readOnly:       readOnly,
 		lockType:       LockNone,
-		pageCache:      make(map[uint32]*CacheEntry),
+		pageCache:      make(map[uint32]*Page),
 	}
 
 	// Apply file lock if requested
@@ -419,217 +428,292 @@ func (db *DB) Set(key, value []byte) error {
 		return fmt.Errorf("key length exceeds maximum allowed size of %d bytes", MaxKeyLength)
 	}
 
-	// Hash the key with salt 0
-	hash := hashKey(key, InitialSalt)
-
-	// Calculate total entries in main index
-	totalMainEntries := MaxIndexEntries * db.mainIndexPages
-
-	// Determine which page of the main index to use
-	mainIndexSlot := int(hash % uint64(totalMainEntries))
-	pageNumber := mainIndexSlot / MaxIndexEntries
-	slotInPage := mainIndexSlot % MaxIndexEntries
-
-	// Main index starts at page 2
-	pageOffset := int64(pageNumber + 1) * PageSize
-
-	// Check if page offset is valid
-	if pageOffset >= db.mainFileSize {
-		return fmt.Errorf("main index page beyond file size")
-	}
-
-	// Read the index page
-	indexPage, err := db.readIndexPage(pageOffset)
+	// Start with the root radix sub-page
+	rootSubPage, err := db.getRootRadixSubPage()
 	if err != nil {
-		return fmt.Errorf("failed to read index page: %w", err)
+		return fmt.Errorf("failed to get root radix sub-page: %w", err)
 	}
 
-	if indexPage.Salt != InitialSalt {
-		return fmt.Errorf("wrong salt for main index page")
+	// Check if we're deleting (value is nil)
+	isDelete := value == nil
+
+	// Process the key byte by byte
+	currentSubPage := rootSubPage
+	keyPos := 0
+
+	// Traverse the radix trie until we reach a leaf page or the end of the key
+	for keyPos < len(key) {
+		// Get the current byte from the key
+		byteValue := key[keyPos]
+
+		// Get the next page number and sub-page index from the current sub-page
+		nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
+
+		// If there's no entry for this byte, create a new path
+		if nextPageNumber == 0 {
+			// If we're deleting, nothing to do
+			if isDelete {
+				return nil
+			}
+
+			// Append the data to the main file
+			dataOffset, err := db.appendData(key, value)
+			if err != nil {
+				return fmt.Errorf("failed to append data: %w", err)
+			}
+
+			// Create a path for this byte
+			return db.createPathForByte(currentSubPage, key, keyPos, dataOffset)
+		}
+
+		// There's an entry for this byte, load the page
+		entry, err := db.getPage(nextPageNumber)
+		if err != nil {
+			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
+		}
+
+		// Check what type of page we got
+		if entry.PageType == ContentTypeRadix {
+			// It's a radix page, continue traversing
+			currentSubPage = &RadixSubPage{
+				Page:       entry.RadixPage,
+				SubPageIdx: nextSubPageIdx,
+			}
+			keyPos++
+		} else if entry.PageType == ContentTypeLeaf {
+			// It's a leaf page, attempt to set the key and value using the leaf page
+			return db.setOnLeafPage(key, value, entry.LeafPage, currentSubPage, byteValue, keyPos)
+		} else {
+			return fmt.Errorf("invalid page type")
+		}
 	}
 
-	err = db.setOnIndex(key, value, indexPage, slotInPage)
-	if err != nil {
-		return err
+	// We've processed all bytes of the key
+	// Attempt to set the key and value on the empty suffix slot
+	return db.setOnEmptySuffix(currentSubPage, key, value, 0)
+}
+
+// setContentOnIndex sets a suffix + content offset pair on the index
+func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos int, contentOffset int64) error {
+
+	// Process the suffix byte by byte
+	currentSubPage := subPage
+
+	// Traverse the radix trie until we reach a leaf page or the end of the suffix
+	for suffixPos < len(suffix) {
+		// Get the current byte from the key's suffix
+		byteValue := suffix[suffixPos]
+
+		// Get the next page number and sub-page index from the current sub-page
+		nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
+
+		// If there's no entry for this byte, create a new path
+		if nextPageNumber == 0 {
+			// Create a path for this byte
+			return db.createPathForByte(currentSubPage, suffix, suffixPos, contentOffset)
+		}
+
+		// There's an entry for this byte, load the page
+		entry, err := db.getPage(nextPageNumber)
+		if err != nil {
+			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
+		}
+
+		// Check what type of page we got
+		if entry.PageType == ContentTypeRadix {
+			// It's a radix page, continue traversing
+			currentSubPage = &RadixSubPage{
+				Page:       entry.RadixPage,
+				SubPageIdx: nextSubPageIdx,
+			}
+			suffixPos++
+		} else if entry.PageType == ContentTypeLeaf {
+			// It's a leaf page
+			suffix = suffix[suffixPos+1:]
+			// Try to add the entry with the suffix to the leaf page
+			if db.addLeafEntry(entry.LeafPage, suffix, contentOffset) {
+				return nil
+			}
+			// Leaf page is full, convert it to a radix page
+			return db.convertLeafToRadix(entry.LeafPage, suffix, contentOffset)
+		} else {
+			return fmt.Errorf("invalid page type")
+		}
 	}
 
-	if indexPage.Dirty {
-		return db.writeIndexPage(indexPage)
-	}
-
+	// We've processed all bytes of the key
+	// Set the content offset on the empty suffix slot
+	db.setEmptySuffixOffset(currentSubPage, contentOffset)
 	return nil
 }
 
-// setOnIndex sets a key-value pair in the index page
-func (db *DB) setOnIndex(key, value []byte, indexPage *IndexPage, forcedSlot ...int) error {
-	var salt uint8 = indexPage.Salt
-	var slot int
+// createPathForByte creates a new path for a byte in the key
+func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, dataOffset int64) error {
 
-	if salt == InitialSalt && len(forcedSlot) > 0 {
-		// Use the forced slot for main index (salt 0)
-		slot = forcedSlot[0]
+	// Get the current byte from the key
+	byteValue := key[keyPos]
+
+	// The remaining part of the key is the suffix
+	suffix := key[keyPos+1:]
+
+	// Handle based on whether we have an empty suffix or not
+	if len(suffix) == 0 {
+		// For empty suffix, create a new radix sub-page and set the empty suffix offset
+		childSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			return fmt.Errorf("failed to allocate radix sub-page: %w", err)
+		}
+
+		// Set the empty suffix offset
+		db.setEmptySuffixOffset(childSubPage, dataOffset)
+
+		// Update the radix entry to point to the new radix page
+		db.setRadixEntry(subPage, byteValue, childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
 	} else {
-		// Calculate slot for the key
-		slot = db.getIndexSlot(key, salt)
+		// For non-empty suffix, create a new leaf page
+		leafPage, err := db.allocateLeafPage()
+		if err != nil {
+			return fmt.Errorf("failed to allocate leaf page: %w", err)
+		}
+
+		// Add the entry with the suffix to the leaf page
+		db.addLeafEntry(leafPage, suffix, dataOffset)
+
+		// Update the radix entry to point to the new leaf page
+		db.setRadixEntry(subPage, byteValue, leafPage.pageNumber, 0)
 	}
 
-	// Check if slot is valid
-	if slot < 0 || slot >= MaxIndexEntries {
-		return fmt.Errorf("slot index is out of range: %d", slot)
-	}
+	// Don't write to disk, just keep pages in cache
+	return nil
+}
 
-	// If value is nil, we're deleting the key
+// setOnLeafPage attempts to set a key and value on a leaf page
+func (db *DB) setOnLeafPage(key, value []byte, leafPage *LeafPage, subPage *RadixSubPage, byteValue uint8, keyPos int) error {
+	// Check if we're deleting
 	isDelete := value == nil
 
-	// Check if the slot is already used
-	contentOffset := db.readIndexEntry(indexPage, slot)
-	if contentOffset != 0 {
-		// Check if offset is valid
-		if contentOffset < 0 || contentOffset >= db.mainFileSize {
-			return fmt.Errorf("index entry points outside file bounds")
-		}
+	// The remaining part of the key is the suffix
+	suffix := key[keyPos+1:]
 
-		// Slot is used, read the content at this offset
-		content, err := db.readContent(contentOffset)
-		if err != nil {
-			return fmt.Errorf("failed to read content: %w", err)
-		}
-
-		if content.contentType == ContentTypeData {
-			// It's data content, check the key
-			existingKey := content.key
-			existingValue := content.value
-
-			// Compare the existing key with the new key
-			if equal(existingKey, key) {
-				// Key found
-
-				// If we're deleting, just zero out the index entry
-				if isDelete {
-					db.writeIndexEntry(indexPage, slot, 0)
-					return nil
-				}
-
-				// Check if value is the same
-				if equal(existingValue, value) {
-					// Value is the same, no need to update
-					return nil
-				}
-
-				// Value is different, append new data to the end of the file
-				newOffset, err := db.appendData(key, value)
-				if err != nil {
-					return err
-				}
-
-				// Update the index entry to point to the new data
-				db.writeIndexEntry(indexPage, slot, newOffset)
-
-				// Write the index page on the caller function
-				return nil
+	// Search for the suffix in the leaf page entries
+	for i, entry := range leafPage.Entries {
+		if bytes.Equal(entry.Suffix, suffix) {
+			// Found the entry, read the content from the main file
+			content, err := db.readContent(entry.DataOffset)
+			if err != nil {
+				return fmt.Errorf("failed to read content: %w", err)
 			}
 
+			// Verify that the key matches
+			if !equal(content.key, key) {
+				return fmt.Errorf("invalid indexed key")
+			}
+
+			// If we're deleting
 			if isDelete {
-				// Key not found, nothing to do
+				// Remove this entry
+				db.removeLeafEntryAt(leafPage, i)
 				return nil
 			}
 
-			// Key collision but different keys, need to create an index page
-			newSalt := generateNewSalt(salt)
-			newIndexPage, err := db.createIndexPage(newSalt)
+			// Check if value is the same
+			if equal(content.value, value) {
+				// Value is the same, nothing to do
+				return nil
+			}
+
+			// Value is different, append new data
+			dataOffset, err := db.appendData(key, value)
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to append data: %w", err)
 			}
 
-			// Append the new key-value pair at the end of the file
-			newDataOffset, err := db.appendData(key, value)
-			if err != nil {
-				return err
-			}
+			// Update the entry
+			leafPage.Entries[i].DataOffset = dataOffset
 
-			// Add both entries to the new index page
-			// Check if the slots would collide with the current salt
-			for {
-				slot1, err := db.setIndexEntry(newIndexPage, existingKey, contentOffset)
-				if err != nil {
-					return err
-				}
-				slot2, err := db.setIndexEntry(newIndexPage, key, newDataOffset)
-				if err != nil {
-					return err
-				}
+			// Mark the leaf page as dirty
+			leafPage.dirty = true
 
-				// If the slots are different, we're good
-				if slot1 != slot2 {
-					break
-				}
-
-				debugPrint(" --> hash collision for keys %s and %s \n", string(existingKey), string(key))
-
-				// Slots collided, try a different salt
-				newSalt = generateNewSalt(newSalt)
-				// Use a new index page because the old one is already dirty
-				newIndexPage, err = db.createIndexPage(newSalt)
-				if err != nil {
-					return err
-				}
-			}
-
-			// Write the new index page at the end of the file
-			if err := db.writeIndexPage(newIndexPage); err != nil {
-				return err
-			}
-
-			// Update the original index to point to the new index page
-			db.writeIndexEntry(indexPage, slot, newIndexPage.offset)
-
-			// Write the index page on the caller function
-			return nil
-
-		} else if content.contentType == ContentTypeIndex {
-			// It's an index content, parse it
-			childIndexPage, err := db.readIndexPage(contentOffset)
-			if err != nil {
-				return fmt.Errorf("failed to parse index page: %w", err)
-			}
-
-			// Assert that the salt is not the initial salt
-			if childIndexPage.Salt == InitialSalt {
-				return fmt.Errorf("salt from internal index page is the initial salt")
-			}
-
-			// Set the key-value pair in the child index page
-			// Don't pass forcedSlot for secondary indexes
-			err = db.setOnIndex(key, value, childIndexPage)
-			if err != nil {
-				return err
-			}
-
-			if childIndexPage.Dirty {
-				// Write the new index page
-				return db.writeIndexPage(childIndexPage)
-			}
-
-			// Write the parent index page on the caller function
 			return nil
 		}
 	}
 
-	// For deletion, if we got here the key doesn't exist, so nothing to do
+	// If we're deleting and didn't find the key, nothing to do
 	if isDelete {
 		return nil
 	}
 
-	// Slot is available, append the data and update the index
+	// Suffix not found, append new data
 	dataOffset, err := db.appendData(key, value)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to append data: %w", err)
 	}
 
-	// Update index entry
-	db.writeIndexEntry(indexPage, slot, dataOffset)
+	// Try to add the entry with the suffix to the leaf page
+	if db.addLeafEntry(leafPage, suffix, dataOffset) {
+		return nil
+	}
 
-	// Write the index page on the caller function
+	// Leaf page is full, convert it to a radix page
+	return db.convertLeafToRadix(leafPage, suffix, dataOffset)
+}
+
+// setOnEmptySuffix attempts to set a key and value on an empty suffix in a radix sub-page
+func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOffset int64) error {
+	// Check if we're deleting
+	isDelete := value == nil
+
+	// Get the current empty suffix offset
+	emptySuffixOffset := db.getEmptySuffixOffset(subPage)
+
+	// If there's no empty suffix offset, nothing to delete
+	if emptySuffixOffset == 0 && isDelete {
+		return nil
+	}
+
+	// If we have an empty suffix offset, read the content to verify the key
+	if emptySuffixOffset > 0 {
+		// Read the content at the offset
+		content, err := db.readContent(emptySuffixOffset)
+		if err != nil {
+			return fmt.Errorf("failed to read content: %w", err)
+		}
+
+		// Verify that the key matches
+		if !equal(content.key, key) {
+			return fmt.Errorf("invalid indexed key")
+		}
+
+		// If we're deleting
+		if isDelete {
+			// Clear the empty suffix offset
+			db.setEmptySuffixOffset(subPage, 0)
+			return nil
+		}
+
+		// Check if value is the same
+		if equal(content.value, value) {
+			// Value is the same, nothing to do
+			return nil
+		}
+
+		// Value is different, need to update it
+		// We'll fall through to append the new data
+	}
+
+	// If dataOffset is not 0, it means we're reindexing the database
+	var err error
+	if dataOffset == 0 {
+		// No empty suffix or key mismatch, append new data
+		dataOffset, err = db.appendData(key, value)
+		if err != nil {
+			return fmt.Errorf("failed to append data: %w", err)
+		}
+	}
+
+	// Set the empty suffix offset
+	db.setEmptySuffixOffset(subPage, dataOffset)
+
 	return nil
 }
 
@@ -647,81 +731,99 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		return nil, fmt.Errorf("key length exceeds maximum allowed size of %d bytes", MaxKeyLength)
 	}
 
-	// Hash the key with salt 0
-	hash := hashKey(key, InitialSalt)
-
-	// Calculate total entries in main index
-	totalMainEntries := MaxIndexEntries * db.mainIndexPages
-
-	// Determine which page of the main index to use
-	mainIndexSlot := int(hash % uint64(totalMainEntries))
-	pageNumber := mainIndexSlot / MaxIndexEntries
-	slotInPage := mainIndexSlot % MaxIndexEntries
-
-	// Main index starts at page 2
-	pageOffset := int64(pageNumber + 1) * PageSize
-
-	// Check if page offset is valid
-	if pageOffset >= db.mainFileSize {
-		return nil, fmt.Errorf("main index page beyond file size")
-	}
-
-	// Read the index page
-	indexPage, err := db.readIndexPage(pageOffset)
+	// Start with the root radix sub-page
+	rootSubPage, err := db.getRootRadixSubPage()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read index page: %w", err)
+		return nil, fmt.Errorf("failed to get root radix sub-page: %w", err)
 	}
 
-	return db.getFromIndex(key, indexPage, InitialSalt, slotInPage)
-}
+	// Process the key byte by byte
+	var currentSubPage = rootSubPage
+	var keyPos int
 
-// getFromIndex retrieves a value using the specified salt and index page
-func (db *DB) getFromIndex(key []byte, indexPage *IndexPage, salt uint8, forcedSlot ...int) ([]byte, error) {
-	var slot int
-	if salt == InitialSalt && len(forcedSlot) > 0 {
-		// Use the forced slot for main index (salt 0)
-		slot = forcedSlot[0]
-	} else {
-		// Calculate slot for the key
-		slot = db.getIndexSlot(key, salt)
-	}
+	// Traverse the radix trie until we reach a leaf page
+	for keyPos < len(key) {
+		// Get the current byte from the key
+		byteValue := key[keyPos]
 
-	// Check if slot has an entry
-	contentOffset := db.readIndexEntry(indexPage, slot)
-	if contentOffset == 0 {
-		return nil, fmt.Errorf("key not found")
-	}
+		// Get the next page number and sub-page index from the current sub-page
+		nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
 
-	// Check if offset is valid
-	if contentOffset < 0 || contentOffset >= db.mainFileSize {
-		return nil, fmt.Errorf("index entry points outside file bounds")
-	}
-
-	// Read the content at the offset
-	content, err := db.readContent(contentOffset)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read content: %w", err)
-	}
-
-	if content.contentType == ContentTypeData {
-		// It's data content, check if key matches
-		if equal(content.key, key) {
-			return content.value, nil
+		// If there's no entry for this byte, the key doesn't exist
+		if nextPageNumber == 0 {
+			return nil, fmt.Errorf("key not found")
 		}
-		return nil, fmt.Errorf("key not found")
 
-	} else if content.contentType == ContentTypeIndex {
-		// It's another index page, follow the chain with its salt
-		childIndexPage, err := db.readIndexPage(contentOffset)
+		// Load the next page
+		entry, err := db.getPage(nextPageNumber)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read index page: %w", err)
+			return nil, fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
 		}
 
-		// Don't pass forcedSlot for secondary indexes
-		return db.getFromIndex(key, childIndexPage, childIndexPage.Salt)
+		// Check what type of page we got
+		if entry.PageType == ContentTypeRadix {
+			// It's a radix page, continue traversing
+			currentSubPage = &RadixSubPage{
+				Page:       entry.RadixPage,
+				SubPageIdx: nextSubPageIdx,
+			}
+			keyPos++
+		} else if entry.PageType == ContentTypeLeaf {
+			// It's a leaf page, search for the suffix
+			leafPage := entry.LeafPage
+
+			// The remaining part of the key is the suffix
+			suffix := key[keyPos+1:]
+
+			// Search for the suffix in the leaf page entries
+			for _, entry := range leafPage.Entries {
+				if bytes.Equal(entry.Suffix, suffix) {
+					// Found the entry, read the content from the main file
+					contentOffset := entry.DataOffset
+
+					// Read the content at the offset
+					content, err := db.readContent(contentOffset)
+					if err != nil {
+						return nil, fmt.Errorf("failed to read content: %w", err)
+					}
+
+					// Verify that the key matches
+					if !equal(content.key, key) {
+						return nil, fmt.Errorf("invalid indexed key")
+					}
+
+					// Return the value
+					return content.value, nil
+				}
+			}
+
+			// If we get here, the suffix wasn't found
+			return nil, fmt.Errorf("key not found")
+		} else {
+			return nil, fmt.Errorf("invalid page type")
+		}
 	}
 
-	return nil, fmt.Errorf("invalid content type")
+	// If we've processed all bytes but haven't found a leaf page,
+	// check if there's an empty suffix in the current sub-page
+	emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
+	if emptySuffixOffset > 0 {
+		// Read the content at the offset
+		content, err := db.readContent(emptySuffixOffset)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read content: %w", err)
+		}
+
+		// Verify that the key matches
+		if !equal(content.key, key) {
+			return nil, fmt.Errorf("invalid indexed key")
+		}
+
+		// Return the value
+		return content.value, nil
+	}
+
+	return nil, fmt.Errorf("key not found")
 }
 
 // Helper functions
@@ -810,8 +912,8 @@ func (db *DB) initializeIndexFile() error {
 	}
 
 	// Page number should be 1 (since we just allocated it after the header page)
-	if rootRadixPage.PageNumber != 1 {
-		return fmt.Errorf("unexpected root radix page number: %d", rootRadixPage.PageNumber)
+	if rootRadixPage.pageNumber != 1 {
+		return fmt.Errorf("unexpected root radix page number: %d", rootRadixPage.pageNumber)
 	}
 
 	// Initialize the first two levels of the radix tree
@@ -1137,11 +1239,10 @@ func (db *DB) readRadixPage(pageNumber uint32) (*RadixPage, error) {
 	// Create structured radix page
 	radixPage := &RadixPage{
 		BasePage: BasePage{
-			PageNumber:  pageNumber,
-			Offset:      offset,
-			Dirty:       false,
+			pageNumber:  pageNumber,
+			offset:      offset,
+			dirty:       false,
 			data:        data,
-			contentType: ContentTypeRadix,
 		},
 		SubPagesUsed: data[1],
 	}
@@ -1167,16 +1268,16 @@ func (db *DB) writeRadixPage(radixPage *RadixPage) error {
 	binary.BigEndian.PutUint32(radixPage.data[4:8], checksum)
 
 	// Ensure the page number and offset are valid
-	if radixPage.PageNumber == 0 {
+	if radixPage.pageNumber == 0 {
 		return fmt.Errorf("cannot write radix page with page number 0")
 	}
 
 	// Calculate offset from page number if not set
 	if radixPage.offset == 0 {
-		radixPage.offset = int64(radixPage.PageNumber) * PageSize
+		radixPage.offset = int64(radixPage.pageNumber) * PageSize
 	}
 
-	debugPrint("Writing radix page to index file at page %d\n", radixPage.PageNumber)
+	debugPrint("Writing radix page to index file at page %d\n", radixPage.pageNumber)
 
 	// Write to disk at the specified offset
 	_, err := db.indexFile.WriteAt(radixPage.data, radixPage.offset)
@@ -1184,7 +1285,7 @@ func (db *DB) writeRadixPage(radixPage *RadixPage) error {
 	// If the page was written successfully
 	if err == nil {
 		// Mark it as clean
-		radixPage.Dirty = false
+		radixPage.dirty = false
 
 		// Update file size if this write extended the file
 		newEndOffset := radixPage.offset + PageSize
@@ -1242,11 +1343,10 @@ func (db *DB) readLeafPage(pageNumber uint32) (*LeafPage, error) {
 	// Create structured leaf page
 	leafPage := &LeafPage{
 		BasePage: BasePage{
-			PageNumber:  pageNumber,
-			Offset:      offset,
-			Dirty:       false,
+			pageNumber:  pageNumber,
+			offset:      offset,
+			dirty:       false,
 			data:        data,
-			contentType: ContentTypeLeaf,
 		},
 		ContentSize: contentSize,
 	}
@@ -1281,20 +1381,20 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 	binary.BigEndian.PutUint32(leafPage.data[4:8], checksum)
 
 	// If page number is 0, allocate a new page at the end of the file
-	if leafPage.PageNumber == 0 {
+	if leafPage.pageNumber == 0 {
 		// Calculate new page number
-		leafPage.PageNumber = uint32(db.indexFileSize / PageSize)
+		leafPage.pageNumber = uint32(db.indexFileSize / PageSize)
 
 		// Update offset
 		leafPage.offset = db.indexFileSize
 
 		// Print some debug info
-		debugPrint("Writing leaf page to end of index file at page %d\n", leafPage.PageNumber)
+		debugPrint("Writing leaf page to end of index file at page %d\n", leafPage.pageNumber)
 	} else {
 		// Calculate offset from page number
-		leafPage.offset = int64(leafPage.PageNumber) * PageSize
+		leafPage.offset = int64(leafPage.pageNumber) * PageSize
 
-		debugPrint("Writing leaf page to index file at page %d\n", leafPage.PageNumber)
+		debugPrint("Writing leaf page to index file at page %d\n", leafPage.pageNumber)
 	}
 
 	// Write to disk at the specified offset
@@ -1303,7 +1403,7 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 	// If the page was written successfully
 	if err == nil {
 		// Mark it as clean
-		leafPage.Dirty = false
+		leafPage.dirty = false
 
 		// Update file size if this write extended the file
 		newEndOffset := leafPage.offset + PageSize
@@ -1313,6 +1413,62 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 	}
 	return err
 }
+
+// ------------------------------------------------------------------------------------------------
+// ...
+// ------------------------------------------------------------------------------------------------
+
+// readPage reads a page from the index file
+// first read 1 byte to check the page type
+// then read the page data
+func (db *DB) readPage(pageNumber uint32) (*Page, error) {
+	// Calculate file offset from page number
+	offset := int64(pageNumber) * PageSize
+
+	// Check if offset is valid
+	if offset < 0 || offset >= db.indexFileSize {
+		return nil, fmt.Errorf("page number %d out of index file bounds", pageNumber)
+	}
+
+	// Read just the first byte to determine page type
+	typeBuffer := make([]byte, 1)
+	if _, err := db.indexFile.ReadAt(typeBuffer, offset); err != nil {
+		return nil, fmt.Errorf("failed to read page type: %w", err)
+	}
+
+	contentType := typeBuffer[0]
+	entry := &Page{
+		PageType: contentType,
+	}
+
+	// Based on the page type, read the full page
+	switch contentType {
+	case ContentTypeRadix:
+		// Read the radix page
+		radixPage, err := db.readRadixPage(pageNumber)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read radix page: %w", err)
+		}
+		entry.RadixPage = radixPage
+
+	case ContentTypeLeaf:
+		// Read the leaf page
+		leafPage, err := db.readLeafPage(pageNumber)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read leaf page: %w", err)
+		}
+		entry.LeafPage = leafPage
+
+	default:
+		return nil, fmt.Errorf("unknown page type: %c", contentType)
+	}
+
+	return entry, nil
+}
+
+// ------------------------------------------------------------------------------------------------
+// ...
+// ------------------------------------------------------------------------------------------------
 
 // Sync flushes all dirty pages to disk and syncs the files
 func (db *DB) Sync() error {
@@ -1364,7 +1520,7 @@ func (db *DB) RefreshFileSize() error {
 
 // addToCache adds a page to the cache
 func (db *DB) addToCache(page interface{}) {
-	entry := &CacheEntry{}
+	entry := &Page{}
 
 	switch p := page.(type) {
 	case *RadixPage:
@@ -1379,9 +1535,9 @@ func (db *DB) addToCache(page interface{}) {
 
 	pageNumber := uint32(0)
 	if entry.PageType == ContentTypeRadix {
-		pageNumber = entry.RadixPage.PageNumber
+		pageNumber = entry.RadixPage.pageNumber
 	} else if entry.PageType == ContentTypeLeaf {
-		pageNumber = entry.LeafPage.PageNumber
+		pageNumber = entry.LeafPage.pageNumber
 	}
 
 	if pageNumber == 0 {
@@ -1393,8 +1549,8 @@ func (db *DB) addToCache(page interface{}) {
 	db.cacheMutex.Unlock()
 }
 
-// getPage gets a page from the cache by page number and type
-func (db *DB) getPage(pageNumber uint32) (*CacheEntry, bool) {
+// getPageFromCache gets a page from the cache by page number and type
+func (db *DB) getPageFromCache(pageNumber uint32) (*Page, bool) {
 	db.cacheMutex.RLock()
 	entry, exists := db.pageCache[pageNumber]
 	db.cacheMutex.RUnlock()
@@ -1402,10 +1558,22 @@ func (db *DB) getPage(pageNumber uint32) (*CacheEntry, bool) {
 	return entry, exists
 }
 
+// getPage gets a page from the cache or from the disk
+func (db *DB) getPage(pageNumber uint32) (*Page, error) {
+	// First check the cache
+	entry, exists := db.getPageFromCache(pageNumber)
+	if exists {
+		return entry, nil
+	}
+
+	// If not in cache, read it from disk
+	return db.readPage(pageNumber)
+}
+
 // getRadixPage returns a radix page from the cache or from the disk
 func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
 	// Check if the page is in the cache
-	entry, exists := db.getPage(pageNumber)
+	entry, exists := db.getPageFromCache(pageNumber)
 
 	// If it exists and is a radix page, return it
 	if exists {
@@ -1422,7 +1590,7 @@ func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
 // getLeafPage returns a leaf page from the cache or from the disk
 func (db *DB) getLeafPage(pageNumber uint32) (*LeafPage, error) {
 	// Check if the page is in the cache
-	entry, exists := db.getPage(pageNumber)
+	entry, exists := db.getPageFromCache(pageNumber)
 
 	// If it exists and is a leaf page, return it
 	if exists {
@@ -1439,7 +1607,7 @@ func (db *DB) getLeafPage(pageNumber uint32) (*LeafPage, error) {
 // loadRadixPage loads a radix page into the cache if it's not already there
 func (db *DB) loadRadixPage(pageNumber uint32) (*RadixPage, error) {
 	// Check if the page is already in cache
-	entry, exists := db.getPage(pageNumber)
+	entry, exists := db.getPageFromCache(pageNumber)
 
 	if exists {
 		if entry.PageType != ContentTypeRadix || entry.RadixPage == nil {
@@ -1504,11 +1672,11 @@ func (db *DB) flushDirtyIndexPages() error {
 	defer db.cacheMutex.RUnlock()
 
 	for _, entry := range db.pageCache {
-		if entry.PageType == ContentTypeRadix && entry.RadixPage != nil && entry.RadixPage.Dirty {
+		if entry.PageType == ContentTypeRadix && entry.RadixPage != nil && entry.RadixPage.dirty {
 			if err := db.writeRadixPage(entry.RadixPage); err != nil {
 				return err
 			}
-		} else if entry.PageType == ContentTypeLeaf && entry.LeafPage != nil && entry.LeafPage.Dirty {
+		} else if entry.PageType == ContentTypeLeaf && entry.LeafPage != nil && entry.LeafPage.dirty {
 			if err := db.writeLeafPage(entry.LeafPage); err != nil {
 				return err
 			}
@@ -1558,8 +1726,6 @@ func equal(a, b []byte) bool {
 func (db *DB) allocateRadixPage() (*RadixPage, error) {
 	// Allocate the page data
 	data := make([]byte, PageSize)
-	data[0] = ContentTypeRadix // Set content type in header
-	data[1] = 0                // No sub-pages used initially
 
 	// Calculate new page number
 	pageNumber := uint32(db.indexFileSize / PageSize)
@@ -1572,11 +1738,10 @@ func (db *DB) allocateRadixPage() (*RadixPage, error) {
 
 	radixPage := &RadixPage{
 		BasePage: BasePage{
-			PageNumber:  pageNumber,
-			Offset:      offset,
-			Dirty:       false,
+			pageNumber:  pageNumber,
+			offset:      offset,
+			dirty:       false,
 			data:        data,
-			contentType: ContentTypeRadix,
 		},
 		SubPagesUsed: 0,
 	}
@@ -1601,7 +1766,7 @@ func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
 
 			// Increment the sub-page counter (will be written when the page is updated)
 			db.lastRadixPage.SubPagesUsed++
-			db.lastRadixPage.Dirty = true
+			db.lastRadixPage.dirty = true
 
 			// Update the page in the cache (no need to write to disk yet)
 			db.addToCache(db.lastRadixPage)
@@ -1635,7 +1800,6 @@ func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
 func (db *DB) allocateLeafPage() (*LeafPage, error) {
 	// Allocate the page data
 	data := make([]byte, PageSize)
-	data[0] = ContentTypeLeaf // Set content type in header
 
 	// Calculate new page number
 	pageNumber := uint32(db.indexFileSize / PageSize)
@@ -1648,11 +1812,10 @@ func (db *DB) allocateLeafPage() (*LeafPage, error) {
 
 	leafPage := &LeafPage{
 		BasePage: BasePage{
-			PageNumber:  pageNumber,
-			Offset:      offset,
-			Dirty:       false,
+			pageNumber:  pageNumber,
+			offset:      offset,
+			dirty:       false,
 			data:        data,
-			contentType: ContentTypeLeaf,
 		},
 		ContentSize: LeafHeaderSize,
 		Entries:     make([]LeafEntry, 0),
@@ -1675,22 +1838,22 @@ func (db *DB) parseLeafEntries(leafPage *LeafPage) ([]LeafEntry, error) {
 	var entries []LeafEntry
 
 	// Start at header size
-	pos := LeafHeaderSize
+	pos := int(LeafHeaderSize)
 
 	// Read entries until we reach content size
-	for pos < leafPage.ContentSize {
+	for pos < int(leafPage.ContentSize) {
 		// Read suffix length
 		suffixLen64, bytesRead := varint.Read(leafPage.data[pos:])
 		if bytesRead == 0 {
 			return nil, fmt.Errorf("failed to read suffix length")
 		}
 		suffixLen := int(suffixLen64)
-		pos += uint16(bytesRead)
+		pos += bytesRead
 
 		// Read suffix
 		suffix := make([]byte, suffixLen)
-		copy(suffix, leafPage.data[pos:pos+uint16(suffixLen)])
-		pos += uint16(suffixLen)
+		copy(suffix, leafPage.data[pos:pos+suffixLen])
+		pos += suffixLen
 
 		// Read data offset
 		dataOffset := int64(binary.LittleEndian.Uint64(leafPage.data[pos:]))
@@ -1719,22 +1882,22 @@ func (db *DB) addLeafEntry(leafPage *LeafPage, suffix []byte, dataOffset int64) 
 	}
 
 	// Get current content position
-	pos := leafPage.ContentSize
+	pos := int(leafPage.ContentSize)
 
 	// Write suffix length
 	suffixLenWritten := varint.Write(leafPage.data[pos:], uint64(len(suffix)))
-	pos += uint16(suffixLenWritten)
+	pos += suffixLenWritten
 
 	// Write suffix
 	copy(leafPage.data[pos:], suffix)
-	pos += uint16(len(suffix))
+	pos += len(suffix)
 
 	// Write data offset
 	binary.LittleEndian.PutUint64(leafPage.data[pos:], uint64(dataOffset))
 	pos += 8
 
 	// Update content size
-	leafPage.ContentSize = pos
+	leafPage.ContentSize = uint16(pos)
 
 	// Add to entries list
 	leafPage.Entries = append(leafPage.Entries, LeafEntry{
@@ -1743,9 +1906,60 @@ func (db *DB) addLeafEntry(leafPage *LeafPage, suffix []byte, dataOffset int64) 
 	})
 
 	// Mark page as dirty
-	leafPage.Dirty = true
+	leafPage.dirty = true
 
 	return true
+}
+
+// removeLeafEntryAt removes an entry from a leaf page at the given index
+// Returns true if the entry was removed
+func (db *DB) removeLeafEntryAt(leafPage *LeafPage, index int) bool {
+	// Check if index is valid
+	if index < 0 || index >= len(leafPage.Entries) {
+		return false
+	}
+
+	// Remove the entry from the entries list
+	leafPage.Entries = append(leafPage.Entries[:index], leafPage.Entries[index+1:]...)
+
+	// Rebuild the page data with the updated entries list
+	db.rebuildLeafPageData(leafPage)
+
+	// Mark page as dirty
+	leafPage.dirty = true
+
+	return true
+}
+
+// rebuildLeafPageData rebuilds the leaf page data from the entries list
+func (db *DB) rebuildLeafPageData(leafPage *LeafPage) {
+	// Reset content size to header size
+	leafPage.ContentSize = LeafHeaderSize
+
+	// Clear data after header
+	for i := LeafHeaderSize; i < PageSize; i++ {
+		leafPage.data[i] = 0
+	}
+
+	// Rebuild data from entries
+	pos := int(LeafHeaderSize)
+
+	for _, entry := range leafPage.Entries {
+		// Write suffix length
+		suffixLenWritten := varint.Write(leafPage.data[pos:], uint64(len(entry.Suffix)))
+		pos += suffixLenWritten
+
+		// Write suffix
+		copy(leafPage.data[pos:], entry.Suffix)
+		pos += len(entry.Suffix)
+
+		// Write data offset
+		binary.LittleEndian.PutUint64(leafPage.data[pos:], uint64(entry.DataOffset))
+		pos += 8
+	}
+
+	// Update content size
+	leafPage.ContentSize = uint16(pos)
 }
 
 // getLeafEntries returns all entries in a leaf page
@@ -1753,22 +1967,22 @@ func (db *DB) getLeafEntries(leafPage *LeafPage) ([]LeafEntry, error) {
 	var entries []LeafEntry
 
 	// Start at header size
-	pos := LeafHeaderSize
+	pos := int(LeafHeaderSize)
 
 	// Read entries until we reach content size
-	for pos < leafPage.ContentSize {
+	for pos < int(leafPage.ContentSize) {
 		// Read suffix length
 		suffixLen64, bytesRead := varint.Read(leafPage.data[pos:])
 		if bytesRead == 0 {
 			return nil, fmt.Errorf("failed to read suffix length")
 		}
 		suffixLen := int(suffixLen64)
-		pos += uint16(bytesRead)
+		pos += bytesRead
 
 		// Read suffix
 		suffix := make([]byte, suffixLen)
-		copy(suffix, leafPage.data[pos:pos+uint16(suffixLen)])
-		pos += uint16(suffixLen)
+		copy(suffix, leafPage.data[pos:pos+suffixLen])
+		pos += suffixLen
 
 		// Read data offset
 		dataOffset := int64(binary.LittleEndian.Uint64(leafPage.data[pos:]))
@@ -1796,7 +2010,8 @@ func (db *DB) setRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValu
 	}
 
 	// Calculate base offset for this entry in the page data
-	entryOffset := RadixHeaderSize + int(subPageIdx)*EntriesPerSubPage*RadixEntrySize + int(byteValue)*RadixEntrySize
+	subPageOffset := RadixHeaderSize + int(subPageIdx) * SubPageSize
+	entryOffset := subPageOffset + int(byteValue) * RadixEntrySize
 
 	// Write page number (4 bytes)
 	binary.LittleEndian.PutUint32(radixPage.data[entryOffset:entryOffset+4], pageNumber)
@@ -1805,7 +2020,7 @@ func (db *DB) setRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValu
 	radixPage.data[entryOffset+4] = nextSubPageIdx
 
 	// Mark page as dirty
-	radixPage.Dirty = true
+	radixPage.dirty = true
 }
 
 // getRadixPageEntry gets an entry from a radix page
@@ -1816,7 +2031,8 @@ func (db *DB) getRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValu
 	}
 
 	// Calculate base offset for this entry in the page data
-	entryOffset := RadixHeaderSize + int(subPageIdx)*EntriesPerSubPage*RadixEntrySize + int(byteValue)*RadixEntrySize
+	subPageOffset := RadixHeaderSize + int(subPageIdx) * SubPageSize
+	entryOffset := subPageOffset + int(byteValue) * RadixEntrySize
 
 	// Read page number (4 bytes)
 	pageNumber = binary.LittleEndian.Uint32(radixPage.data[entryOffset:entryOffset+4])
@@ -1825,6 +2041,31 @@ func (db *DB) getRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValu
 	nextSubPageIdx = radixPage.data[entryOffset+4]
 
 	return pageNumber, nextSubPageIdx
+}
+
+// getEmptySuffixOffset gets the empty suffix offset for a radix sub-page
+func (db *DB) getEmptySuffixOffset(subPage *RadixSubPage) int64 {
+	// Calculate the offset for the empty suffix in the page data
+	// Each sub-page has 256 entries of 5 bytes each, followed by an 8-byte empty suffix offset
+	subPageOffset := RadixHeaderSize + int(subPage.SubPageIdx) * SubPageSize
+	emptySuffixOffsetPos := subPageOffset + EntriesPerSubPage * RadixEntrySize
+
+	// Read the 8-byte offset
+	return int64(binary.LittleEndian.Uint64(subPage.Page.data[emptySuffixOffsetPos:emptySuffixOffsetPos+8]))
+}
+
+// setEmptySuffixOffset sets the empty suffix offset for a radix sub-page
+func (db *DB) setEmptySuffixOffset(subPage *RadixSubPage, offset int64) {
+	// Calculate the offset for the empty suffix in the page data
+	// Each sub-page has 256 entries of 5 bytes each, followed by an 8-byte empty suffix offset
+	subPageOffset := RadixHeaderSize + int(subPage.SubPageIdx) * SubPageSize
+	emptySuffixOffsetPos := subPageOffset + EntriesPerSubPage * RadixEntrySize
+
+	// Write the 8-byte offset
+	binary.LittleEndian.PutUint64(subPage.Page.data[emptySuffixOffsetPos:emptySuffixOffsetPos+8], uint64(offset))
+
+	// Mark the page as dirty
+	subPage.Page.dirty = true
 }
 
 // setRadixEntry sets an entry in a radix sub-page
@@ -1850,8 +2091,8 @@ func (db *DB) preloadRadixLevels() error {
 	}
 
 	// For each entry in the root sub-page (first level), load the referenced sub-pages
-	for byteValue := uint8(0); byteValue < 256; byteValue++ {
-		pageNumber, _ := db.getRadixEntry(rootSubPage, byteValue)
+	for byteValue := 0; byteValue < 256; byteValue++ {
+		pageNumber, _ := db.getRadixEntry(rootSubPage, uint8(byteValue))
 		if pageNumber > 0 {
 			// Load this page into cache if not already there
 			_, err := db.loadRadixPage(pageNumber)
@@ -1884,10 +2125,10 @@ func (db *DB) initializeRadixLevels() error {
 
 	// First level: Mark the root page as having one sub-page used
 	rootRadixPage.SubPagesUsed = 1
-	rootRadixPage.Dirty = true
+	rootRadixPage.dirty = true
 
 	// For the first 256 possible values in the first byte, create entries in the radix tree
-	for byteValue := uint8(0); byteValue < 256; byteValue++ {
+	for byteValue := 0; byteValue < 256; byteValue++ {
 		// Allocate a new sub-page for this byte value
 		childSubPage, err := db.allocateRadixSubPage()
 		if err != nil {
@@ -1895,8 +2136,55 @@ func (db *DB) initializeRadixLevels() error {
 		}
 
 		// Link from root page to this page/sub-page
-		db.setRadixEntry(rootSubPage, byteValue, childSubPage.Page.PageNumber, childSubPage.SubPageIdx)
+		db.setRadixEntry(rootSubPage, uint8(byteValue), childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
 	}
+
+	return nil
+}
+
+// convertLeafToRadix converts a leaf page to a radix page when it's full
+// It creates a new radix page with the same page number as the leaf page,
+// and redistributes all entries from the leaf page to appropriate new leaf pages
+func (db *DB) convertLeafToRadix(leafPage *LeafPage, newSuffix []byte, newDataOffset int64) error {
+	debugPrint("Converting leaf page %d to radix page\n", leafPage.pageNumber)
+
+	// Create a new radix page with the same page number
+	radixPage := &RadixPage{
+		BasePage: BasePage{
+			pageNumber: leafPage.pageNumber,
+			offset:     leafPage.offset,
+			dirty:      true,
+			data:       make([]byte, PageSize),
+		},
+		SubPagesUsed: 1, // Start with one sub-page
+	}
+
+	// Update the cache to replace the leaf page with the radix page
+	db.addToCache(radixPage)
+
+	// Create a pointer to the radix sub-page
+	radixSubPage := &RadixSubPage{
+		Page:       radixPage,
+		SubPageIdx: 0,
+	}
+
+	// Add the new entry to the collection of entries we need to redistribute
+	entries := append(leafPage.Entries, LeafEntry{
+		Suffix:     newSuffix,
+		DataOffset: newDataOffset,
+	})
+
+	// Process all entries from the leaf page plus the new entry
+	for _, entry := range entries {
+		// Add it to the newly created radix sub-page
+		// The first byte of the suffix determines which branch to take
+		if err := db.setContentOnIndex(radixSubPage, entry.Suffix, 0, entry.DataOffset); err != nil {
+			return fmt.Errorf("failed to convert leaf page to radix page: %w", err)
+		}
+	}
+
+	// Mark the radix page as dirty
+	radixPage.dirty = true
 
 	return nil
 }
