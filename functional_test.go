@@ -9,13 +9,13 @@ import (
 
 func TestDatabaseBasicOperations(t *testing.T) {
 	// Create a test database
-	dbPath := "test_db.db"
+	dbPath := "test_basic.db"
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
 
 	// Open a new database
-	db, err := Open(dbPath, Options{"MainIndexPages": 1})
+	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
@@ -24,7 +24,7 @@ func TestDatabaseBasicOperations(t *testing.T) {
 		//os.Remove(dbPath) // Clean up after test
 	}()
 
-	// Test setting multiple key-value pairs similar to main.go
+	// Test setting a key-value pair
 	err = db.Set([]byte("name"), []byte("hash-table-tree"))
 	if err != nil {
 		t.Fatalf("Failed to set 'name': %v", err)
@@ -331,58 +331,6 @@ func TestDeleteOperations(t *testing.T) {
 	}
 }
 
-func TestMainIndexPagesPersistence(t *testing.T) {
-	// Create a test database with custom mainIndexPages value
-	dbPath := "test_main_index_pages.db"
-	customPages := 4 // Use a non-default value
-
-	// Clean up any existing test database
-	os.Remove(dbPath)
-
-	// Open a new database with custom mainIndexPages
-	db, err := Open(dbPath, Options{"MainIndexPages": customPages})
-	if err != nil {
-		t.Fatalf("Failed to open database with custom mainIndexPages: %v", err)
-	}
-
-	// Add some data to ensure file is written
-	err = db.Set([]byte("test_key"), []byte("test_value"))
-	if err != nil {
-		t.Fatalf("Failed to set test key-value: %v", err)
-	}
-
-	// Close the database
-	if err := db.Close(); err != nil {
-		t.Fatalf("Failed to close database: %v", err)
-	}
-
-	// Reopen the database without specifying mainIndexPages
-	reopenedDB, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to reopen database: %v", err)
-	}
-	defer func() {
-		reopenedDB.Close()
-		os.Remove(dbPath) // Clean up after test
-	}()
-
-	// Verify the mainIndexPages value was preserved
-	if reopenedDB.mainIndexPages != customPages {
-		t.Fatalf("mainIndexPages not preserved: got %d, want %d",
-			reopenedDB.mainIndexPages, customPages)
-	}
-
-	// Verify data can still be read
-	value, err := reopenedDB.Get([]byte("test_key"))
-	if err != nil {
-		t.Fatalf("Failed to get test key after reopen: %v", err)
-	}
-	if !bytes.Equal(value, []byte("test_value")) {
-		t.Fatalf("Value mismatch after reopen: got %s, want %s",
-			string(value), "test_value")
-	}
-}
-
 func TestIterator(t *testing.T) {
 	// Create a test database
 	dbPath := "test_iterator.db"
@@ -391,7 +339,7 @@ func TestIterator(t *testing.T) {
 	os.Remove(dbPath)
 
 	// Open a new database
-	db, err := Open(dbPath, Options{"MainIndexPages": 1})
+	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
@@ -416,7 +364,7 @@ func TestIterator(t *testing.T) {
 	}
 
 	// Create an iterator
-	it := db.Iterator()
+	it := db.NewIterator()
 	defer it.Close()
 
 	// Count the number of entries found
@@ -477,7 +425,7 @@ func TestIterator(t *testing.T) {
 	}
 
 	// Create a new iterator
-	modifiedIt := db.Iterator()
+	modifiedIt := db.NewIterator()
 	defer modifiedIt.Close()
 
 	// Reset tracking variables
@@ -545,7 +493,7 @@ func TestIterator(t *testing.T) {
 		os.Remove(emptyDbPath)
 	}()
 
-	emptyIt := emptyDb.Iterator()
+	emptyIt := emptyDb.NewIterator()
 	defer emptyIt.Close()
 
 	// Verify the iterator is not valid for an empty database
@@ -554,15 +502,15 @@ func TestIterator(t *testing.T) {
 	}
 }
 
-func TestIteratorWithCollisions(t *testing.T) {
+func TestIteratorWithLargeDataset(t *testing.T) {
 	// Create a test database
-	dbPath := "test_iterator_collisions.db"
+	dbPath := "test_iterator_large_dataset.db"
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
 
-	// Open a new database with minimal index pages to force collisions
-	db, err := Open(dbPath, Options{"MainIndexPages": 1})
+	// Open a new database
+	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
@@ -571,14 +519,14 @@ func TestIteratorWithCollisions(t *testing.T) {
 		os.Remove(dbPath) // Clean up after test
 	}()
 
-	// Insert many key-value pairs to ensure hash collisions
+	// Insert many key-value pairs to test iterator with a large dataset
 	numPairs := 1000
 	keys := make([]string, numPairs)
 	values := make([]string, numPairs)
 
 	for i := 0; i < numPairs; i++ {
-		keys[i] = fmt.Sprintf("collision-key-%d", i)
-		values[i] = fmt.Sprintf("collision-value-%d", i)
+		keys[i] = fmt.Sprintf("test-key-%d", i)
+		values[i] = fmt.Sprintf("test-value-%d", i)
 
 		if err := db.Set([]byte(keys[i]), []byte(values[i])); err != nil {
 			t.Fatalf("Failed to set key %d: %v", i, err)
@@ -592,7 +540,7 @@ func TestIteratorWithCollisions(t *testing.T) {
 	}
 
 	// Create an iterator
-	it := db.Iterator()
+	it := db.NewIterator()
 	defer it.Close()
 
 	// Count the number of entries found
