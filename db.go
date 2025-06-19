@@ -186,7 +186,7 @@ func Open(path string, options ...Options) (*DB, error) {
 			return nil, fmt.Errorf("failed to open main database file in read-only mode: %w", err)
 		}
 	} else {
-		mainFile, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0666)
+		mainFile, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open main database file: %w", err)
 		}
@@ -874,7 +874,8 @@ func (db *DB) initializeMainFile() error {
 	// The rest of the root page is reserved for future use
 
 	debugPrint("Writing main file root page to disk\n")
-	if _, err := db.mainFile.WriteAt(rootPage, 0); err != nil {
+	// Write the root page to the file
+	if _, err := db.mainFile.Write(rootPage); err != nil {
 		return err
 	}
 
@@ -1079,8 +1080,8 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 	// Write value
 	copy(content[offset:], value)
 
-	// Write the content to the file
-	if _, err := db.mainFile.WriteAt(content, fileSize); err != nil {
+	// Write the content to the end of the file
+	if _, err := db.mainFile.Write(content); err != nil {
 		return 0, fmt.Errorf("failed to write content: %w", err)
 	}
 
