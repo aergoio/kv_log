@@ -1,41 +1,56 @@
 package kv_log
 
-// DBIterator implements iteration over database key-value pairs
-type DBIterator struct {
+// Iterator implements iteration over database key-value pairs
+type Iterator struct {
 	db           *DB
-	currentPage  int       // Current main index page
-	currentSlot  int       // Current slot in the current page
 	currentKey   []byte    // Current key
 	currentValue []byte    // Current value
 	valid        bool      // Whether the iterator is valid
-	stack        []iterPos // Stack for depth-first traversal
 	closed       bool      // Whether the iterator is closed
+	stack        []radixIterPos // Stack for depth-first traversal
+	keyPrefix    []byte    // Current key prefix during traversal
 }
 
-// iterPos represents a position in the iteration
-type iterPos struct {
-	offset int64 // Offset of the index page
-	slot   int   // Current slot in the index page
+// radixIterPos represents a position in the radix tree traversal
+type radixIterPos struct {
+	pageNumber  uint32 // Page number of the current page
+	pageType    byte   // Type of the current page (radix or leaf)
+	byteValue   int    // Current byte value being processed (0-255)
+	subPageIdx  uint8  // Current sub-page index in radix page
+	entryIdx    int    // Current entry index in leaf page
+	emptySuffix bool   // Whether we've processed the empty suffix
 }
 
-// Iterator returns a new iterator for the database
-func (db *DB) Iterator() *DBIterator {
+// NewIterator returns a new iterator for the database
+func (db *DB) NewIterator() *Iterator {
 	// Create a new iterator
-	it := &DBIterator{
-		db:          db,
-		currentPage: 0,
-		currentSlot: -1, // Start at -1 so Next() will move to slot 0
-		valid:       false,
-		stack:       make([]iterPos, 0),
+	it := &Iterator{
+		db:         db,
+		valid:      false,
+		stack:      make([]radixIterPos, 0),
+		keyPrefix:  make([]byte, 0, MaxKeyLength),
 	}
 
-	// Move to the first entry
-	it.Next()
+	// Start with the root radix page (page 1)
+	rootSubPage, err := db.getRootRadixSubPage()
+	if err == nil {
+		// Push the root page to the stack
+		it.stack = append(it.stack, radixIterPos{
+			pageNumber: rootSubPage.Page.pageNumber,
+			pageType:   ContentTypeRadix,
+			byteValue:  -1, // Start at -1 so Next() will move to byte 0
+			subPageIdx: rootSubPage.SubPageIdx,
+		})
+
+		// Move to the first entry
+		it.Next()
+	}
+
 	return it
 }
 
 // Next moves the iterator to the next key-value pair
-func (it *DBIterator) Next() {
+func (it *Iterator) Next() {
 	if it.closed {
 		it.valid = false
 		return
@@ -49,166 +64,178 @@ func (it *DBIterator) Next() {
 	// we might get inconsistent data, but that's acceptable for read operations
 	// The mutex above protects against concurrent modifications from the same process
 
-	// If we have positions in the stack, process them first (depth-first traversal)
-	if len(it.stack) > 0 {
-		// Get the top position from the stack
-		pos := it.stack[len(it.stack)-1]
+	for len(it.stack) > 0 {
+		// Get the current position from the top of the stack
+		pos := &it.stack[len(it.stack)-1]
 
-		// Move to the next slot in the current index page
-		pos.slot++
-
-		// Update the stack
-		it.stack[len(it.stack)-1] = pos
-
-		// Check if the offset is valid
-		if pos.offset < 0 || pos.offset >= it.db.fileSize {
-			// Invalid offset, pop it from the stack and continue
-			it.stack = it.stack[:len(it.stack)-1]
-			it.Next()
-			return
-		}
-
-		// Read the index page
-		indexPage, err := it.db.readIndexPage(pos.offset)
-		if err != nil {
-			// If we can't read the page, pop it from the stack and continue
-			it.stack = it.stack[:len(it.stack)-1]
-			it.Next()
-			return
-		}
-
-		// Find the next non-empty slot
-		for pos.slot < MaxIndexEntries {
-			contentOffset := it.db.readIndexEntry(indexPage, pos.slot)
-			if contentOffset != 0 {
-				// Check if the offset is valid
-				if contentOffset < 0 || contentOffset >= it.db.fileSize {
-					// Invalid offset, move to the next slot
-					pos.slot++
-					it.stack[len(it.stack)-1] = pos
-					continue
-				}
-
-				// Found an entry, process it
-				content, err := it.db.readContent(contentOffset)
-				if err == nil {
-					if content.contentType == ContentTypeData {
-						// It's a data entry, return it
-						it.currentKey = content.key
-						it.currentValue = content.value
-						it.valid = true
-						return
-					} else if content.contentType == ContentTypeIndex {
-						// It's an index page, push it to the stack
-						it.stack = append(it.stack, iterPos{
-							offset: contentOffset,
-							slot:   -1, // Start at -1 so we'll move to slot 0
-						})
-						// Process this new index page
-						it.Next()
-						return
-					}
-				}
+		// Process based on page type
+		if pos.pageType == ContentTypeRadix {
+			// Process radix page
+			if !it.processRadixPage(pos) {
+				// If we've exhausted this radix page, pop it from the stack and continue
+				it.popStackAndTrimPrefix()
+				continue
 			}
-
-			// Move to the next slot
-			pos.slot++
-			it.stack[len(it.stack)-1] = pos
-		}
-
-		// If we get here, we've exhausted this index page
-		it.stack = it.stack[:len(it.stack)-1]
-		// Continue with the next entry
-		it.Next()
-		return
-	}
-
-	// Process main index pages
-	for it.currentPage < it.db.mainIndexPages {
-		// Move to the next slot
-		it.currentSlot++
-
-		// If we've exhausted the current page, move to the next page
-		if it.currentSlot >= MaxIndexEntries {
-			it.currentPage++
-			it.currentSlot = 0
-
-			// If we've exhausted all pages, we're done
-			if it.currentPage >= it.db.mainIndexPages {
-				it.valid = false
-				return
+			return
+		} else if pos.pageType == ContentTypeLeaf {
+			// Process leaf page
+			if !it.processLeafPage(pos) {
+				// If we've exhausted this leaf page, pop it from the stack and continue
+				it.popStackAndTrimPrefix()
+				continue
 			}
-		}
-
-		// Calculate the offset of the current main index page
-		pageOffset := int64(it.currentPage + 1) * PageSize
-
-		// Check if page offset is valid
-		if pageOffset >= it.db.fileSize {
-			// Invalid offset, move to the next page
-			it.currentPage++
-			it.currentSlot = -1 // Start at -1 so we'll move to slot 0
-			continue
-		}
-
-		// Read the index page
-		indexPage, err := it.db.readIndexPage(pageOffset)
-		if err != nil {
-			// If we can't read the page, move to the next page
-			it.currentPage++
-			it.currentSlot = -1 // Start at -1 so we'll move to slot 0
-			continue
-		}
-
-		// Read the entry at the current slot
-		contentOffset := it.db.readIndexEntry(indexPage, it.currentSlot)
-		if contentOffset == 0 {
-			// Empty slot, continue
-			continue
-		}
-
-		// Check if content offset is valid
-		if contentOffset < 0 || contentOffset >= it.db.fileSize {
-			// Invalid offset, continue
-			continue
-		}
-
-		// Read the content at the offset
-		content, err := it.db.readContent(contentOffset)
-		if err != nil {
-			// If we can't read the content, continue
-			continue
-		}
-
-		if content.contentType == ContentTypeData {
-			// It's a data entry, return it
-			it.currentKey = content.key
-			it.currentValue = content.value
-			it.valid = true
-			return
-		} else if content.contentType == ContentTypeIndex {
-			// It's an index page, push it to the stack
-			it.stack = append(it.stack, iterPos{
-				offset: contentOffset,
-				slot:   -1, // Start at -1 so we'll move to slot 0
-			})
-			// Process this index page
-			it.Next()
 			return
 		}
+
+		// If we get here with an unknown page type, pop it and continue
+		it.popStackAndTrimPrefix()
 	}
 
 	// If we get here, we've exhausted all pages
 	it.valid = false
 }
 
+// processRadixPage processes the current radix page position
+// Returns true if a valid entry was found, false if the page is exhausted
+func (it *Iterator) processRadixPage(pos *radixIterPos) bool {
+	// Get the radix page
+	radixPage, err := it.db.getRadixPage(pos.pageNumber)
+	if err != nil {
+		return false
+	}
+
+	// Create a radix sub-page
+	subPage := &RadixSubPage{
+		Page:      radixPage,
+		SubPageIdx: pos.subPageIdx,
+	}
+
+	// Check if we need to process the empty suffix
+	if !pos.emptySuffix {
+		// First, check the empty suffix
+		emptySuffixOffset := it.db.getEmptySuffixOffset(subPage)
+		if emptySuffixOffset > 0 {
+			// Read the content at the offset
+			content, err := it.db.readContent(emptySuffixOffset)
+			if err == nil {
+				// Found a valid entry
+				it.currentKey = content.key
+				it.currentValue = content.value
+				it.valid = true
+
+				// Mark that we've processed the empty suffix
+				pos.emptySuffix = true
+				return true
+			}
+		}
+
+		// Mark that we've processed the empty suffix
+		pos.emptySuffix = true
+	}
+
+	// Process next byte value
+	for pos.byteValue < 255 {
+		pos.byteValue++
+		byteValue := uint8(pos.byteValue)
+
+		// Get the next page number and sub-page index
+		nextPageNumber, nextSubPageIdx := it.db.getRadixEntry(subPage, byteValue)
+		if nextPageNumber == 0 {
+			// No entry for this byte, continue
+			continue
+		}
+
+		// Found an entry, load the page
+		page, err := it.db.getPage(nextPageNumber)
+		if err != nil {
+			// If we can't load the page, continue
+			continue
+		}
+
+		// Add this byte to the key prefix
+		it.keyPrefix = append(it.keyPrefix, byteValue)
+
+		// Push the new page to the stack
+		if page.PageType == ContentTypeRadix {
+			it.stack = append(it.stack, radixIterPos{
+				pageNumber: nextPageNumber,
+				pageType:   ContentTypeRadix,
+				byteValue:  -1, // Start at -1 so we'll move to byte 0
+				subPageIdx: nextSubPageIdx,
+			})
+			return it.processRadixPage(&it.stack[len(it.stack)-1])
+		} else if page.PageType == ContentTypeLeaf {
+			it.stack = append(it.stack, radixIterPos{
+				pageNumber: nextPageNumber,
+				pageType:   ContentTypeLeaf,
+				entryIdx:   -1, // Start at -1 so we'll move to entry 0
+			})
+			return it.processLeafPage(&it.stack[len(it.stack)-1])
+		}
+	}
+
+	// If we get here, we've exhausted this radix page
+	return false
+}
+
+// processLeafPage processes the current leaf page position
+// Returns true if a valid entry was found, false if the page is exhausted
+func (it *Iterator) processLeafPage(pos *radixIterPos) bool {
+	// Get the leaf page
+	leafPage, err := it.db.getLeafPage(pos.pageNumber)
+	if err != nil {
+		return false
+	}
+
+	// Move to the next entry
+	pos.entryIdx++
+
+	// Check if we've exhausted all entries
+	if pos.entryIdx >= len(leafPage.Entries) {
+		return false
+	}
+
+	// Get the current entry
+	entry := leafPage.Entries[pos.entryIdx]
+
+	// Read the content at the offset
+	content, err := it.db.readContent(entry.DataOffset)
+	if err != nil {
+		// If we can't read the content, move to the next entry
+		pos.entryIdx++
+		return it.processLeafPage(pos)
+	}
+
+	// Found a valid entry
+	it.currentKey = content.key
+	it.currentValue = content.value
+	it.valid = true
+	return true
+}
+
+// popStackAndTrimPrefix pops the top position from the stack and trims the key prefix
+func (it *Iterator) popStackAndTrimPrefix() {
+	if len(it.stack) > 0 {
+		// If we're popping a radix page and we added a byte to the prefix
+		if it.stack[len(it.stack)-1].pageType == ContentTypeRadix &&
+		   it.stack[len(it.stack)-1].byteValue >= 0 &&
+		   len(it.keyPrefix) > 0 {
+			// Remove the last byte from the key prefix
+			it.keyPrefix = it.keyPrefix[:len(it.keyPrefix)-1]
+		}
+
+		// Pop the stack
+		it.stack = it.stack[:len(it.stack)-1]
+	}
+}
+
 // Valid returns whether the iterator is valid
-func (it *DBIterator) Valid() bool {
+func (it *Iterator) Valid() bool {
 	return !it.closed && it.valid
 }
 
 // Key returns the current key
-func (it *DBIterator) Key() []byte {
+func (it *Iterator) Key() []byte {
 	if !it.Valid() {
 		return nil
 	}
@@ -216,7 +243,7 @@ func (it *DBIterator) Key() []byte {
 }
 
 // Value returns the current value
-func (it *DBIterator) Value() []byte {
+func (it *Iterator) Value() []byte {
 	if !it.Valid() {
 		return nil
 	}
@@ -224,7 +251,7 @@ func (it *DBIterator) Value() []byte {
 }
 
 // Close closes the iterator
-func (it *DBIterator) Close() {
+func (it *Iterator) Close() {
 	it.closed = true
 	it.valid = false
 }
