@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -1705,7 +1706,20 @@ func (db *DB) flushAllIndexPages() error {
 	db.cacheMutex.RLock()
 	defer db.cacheMutex.RUnlock()
 
-	for _, entry := range db.pageCache {
+	// Get all page numbers and sort them
+	pageNumbers := make([]uint32, 0, len(db.pageCache))
+	for pageNumber := range db.pageCache {
+		pageNumbers = append(pageNumbers, pageNumber)
+	}
+
+	// Sort page numbers in ascending order
+	sort.Slice(pageNumbers, func(i, j int) bool {
+		return pageNumbers[i] < pageNumbers[j]
+	})
+
+	// Process pages in order
+	for _, pageNumber := range pageNumbers {
+		entry := db.pageCache[pageNumber]
 		if entry.PageType == ContentTypeRadix && entry.RadixPage != nil {
 			if err := db.writeRadixPage(entry.RadixPage); err != nil {
 				return err
@@ -1725,7 +1739,20 @@ func (db *DB) flushDirtyIndexPages() error {
 	db.cacheMutex.RLock()
 	defer db.cacheMutex.RUnlock()
 
-	for _, entry := range db.pageCache {
+	// Get all page numbers and sort them
+	pageNumbers := make([]uint32, 0, len(db.pageCache))
+	for pageNumber := range db.pageCache {
+		pageNumbers = append(pageNumbers, pageNumber)
+	}
+
+	// Sort page numbers in ascending order
+	sort.Slice(pageNumbers, func(i, j int) bool {
+		return pageNumbers[i] < pageNumbers[j]
+	})
+
+	// Process pages in order
+	for _, pageNumber := range pageNumbers {
+		entry := db.pageCache[pageNumber]
 		if entry.PageType == ContentTypeRadix && entry.RadixPage != nil && entry.RadixPage.dirty {
 			if err := db.writeRadixPage(entry.RadixPage); err != nil {
 				return err
