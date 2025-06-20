@@ -647,8 +647,8 @@ func (db *DB) setOnLeafPage(key, value []byte, leafPage *LeafPage, subPage *Radi
 				return fmt.Errorf("failed to append data: %w", err)
 			}
 
-			// Update the entry
-			leafPage.Entries[i].DataOffset = dataOffset
+			// Update the entry on the leaf page
+			db.updateLeafEntryOffset(leafPage, i, dataOffset)
 
 			// Mark the leaf page as dirty
 			leafPage.dirty = true
@@ -2006,6 +2006,45 @@ func (db *DB) removeLeafEntryAt(leafPage *LeafPage, index int) bool {
 	leafPage.dirty = true
 
 	return true
+}
+
+// updateLeafEntryOffset updates the content offset for an existing leaf entry in the data buffer
+func (db *DB) updateLeafEntryOffset(leafPage *LeafPage, index int, dataOffset int64) {
+
+	// Update the entry
+	leafPage.Entries[index].DataOffset = dataOffset
+
+	// We need to find the position of this entry in the data buffer
+	pos := int(LeafHeaderSize)
+
+	// Iterate through entries until we reach the one we want to update
+	for i := 0; i < index; i++ {
+		// Skip the suffix length
+		suffixLen64, bytesRead := varint.Read(leafPage.data[pos:])
+		suffixLen := int(suffixLen64)
+		pos += bytesRead
+
+		// Skip the suffix
+		pos += suffixLen
+
+		// Skip the data offset
+		pos += 8
+	}
+
+	// Now we're at the start of our target entry
+	// Skip the suffix length
+	suffixLen64, bytesRead := varint.Read(leafPage.data[pos:])
+	suffixLen := int(suffixLen64)
+	pos += bytesRead
+
+	// Skip the suffix
+	pos += suffixLen
+
+	// Write the new data offset
+	binary.LittleEndian.PutUint64(leafPage.data[pos:], uint64(dataOffset))
+
+	// Mark the page as dirty
+	leafPage.dirty = true
 }
 
 // rebuildLeafPageData rebuilds the leaf page data from the entries list

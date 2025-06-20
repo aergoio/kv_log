@@ -331,6 +331,204 @@ func TestDeleteOperations(t *testing.T) {
 	}
 }
 
+func TestDatabasePersistence1(t *testing.T) {
+	// Create a test database
+	dbPath := "test_persistence.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Set initial key-value pairs
+	initialData := map[string]string{
+		"key1": "value1",
+		"key2": "value2",
+		"key3": "value3",
+		"key4": "value4",
+	}
+
+	for k, v := range initialData {
+		if err := db.Set([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("Failed to set '%s': %v", k, err)
+		}
+	}
+
+	// Modify some data
+	if err := db.Set([]byte("key2"), []byte("modified2")); err != nil {
+		t.Fatalf("Failed to update 'key2': %v", err)
+	}
+
+	// Delete a key
+	if err := db.Delete([]byte("key3")); err != nil {
+		t.Fatalf("Failed to delete 'key3': %v", err)
+	}
+
+	// Close the database
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen the database
+	reopenedDb, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer func() {
+		reopenedDb.Close()
+		os.Remove(dbPath) // Clean up after test
+	}()
+
+	// Verify key1 still exists with original value
+	val1, err := reopenedDb.Get([]byte("key1"))
+	if err != nil {
+		t.Fatalf("Failed to get 'key1' after reopen: %v", err)
+	}
+	if !bytes.Equal(val1, []byte("value1")) {
+		t.Fatalf("Value mismatch for 'key1' after reopen: got %s, want %s", string(val1), "value1")
+	}
+
+	// Verify key2 has the modified value
+	val2, err := reopenedDb.Get([]byte("key2"))
+	if err != nil {
+		t.Fatalf("Failed to get 'key2' after reopen: %v", err)
+	}
+	if !bytes.Equal(val2, []byte("modified2")) {
+		t.Fatalf("Value mismatch for 'key2' after reopen: got %s, want %s", string(val2), "modified2")
+	}
+
+	// Verify key3 was deleted
+	_, err = reopenedDb.Get([]byte("key3"))
+	if err == nil {
+		t.Fatalf("Expected error when getting deleted key 'key3' after reopen, got nil")
+	}
+
+	// Verify key4 still exists with original value
+	val4, err := reopenedDb.Get([]byte("key4"))
+	if err != nil {
+		t.Fatalf("Failed to get 'key4' after reopen: %v", err)
+	}
+	if !bytes.Equal(val4, []byte("value4")) {
+		t.Fatalf("Value mismatch for 'key4' after reopen: got %s, want %s", string(val4), "value4")
+	}
+
+	// Add a new key to the reopened database
+	if err := reopenedDb.Set([]byte("key5"), []byte("value5")); err != nil {
+		t.Fatalf("Failed to set 'key5' after reopen: %v", err)
+	}
+
+	// Verify the new key exists
+	val5, err := reopenedDb.Get([]byte("key5"))
+	if err != nil {
+		t.Fatalf("Failed to get 'key5' after setting: %v", err)
+	}
+	if !bytes.Equal(val5, []byte("value5")) {
+		t.Fatalf("Value mismatch for 'key5': got %s, want %s", string(val5), "value5")
+	}
+}
+
+func TestDatabasePersistence2(t *testing.T) {
+	// Create a test database
+	dbPath := "test_persistence2.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Test setting key-value pairs from TestDatabaseBasicOperations
+	err = db.Set([]byte("name"), []byte("hash-table-tree"))
+	if err != nil {
+		t.Fatalf("Failed to set 'name': %v", err)
+	}
+
+	err = db.Set([]byte("author"), []byte("Bernardo"))
+	if err != nil {
+		t.Fatalf("Failed to set 'author': %v", err)
+	}
+
+	err = db.Set([]byte("type"), []byte("key-value database"))
+	if err != nil {
+		t.Fatalf("Failed to set 'type': %v", err)
+	}
+
+	// Update a key
+	err = db.Set([]byte("name"), []byte("hash-table-tree DB"))
+	if err != nil {
+		t.Fatalf("Failed to update 'name': %v", err)
+	}
+
+	// Delete a key
+	err = db.Delete([]byte("author"))
+	if err != nil {
+		t.Fatalf("Failed to delete 'author': %v", err)
+	}
+
+	// Close the database
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen the database
+	reopenedDb, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer func() {
+		reopenedDb.Close()
+		os.Remove(dbPath) // Clean up after test
+	}()
+
+	// Verify name has the updated value
+	nameVal, err := reopenedDb.Get([]byte("name"))
+	if err != nil {
+		t.Fatalf("Failed to get 'name' after reopen: %v", err)
+	}
+	if !bytes.Equal(nameVal, []byte("hash-table-tree DB")) {
+		t.Fatalf("Value mismatch for 'name' after reopen: got %s, want %s",
+			string(nameVal), "hash-table-tree DB")
+	}
+
+	// Verify author was deleted
+	_, err = reopenedDb.Get([]byte("author"))
+	if err == nil {
+		t.Fatalf("Expected error when getting deleted key 'author' after reopen, got nil")
+	}
+
+	// Verify type still exists with original value
+	typeVal, err := reopenedDb.Get([]byte("type"))
+	if err != nil {
+		t.Fatalf("Failed to get 'type' after reopen: %v", err)
+	}
+	if !bytes.Equal(typeVal, []byte("key-value database")) {
+		t.Fatalf("Value mismatch for 'type' after reopen: got %s, want %s",
+			string(typeVal), "key-value database")
+	}
+
+	// Add a new key after reopening
+	err = reopenedDb.Set([]byte("version"), []byte("1.0"))
+	if err != nil {
+		t.Fatalf("Failed to set 'version' after reopen: %v", err)
+	}
+
+	// Verify the new key exists
+	versionVal, err := reopenedDb.Get([]byte("version"))
+	if err != nil {
+		t.Fatalf("Failed to get 'version': %v", err)
+	}
+	if !bytes.Equal(versionVal, []byte("1.0")) {
+		t.Fatalf("Value mismatch for 'version': got %s, want %s", string(versionVal), "1.0")
+	}
+}
+
 func TestIterator(t *testing.T) {
 	// Create a test database
 	dbPath := "test_iterator.db"
