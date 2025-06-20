@@ -43,6 +43,9 @@ const (
 	EntriesPerSubPage = 256
 	// Size of each sub-page including the empty suffix offset
 	SubPageSize = EntriesPerSubPage * RadixEntrySize + 8 // 256 entries * 5 bytes + 8 bytes for empty suffix offset
+
+	// Header offsets for metadata fields
+	HeaderFreeSubPagesOffset = 16 // Offset in the index header for the free sub-pages pointer (4 bytes)
 )
 
 // Content types
@@ -79,7 +82,8 @@ type DB struct {
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
 	pageCache      map[uint32]*Page // Cache for all page types
-	lastRadixPage  *RadixPage // Last radix page with available sub-pages
+	freeSubPagesHead *RadixPage // Head of linked list of radix pages with available sub-pages
+	headerDirty    bool  // Track if the header needs to be written during sync
 }
 
 // Content represents a piece of content in the database
@@ -102,6 +106,7 @@ type BasePage struct {
 type RadixPage struct {
 	BasePage     // Embed the base Page
 	SubPagesUsed uint8  // Number of sub-pages used
+	NextFreePage uint32 // Pointer to the next radix page with free sub-pages (0 if none)
 }
 
 // RadixSubPage represents a specific sub-page within a radix page
@@ -350,12 +355,26 @@ func (db *DB) Close() error {
 
 	var mainErr, indexErr, flushErr error
 
-	// Flush all cached index pages to disk
-	if !db.readOnly && len(db.pageCache) > 0 {
-		flushErr = db.flushAllIndexPages()
-		if flushErr != nil {
-			// Log the error but continue with closing
-			debugPrint("Error flushing index pages: %v\n", flushErr)
+	// Flush all cached index pages to disk and header metadata
+	if !db.readOnly {
+		// Write header metadata if needed
+		if db.headerDirty {
+			if err := db.writeFreeSubPagesHeadToHeader(); err != nil {
+				// Log the error but continue with closing
+				debugPrint("Error writing header metadata: %v\n", err)
+				flushErr = err
+			}
+		}
+
+		if len(db.pageCache) > 0 {
+			err := db.flushAllIndexPages()
+			if err != nil {
+				// Log the error but continue with closing
+				debugPrint("Error flushing index pages: %v\n", err)
+				if flushErr == nil {
+					flushErr = err
+				}
+			}
 		}
 	}
 
@@ -896,8 +915,6 @@ func (db *DB) initializeIndexFile() error {
 	// Write the 2-byte version
 	copy(rootPage[6:8], VersionString)
 
-	// The rest of the root page is reserved for future use
-
 	debugPrint("Writing index file root page to disk\n")
 	if _, err := db.indexFile.WriteAt(rootPage, 0); err != nil {
 		return err
@@ -917,6 +934,9 @@ func (db *DB) initializeIndexFile() error {
 		return fmt.Errorf("unexpected root radix page number: %d", rootRadixPage.pageNumber)
 	}
 
+	// Cache this as the head of the free sub-pages list
+	db.freeSubPagesHead = rootRadixPage
+
 	// Initialize the first two levels of the radix tree
 	if err := db.initializeRadixLevels(); err != nil {
 		return fmt.Errorf("failed to initialize radix levels: %w", err)
@@ -926,9 +946,6 @@ func (db *DB) initializeIndexFile() error {
 	if err := db.flushAllIndexPages(); err != nil {
 		return fmt.Errorf("failed to write index pages: %w", err)
 	}
-
-	// Cache this as the last radix page
-	db.lastRadixPage = rootRadixPage
 
 	return nil
 }
@@ -950,9 +967,9 @@ func (db *DB) readHeader() error {
 		return fmt.Errorf("failed to preload radix levels: %w", err)
 	}
 
-	// Initialize the last radix page
-	if err := db.initLastRadixPage(); err != nil {
-		return fmt.Errorf("failed to initialize last radix page: %w", err)
+	// Load the linked list of radix pages with free sub-pages
+	if err := db.loadFreeSubPagesList(); err != nil {
+		return fmt.Errorf("failed to load free sub-pages list: %w", err)
 	}
 
 	return nil
@@ -1009,35 +1026,25 @@ func (db *DB) readIndexFileHeader() error {
 }
 
 // initLastRadixPage initializes the lastRadixPage field by scanning the index file
-func (db *DB) initLastRadixPage() error {
-	// If the index file only has the header page, there's nothing to do
-	if db.indexFileSize <= PageSize {
-		return nil
+func (db *DB) loadFreeSubPagesList() error {
+	var freePageNum uint32
+	headerData := make([]byte, 4)
+
+	// Read the free sub-pages head pointer from the header
+	if _, err := db.indexFile.ReadAt(headerData, HeaderFreeSubPagesOffset); err != nil {
+		return fmt.Errorf("failed to read free sub-pages pointer: %w", err)
 	}
 
-	// Scan backward from the end of the file to find the last radix page
-	// Start from the last page
-	lastPageNumber := uint32((db.indexFileSize - 1) / PageSize)
+	// Parse the free page pointer
+	freePageNum = binary.LittleEndian.Uint32(headerData)
 
-	// Skip the header page
-	if lastPageNumber == 0 {
-		lastPageNumber = 1
-	}
-
-	// Scan backward until we find the last radix page
-	for pageNum := lastPageNumber; pageNum >= 1; pageNum-- {
-		// Try to read the page
-		page, err := db.readRadixPage(pageNum)
+	// If we have a valid free page pointer
+	if freePageNum > 0 {
+		radixPage, err := db.getRadixPage(freePageNum)
 		if err != nil {
-			// If it's not a radix page, continue
-			if strings.Contains(err.Error(), "not a radix page") {
-				continue
-			}
-			return fmt.Errorf("failed to read page %d: %w", pageNum, err)
+			return fmt.Errorf("failed to get radix page: %w", err)
 		}
-		// Found the last radix page
-		db.lastRadixPage = page
-		break
+		db.freeSubPagesHead = radixPage
 	}
 
 	return nil
@@ -1237,6 +1244,12 @@ func (db *DB) readRadixPage(pageNumber uint32) (*RadixPage, error) {
 		return nil, fmt.Errorf("radix page checksum mismatch at page %d: stored=%d, calculated=%d", pageNumber, storedChecksum, calculatedChecksum)
 	}
 
+	// Read the sub-pages used
+	subPagesUsed := data[1]
+
+	// Read the next free page number
+	nextFreePage := binary.LittleEndian.Uint32(data[8:12])
+
 	// Create structured radix page
 	radixPage := &RadixPage{
 		BasePage: BasePage{
@@ -1245,7 +1258,8 @@ func (db *DB) readRadixPage(pageNumber uint32) (*RadixPage, error) {
 			dirty:       false,
 			data:        data,
 		},
-		SubPagesUsed: data[1],
+		SubPagesUsed: subPagesUsed,
+		NextFreePage: nextFreePage,
 	}
 
 	// Add to cache
@@ -1259,6 +1273,9 @@ func (db *DB) writeRadixPage(radixPage *RadixPage) error {
 	// Set page type in the data
 	radixPage.data[0] = ContentTypeRadix  // Type identifier
 	radixPage.data[1] = radixPage.SubPagesUsed // The number of sub-pages used
+
+	// Store the NextFreePage field at bytes 8-11
+	binary.LittleEndian.PutUint32(radixPage.data[8:12], radixPage.NextFreePage)
 
 	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
 	// Zero out the checksum field before calculating
@@ -1478,6 +1495,13 @@ func (db *DB) Sync() error {
 		return fmt.Errorf("cannot sync: database opened in read-only mode")
 	}
 
+	// Write header metadata if needed
+	if db.headerDirty {
+		if err := db.writeFreeSubPagesHeadToHeader(); err != nil {
+			return fmt.Errorf("failed to update free sub-pages head in header: %w", err)
+		}
+	}
+
 	// Flush all dirty pages
 	if err := db.flushDirtyIndexPages(); err != nil {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
@@ -1492,6 +1516,35 @@ func (db *DB) Sync() error {
 	if err := db.indexFile.Sync(); err != nil {
 		return fmt.Errorf("failed to sync index file: %w", err)
 	}
+
+	return nil
+}
+
+// writeFreeSubPagesHeadToHeader writes the current free sub-pages head pointer to the index file header
+func (db *DB) writeFreeSubPagesHeadToHeader() error {
+	// Don't update if database is in read-only mode
+	if db.readOnly {
+		return nil
+	}
+
+	// Determine the page number to write to the header
+	pageNumber := uint32(0)
+	if db.freeSubPagesHead != nil {
+		pageNumber = db.freeSubPagesHead.pageNumber
+	}
+
+	// Prepare the buffer with the page number
+	buffer := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buffer, pageNumber)
+
+	// Write to the header
+	_, err := db.indexFile.WriteAt(buffer, HeaderFreeSubPagesOffset)
+	if err != nil {
+		return err
+	}
+
+	// Header is no longer dirty
+	db.headerDirty = false
 
 	return nil
 }
@@ -1758,28 +1811,48 @@ func (db *DB) allocateRadixPage() (*RadixPage, error) {
 // allocateRadixSubPage returns the next available radix sub-page or creates a new one if needed
 // It returns a RadixSubPage struct
 func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
-	// If we have a cached last radix page, check if it has available sub-pages
-	if db.lastRadixPage != nil {
-		// If there are still available sub-pages
-		if db.lastRadixPage.SubPagesUsed < SubPagesPerRadixPage {
-			// Use the next available sub-page index
-			subPageIdx := db.lastRadixPage.SubPagesUsed
 
-			// Increment the sub-page counter (will be written when the page is updated)
-			db.lastRadixPage.SubPagesUsed++
-			db.lastRadixPage.dirty = true
+	// If we have a cached free radix page with available sub-pages
+	if db.freeSubPagesHead != nil && db.freeSubPagesHead.SubPagesUsed < SubPagesPerRadixPage {
+		// Use the next available sub-page index
+		subPageIdx := db.freeSubPagesHead.SubPagesUsed
 
-			// Update the page in the cache (no need to write to disk yet)
-			db.addToCache(db.lastRadixPage)
+		// Increment the sub-page counter (will be written when the page is updated)
+		db.freeSubPagesHead.SubPagesUsed++
+		db.freeSubPagesHead.dirty = true
 
-			return &RadixSubPage{
-				Page:      db.lastRadixPage,
-				SubPageIdx: subPageIdx,
-			}, nil
+		// Create a new radix sub-page
+		radixSubPage := &RadixSubPage{
+			Page:       db.freeSubPagesHead,
+			SubPageIdx: subPageIdx,
 		}
+
+		// If the page is now full, remove it from the free list
+		if db.freeSubPagesHead.SubPagesUsed >= SubPagesPerRadixPage {
+			// Save the next free page pointer
+			nextFreePage := db.freeSubPagesHead.NextFreePage
+			// Clear the next free page pointer
+			db.freeSubPagesHead.NextFreePage = 0
+
+			// Get the next free page and update the head of the free list
+			nextPage := (*RadixPage)(nil)
+			if nextFreePage > 0 {
+				// Load the next free page
+				var err error
+				nextPage, err = db.getRadixPage(nextFreePage)
+				if err != nil {
+					return nil, fmt.Errorf("failed to load next free page: %w", err)
+				}
+			}
+			db.updateFreeSubPagesHead(nextPage)
+		}
+
+		// Return the new radix sub-page
+		return radixSubPage, nil
 	}
 
-	// No available radix page found or lastRadixPage is full, create a new one
+	// No available radix page found or free list is empty
+	// Allocate a new radix page
 	newRadixPage, err := db.allocateRadixPage()
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate radix page: %w", err)
@@ -1788,11 +1861,14 @@ func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
 	// Mark first sub-page as used
 	newRadixPage.SubPagesUsed = 1
 
-	// Cache this as the last radix page
-	db.lastRadixPage = newRadixPage
+	// Mark page as dirty
+	newRadixPage.dirty = true
+
+	// Add this page to the free sub-pages list
+	db.addToFreeSubPagesList(newRadixPage)
 
 	return &RadixSubPage{
-		Page:      newRadixPage,
+		Page:       newRadixPage,
 		SubPageIdx: 0,
 	}, nil
 }
@@ -2118,15 +2194,15 @@ func (db *DB) initializeRadixLevels() error {
 		return fmt.Errorf("failed to get root radix page: %w", err)
 	}
 
-	// Create root sub-page
-	rootSubPage := &RadixSubPage{
-		Page:      rootRadixPage,
-		SubPageIdx: 0,
-	}
-
 	// First level: Mark the root page as having one sub-page used
 	rootRadixPage.SubPagesUsed = 1
 	rootRadixPage.dirty = true
+
+	// Create root sub-page
+	rootSubPage := &RadixSubPage{
+		Page:       rootRadixPage,
+		SubPageIdx: 0,
+	}
 
 	// For the first 256 possible values in the first byte, create entries in the radix tree
 	for byteValue := 0; byteValue < 256; byteValue++ {
@@ -2163,6 +2239,9 @@ func (db *DB) convertLeafToRadix(leafPage *LeafPage, newSuffix []byte, newDataOf
 	// Update the cache to replace the leaf page with the radix page
 	db.addToCache(radixPage)
 
+	// Since we're only using one sub-page initially, add this to the free list
+	db.addToFreeSubPagesList(radixPage)
+
 	// Create a pointer to the radix sub-page
 	radixSubPage := &RadixSubPage{
 		Page:       radixPage,
@@ -2188,4 +2267,45 @@ func (db *DB) convertLeafToRadix(leafPage *LeafPage, newSuffix []byte, newDataOf
 	radixPage.dirty = true
 
 	return nil
+}
+
+// addToFreeSubPagesList adds a radix page with free sub-pages to the list
+func (db *DB) addToFreeSubPagesList(radixPage *RadixPage) {
+	// Only add if the page has free sub-pages
+	if radixPage.SubPagesUsed >= SubPagesPerRadixPage {
+		return
+	}
+
+	// Don't add if it's already the head of the list
+	if db.freeSubPagesHead != nil && db.freeSubPagesHead.pageNumber == radixPage.pageNumber {
+		return
+	}
+
+	// Link this page to the current head
+	if db.freeSubPagesHead != nil {
+		radixPage.NextFreePage = db.freeSubPagesHead.pageNumber
+	} else {
+		radixPage.NextFreePage = 0
+	}
+
+	// Mark the page as dirty
+	radixPage.dirty = true
+
+	// Make it the new head
+	db.updateFreeSubPagesHead(radixPage)
+}
+
+// updateFreeSubPagesHead updates the in-memory pointer to the head of the free sub-pages list
+// The change will be written to the index header during the next Sync operation
+func (db *DB) updateFreeSubPagesHead(radixPage *RadixPage) {
+	// Don't update if database is in read-only mode
+	if db.readOnly {
+		return
+	}
+
+	// Update the in-memory pointer
+	db.freeSubPagesHead = radixPage
+
+	// Mark the header as dirty so it gets written during the next sync
+	db.headerDirty = true
 }
