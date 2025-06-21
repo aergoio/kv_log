@@ -44,9 +44,6 @@ const (
 	EntriesPerSubPage = 256
 	// Size of each sub-page including the empty suffix offset
 	SubPageSize = EntriesPerSubPage * RadixEntrySize + 8 // 256 entries * 5 bytes + 8 bytes for empty suffix offset
-
-	// Header offsets for metadata fields
-	HeaderFreeSubPagesOffset = 16 // Offset in the index header for the free sub-pages pointer (4 bytes)
 )
 
 // Content types
@@ -84,6 +81,7 @@ type DB struct {
 	readOnly       bool  // Track if the database is opened in read-only mode
 	pageCache      map[uint32]*Page // Cache for all page types
 	freeSubPagesHead *RadixPage // Head of linked list of radix pages with available sub-pages
+	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	headerDirty    bool  // Track if the header needs to be written during sync
 }
 
@@ -159,6 +157,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		if err := os.Remove(indexPath); err != nil {
 			return nil, fmt.Errorf("failed to remove index file: %w", err)
 		}
+		indexFileExists = false
 	}
 
 	// Default options
@@ -265,6 +264,19 @@ func Open(path string, options ...Options) (*DB, error) {
 			indexFile.Close()
 			return nil, fmt.Errorf("failed to read database header: %w", err)
 		}
+
+		if !readOnly {
+			// If the index file is not up-to-date, reindex the remaining content
+			if db.lastIndexedOffset < db.mainFileSize {
+				debugPrint("Index file is not up-to-date, reindexing remaining content\n")
+				if err := db.recoverUnindexedContent(); err != nil {
+					db.Unlock()
+					mainFile.Close()
+					indexFile.Close()
+					return nil, fmt.Errorf("failed to reindex database: %w", err)
+				}
+			}
+		}
 	}
 
 	return db, nil
@@ -356,27 +368,9 @@ func (db *DB) Close() error {
 
 	var mainErr, indexErr, flushErr error
 
-	// Flush all cached index pages to disk and header metadata
 	if !db.readOnly {
-		// Write header metadata if needed
-		if db.headerDirty {
-			if err := db.writeFreeSubPagesHeadToHeader(); err != nil {
-				// Log the error but continue with closing
-				debugPrint("Error writing header metadata: %v\n", err)
-				flushErr = err
-			}
-		}
-
-		if len(db.pageCache) > 0 {
-			err := db.flushAllIndexPages()
-			if err != nil {
-				// Log the error but continue with closing
-				debugPrint("Error flushing index pages: %v\n", err)
-				if flushErr == nil {
-					flushErr = err
-				}
-			}
-		}
+		// Flush the index to disk
+		flushErr = db.flushIndexToDisk()
 	}
 
 	// Close main file if open
@@ -981,18 +975,11 @@ func (db *DB) initializeMainFile() error {
 
 // initializeIndexFile initializes the index file
 func (db *DB) initializeIndexFile() error {
-	// Write file header in root page (page 0)
-	rootPage := make([]byte, PageSize)
 
-	// Write the 6-byte magic string
-	copy(rootPage[0:6], IndexFileMagicString)
-
-	// Write the 2-byte version
-	copy(rootPage[6:8], VersionString)
-
-	debugPrint("Writing index file root page to disk\n")
-	if _, err := db.indexFile.WriteAt(rootPage, 0); err != nil {
-		return err
+	// Write the index file header
+	debugPrint("Writing index file header\n")
+	if err := db.writeIndexHeader(true); err != nil {
+		return fmt.Errorf("failed to write index file header: %w", err)
 	}
 
 	// Update file size to include the root page
@@ -1017,10 +1004,10 @@ func (db *DB) initializeIndexFile() error {
 		return fmt.Errorf("failed to initialize radix levels: %w", err)
 	}
 
-	// Write all index pages to disk
-	if err := db.flushAllIndexPages(); err != nil {
-		return fmt.Errorf("failed to write index pages: %w", err)
-	}
+	// Flush the index to disk
+	//if err := db.flushIndexToDisk(); err != nil {
+	//	return fmt.Errorf("failed to flush index to disk: %w", err)
+	//}
 
 	return nil
 }
@@ -1040,11 +1027,6 @@ func (db *DB) readHeader() error {
 	// Preload the first two levels of the radix tree
 	if err := db.preloadRadixLevels(); err != nil {
 		return fmt.Errorf("failed to preload radix levels: %w", err)
-	}
-
-	// Load the linked list of radix pages with free sub-pages
-	if err := db.loadFreeSubPagesList(); err != nil {
-		return fmt.Errorf("failed to load free sub-pages list: %w", err)
 	}
 
 	return nil
@@ -1077,8 +1059,8 @@ func (db *DB) readMainFileHeader() error {
 
 // readIndexFileHeader reads the index file header
 func (db *DB) readIndexFileHeader() error {
-	// Read the header (8 bytes) in root page (page 1)
-	header := make([]byte, 8)
+	// Read the entire header page
+	header := make([]byte, PageSize)
 	if _, err := db.indexFile.ReadAt(header, 0); err != nil {
 		return err
 	}
@@ -1097,21 +1079,15 @@ func (db *DB) readIndexFileHeader() error {
 		return fmt.Errorf("unsupported index database version")
 	}
 
-	return nil
-}
-
-// initLastRadixPage initializes the lastRadixPage field by scanning the index file
-func (db *DB) loadFreeSubPagesList() error {
-	var freePageNum uint32
-	headerData := make([]byte, 4)
-
-	// Read the free sub-pages head pointer from the header
-	if _, err := db.indexFile.ReadAt(headerData, HeaderFreeSubPagesOffset); err != nil {
-		return fmt.Errorf("failed to read free sub-pages pointer: %w", err)
+	// Parse the last indexed offset from the header
+	db.lastIndexedOffset = int64(binary.LittleEndian.Uint64(header[8:16]))
+	if db.lastIndexedOffset == 0 {
+		// If the last indexed offset is 0, default to PageSize
+		db.lastIndexedOffset = PageSize
 	}
 
-	// Parse the free page pointer
-	freePageNum = binary.LittleEndian.Uint32(headerData)
+	// Parse the free sub-pages head pointer
+	freePageNum := binary.LittleEndian.Uint32(header[16:20])
 
 	// If we have a valid free page pointer
 	if freePageNum > 0 {
@@ -1121,6 +1097,54 @@ func (db *DB) loadFreeSubPagesList() error {
 		}
 		db.freeSubPagesHead = radixPage
 	}
+
+	return nil
+}
+
+// writeIndexHeader writes metadata to the index file header
+func (db *DB) writeIndexHeader(isInit bool) error {
+	// Don't update if database is in read-only mode
+	if db.readOnly {
+		return nil
+	}
+
+	// The offset of the last indexed content in the main file
+	lastIndexedOffset := int64(PageSize)
+	if !isInit {
+		lastIndexedOffset = db.mainFileSize
+	}
+
+	// The page number of the next free sub-page
+	nextFreePageNumber := uint32(0)
+	if !isInit && db.freeSubPagesHead != nil {
+		nextFreePageNumber = db.freeSubPagesHead.pageNumber
+	}
+
+	// Allocate a buffer for the entire page
+	rootPage := make([]byte, PageSize)
+
+	// Write the 6-byte magic string
+	copy(rootPage[0:6], IndexFileMagicString)
+
+	// Write the 2-byte version
+	copy(rootPage[6:8], VersionString)
+
+	// Set last indexed offset (8 bytes)
+	binary.LittleEndian.PutUint64(rootPage[8:16], uint64(lastIndexedOffset))
+
+	// Set free sub-pages head pointer (4 bytes)
+	binary.LittleEndian.PutUint32(rootPage[16:20], nextFreePageNumber)
+
+	// Write the entire root page to disk
+	if _, err := db.indexFile.WriteAt(rootPage, 0); err != nil {
+		return fmt.Errorf("failed to write index file root page: %w", err)
+	}
+
+	// Update the in-memory offset
+	db.lastIndexedOffset = lastIndexedOffset
+
+	// Header is no longer dirty
+	db.headerDirty = false
 
 	return nil
 }
@@ -1570,16 +1594,9 @@ func (db *DB) Sync() error {
 		return fmt.Errorf("cannot sync: database opened in read-only mode")
 	}
 
-	// Write header metadata if needed
-	if db.headerDirty {
-		if err := db.writeFreeSubPagesHeadToHeader(); err != nil {
-			return fmt.Errorf("failed to update free sub-pages head in header: %w", err)
-		}
-	}
-
-	// Flush all dirty pages
-	if err := db.flushDirtyIndexPages(); err != nil {
-		return fmt.Errorf("failed to flush dirty pages: %w", err)
+	// Flush the index to disk
+	if err := db.flushIndexToDisk(); err != nil {
+		return fmt.Errorf("failed to flush index to disk: %w", err)
 	}
 
 	// Sync the main file
@@ -1591,35 +1608,6 @@ func (db *DB) Sync() error {
 	if err := db.indexFile.Sync(); err != nil {
 		return fmt.Errorf("failed to sync index file: %w", err)
 	}
-
-	return nil
-}
-
-// writeFreeSubPagesHeadToHeader writes the current free sub-pages head pointer to the index file header
-func (db *DB) writeFreeSubPagesHeadToHeader() error {
-	// Don't update if database is in read-only mode
-	if db.readOnly {
-		return nil
-	}
-
-	// Determine the page number to write to the header
-	pageNumber := uint32(0)
-	if db.freeSubPagesHead != nil {
-		pageNumber = db.freeSubPagesHead.pageNumber
-	}
-
-	// Prepare the buffer with the page number
-	buffer := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buffer, pageNumber)
-
-	// Write to the header
-	_, err := db.indexFile.WriteAt(buffer, HeaderFreeSubPagesOffset)
-	if err != nil {
-		return err
-	}
-
-	// Header is no longer dirty
-	db.headerDirty = false
 
 	return nil
 }
@@ -1773,6 +1761,26 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 	stats["leaf_pages"] = leafPages
 
 	return stats
+}
+
+// flushIndexToDisk flushes all dirty pages to disk and writes the index header
+func (db *DB) flushIndexToDisk() error {
+	// Check if file is opened in read-only mode
+	if db.readOnly {
+		return fmt.Errorf("cannot flush index to disk: database opened in read-only mode")
+	}
+
+	// Flush all dirty pages
+	if err := db.flushDirtyIndexPages(); err != nil {
+		return fmt.Errorf("failed to flush dirty pages: %w", err)
+	}
+
+	// Write index header
+	if err := db.writeIndexHeader(false); err != nil {
+		return fmt.Errorf("failed to update index header: %w", err)
+	}
+
+	return nil
 }
 
 // flushAllIndexPages writes all cached pages to disk
@@ -2448,4 +2456,65 @@ func (db *DB) updateFreeSubPagesHead(radixPage *RadixPage) {
 
 	// Mark the header as dirty so it gets written during the next sync
 	db.headerDirty = true
+}
+
+// recoverUnindexedContent reads the main file starting from the last indexed offset
+// and reindexes any content that hasn't been indexed yet
+func (db *DB) recoverUnindexedContent() error {
+	// Check if we're in read-only mode
+	if db.readOnly {
+		return fmt.Errorf("cannot recover unindexed content in read-only mode")
+	}
+
+	lastIndexedOffset := db.lastIndexedOffset
+
+	// If the last indexed offset is 0, start from the beginning (after header)
+	if lastIndexedOffset < int64(PageSize) {
+		lastIndexedOffset = int64(PageSize)
+	}
+
+	// If the last indexed offset is already at the end of the file, nothing to do
+	if lastIndexedOffset >= db.mainFileSize {
+		return nil
+	}
+
+	debugPrint("Recovering unindexed content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize)
+
+	// Get the root radix sub-page
+	rootSubPage, err := db.getRootRadixSubPage()
+	if err != nil {
+		return fmt.Errorf("failed to get root radix sub-page: %w", err)
+	}
+
+	// Start reading from the last indexed offset
+	currentOffset := lastIndexedOffset
+
+	// Process all content until we reach the end of the file
+	for currentOffset < db.mainFileSize {
+		// Read the content at the current offset
+		content, err := db.readContent(currentOffset)
+		if err != nil {
+			return fmt.Errorf("failed to read content at offset %d: %w", currentOffset, err)
+		}
+
+		// Only process data content
+		if content.data[0] == ContentTypeData {
+			// Set the key-value pair on the index
+			err := db.setKvOnIndex(rootSubPage, content.key, content.value, currentOffset)
+			if err != nil {
+				return fmt.Errorf("failed to set kv on index: %w", err)
+			}
+		}
+
+		// Move to the next content
+		currentOffset += int64(len(content.data))
+	}
+
+	// Flush the index pages to disk
+	if err := db.flushIndexToDisk(); err != nil {
+		return fmt.Errorf("failed to flush index to disk: %w", err)
+	}
+
+	debugPrint("Recovery complete, reindexed content up to offset %d\n", db.mainFileSize)
+	return nil
 }
