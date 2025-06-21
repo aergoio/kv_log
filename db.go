@@ -109,6 +109,7 @@ type DB struct {
 	commitMode     int    // CallerThread or WorkerThread
 	useWAL         bool   // Whether to use WAL or not
 	syncMode       int    // SyncOn or SyncOff
+	walInfo        *WalInfo // WAL file information
 }
 
 // Content represents a piece of content in the database
@@ -122,9 +123,8 @@ type Content struct {
 // BasePage contains common fields for all page types
 type BasePage struct {
 	pageNumber  uint32
-	offset      int64
-	dirty       bool
 	data        []byte
+	dirty       bool
 }
 
 // RadixPage represents a radix page with sub-pages
@@ -273,12 +273,11 @@ func Open(path string, options ...Options) (*DB, error) {
 		readOnly:       readOnly,
 		lockType:       LockNone,
 		pageCache:      make(map[uint32]*Page),
-		writeMode:      writeMode,
-		nextWriteMode:  writeMode,
 	}
 
 	// Initialize internal write mode fields
-	db.updateWriteMode()
+	db.updateWriteMode(writeMode)
+	db.nextWriteMode = writeMode
 
 	// Apply file lock if requested
 	if lockType != LockNone {
@@ -358,7 +357,11 @@ func (db *DB) SetOption(name string, value interface{}) error {
 }
 
 // updateWriteMode updates the internal write mode fields based on the writeMode string
-func (db *DB) updateWriteMode() {
+func (db *DB) updateWriteMode(writeMode string) {
+	// Update the write mode
+	db.writeMode = writeMode
+
+	// Update the internal fields based on the write mode
 	switch db.writeMode {
 	case CallerThread_WAL_Sync:
 		db.commitMode = CallerThread
@@ -1054,6 +1057,10 @@ func (db *DB) initialize() error {
 
 	debugPrint("Initializing database\n")
 
+	// Save the original journal mode and temporarily disable it during initialization
+	originalWriteMode := db.writeMode
+	db.updateWriteMode(CallerThread_Direct_NoSync)
+
 	// Initialize main file
 	if err := db.initializeMainFile(); err != nil {
 		return fmt.Errorf("failed to initialize main file: %w", err)
@@ -1063,6 +1070,9 @@ func (db *DB) initialize() error {
 	if err := db.initializeIndexFile(); err != nil {
 		return fmt.Errorf("failed to initialize index file: %w", err)
 	}
+
+	// Restore the original journal mode
+	db.updateWriteMode(originalWriteMode)
 
 	debugPrint("Database initialized\n")
 
@@ -1125,6 +1135,18 @@ func (db *DB) initializeIndexFile() error {
 		return fmt.Errorf("failed to initialize radix levels: %w", err)
 	}
 
+	// If using WAL mode, delete existing WAL file and open a new one
+	if db.useWAL {
+		// Delete existing WAL file
+		if err := db.deleteWAL(); err != nil {
+			return fmt.Errorf("failed to delete WAL file: %w", err)
+		}
+		// Open new WAL file
+		if err := db.openWAL(); err != nil {
+			return fmt.Errorf("failed to open WAL file: %w", err)
+		}
+	}
+
 	// Flush the index to disk
 	//if err := db.flushIndexToDisk(); err != nil {
 	//	return fmt.Errorf("failed to flush index to disk: %w", err)
@@ -1138,6 +1160,14 @@ func (db *DB) readHeader() error {
 	// Read main file header
 	if err := db.readMainFileHeader(); err != nil {
 		return fmt.Errorf("failed to read main file header: %w", err)
+	}
+
+	// Check for existing WAL file if in WAL mode
+	if db.useWAL {
+		// Open existing WAL file if it exists
+		if err := db.openWAL(); err != nil {
+			return fmt.Errorf("failed to open WAL file: %w", err)
+		}
 	}
 
 	// Read index file header
@@ -1181,9 +1211,9 @@ func (db *DB) readMainFileHeader() error {
 // readIndexFileHeader reads the index file header
 func (db *DB) readIndexFileHeader() error {
 	// Read the entire header page
-	header := make([]byte, PageSize)
-	if _, err := db.indexFile.ReadAt(header, 0); err != nil {
-		return err
+	header, err := db.readIndexPage(1)
+	if err != nil {
+		return fmt.Errorf("failed to read index file header: %w", err)
 	}
 
 	// Extract magic string (6 bytes)
@@ -1257,7 +1287,7 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	binary.LittleEndian.PutUint32(rootPage[16:20], nextFreePageNumber)
 
 	// Write the entire root page to disk
-	if _, err := db.indexFile.WriteAt(rootPage, 0); err != nil {
+	if err := db.writeIndexPage(rootPage, 1); err != nil {
 		return fmt.Errorf("failed to write index file root page: %w", err)
 	}
 
@@ -1425,27 +1455,11 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 }
 
 // ------------------------------------------------------------------------------------------------
-// Index file
+// Radix pages
 // ------------------------------------------------------------------------------------------------
 
-// readRadixPage reads a radix page from the disk
-func (db *DB) readRadixPage(pageNumber uint32) (*RadixPage, error) {
-	debugPrint("Reading radix page %d\n", pageNumber)
-
-	// Calculate file offset from page number
-	offset := int64(pageNumber) * PageSize
-
-	// Check if offset is valid
-	if offset < 0 || offset >= db.indexFileSize {
-		return nil, fmt.Errorf("page number %d out of index file bounds", pageNumber)
-	}
-
-	data := make([]byte, PageSize)
-
-	if _, err := db.indexFile.ReadAt(data, offset); err != nil {
-		return nil, err
-	}
-
+// parseRadixPage parses a radix page read from the disk
+func (db *DB) parseRadixPage(data []byte, pageNumber uint32) (*RadixPage, error) {
 	// Check if it's a radix page
 	if data[0] != ContentTypeRadix {
 		return nil, fmt.Errorf("not a radix page at page %d", pageNumber)
@@ -1474,7 +1488,6 @@ func (db *DB) readRadixPage(pageNumber uint32) (*RadixPage, error) {
 	radixPage := &RadixPage{
 		BasePage: BasePage{
 			pageNumber:  pageNumber,
-			offset:      offset,
 			dirty:       false,
 			data:        data,
 		},
@@ -1510,26 +1523,15 @@ func (db *DB) writeRadixPage(radixPage *RadixPage) error {
 		return fmt.Errorf("cannot write radix page with page number 0")
 	}
 
-	// Calculate offset from page number if not set
-	if radixPage.offset == 0 {
-		radixPage.offset = int64(radixPage.pageNumber) * PageSize
-	}
-
 	debugPrint("Writing radix page to index file at page %d\n", radixPage.pageNumber)
 
-	// Write to disk at the specified offset
-	_, err := db.indexFile.WriteAt(radixPage.data, radixPage.offset)
+	// Write to disk at the specified page number
+	err := db.writeIndexPage(radixPage.data, radixPage.pageNumber)
 
 	// If the page was written successfully
 	if err == nil {
 		// Mark it as clean
 		radixPage.dirty = false
-
-		// Update file size if this write extended the file
-		newEndOffset := radixPage.offset + PageSize
-		if newEndOffset > db.indexFileSize {
-			db.indexFileSize = newEndOffset
-		}
 	}
 
 	return err
@@ -1539,24 +1541,8 @@ func (db *DB) writeRadixPage(radixPage *RadixPage) error {
 // Leaf pages
 // ------------------------------------------------------------------------------------------------
 
-// readLeafPage reads a leaf page from the given page number
-func (db *DB) readLeafPage(pageNumber uint32) (*LeafPage, error) {
-	debugPrint("Reading leaf page %d\n", pageNumber)
-
-	// Calculate file offset from page number
-	offset := int64(pageNumber) * PageSize
-
-	// Check if offset is valid
-	if offset < 0 || offset >= db.indexFileSize {
-		return nil, fmt.Errorf("page number %d out of index file bounds", pageNumber)
-	}
-
-	data := make([]byte, PageSize)
-
-	if _, err := db.indexFile.ReadAt(data, offset); err != nil {
-		return nil, err
-	}
-
+// parseLeafPage parses a leaf page read from the disk
+func (db *DB) parseLeafPage(data []byte, pageNumber uint32) (*LeafPage, error) {
 	// Check if it's a leaf page
 	if data[0] != ContentTypeLeaf {
 		return nil, fmt.Errorf("not a leaf page at page %d", pageNumber)
@@ -1582,9 +1568,8 @@ func (db *DB) readLeafPage(pageNumber uint32) (*LeafPage, error) {
 	leafPage := &LeafPage{
 		BasePage: BasePage{
 			pageNumber:  pageNumber,
-			offset:      offset,
-			dirty:       false,
 			data:        data,
+			dirty:       false,
 		},
 		ContentSize: contentSize,
 	}
@@ -1620,61 +1605,36 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 
 	// If page number is 0, allocate a new page at the end of the file
 	if leafPage.pageNumber == 0 {
-		// Calculate new page number
-		leafPage.pageNumber = uint32(db.indexFileSize / PageSize)
-
-		// Update offset
-		leafPage.offset = db.indexFileSize
-
-		// Print some debug info
-		debugPrint("Writing leaf page to end of index file at page %d\n", leafPage.pageNumber)
-	} else {
-		// Calculate offset from page number
-		leafPage.offset = int64(leafPage.pageNumber) * PageSize
-
-		debugPrint("Writing leaf page to index file at page %d\n", leafPage.pageNumber)
+		return fmt.Errorf("cannot write leaf page with page number 0")
 	}
 
-	// Write to disk at the specified offset
-	_, err := db.indexFile.WriteAt(leafPage.data, leafPage.offset)
+	// Write to disk at the specified page number
+	err := db.writeIndexPage(leafPage.data, leafPage.pageNumber)
 
 	// If the page was written successfully
 	if err == nil {
 		// Mark it as clean
 		leafPage.dirty = false
-
-		// Update file size if this write extended the file
-		newEndOffset := leafPage.offset + PageSize
-		if newEndOffset > db.indexFileSize {
-			db.indexFileSize = newEndOffset
-		}
 	}
+
 	return err
 }
 
 // ------------------------------------------------------------------------------------------------
-// ...
+// Index pages
 // ------------------------------------------------------------------------------------------------
 
 // readPage reads a page from the index file
 // first read 1 byte to check the page type
 // then read the page data
 func (db *DB) readPage(pageNumber uint32) (*Page, error) {
-	// Calculate file offset from page number
-	offset := int64(pageNumber) * PageSize
 
-	// Check if offset is valid
-	if offset < 0 || offset >= db.indexFileSize {
-		return nil, fmt.Errorf("page number %d out of index file bounds", pageNumber)
+	data, err := db.readIndexPage(pageNumber)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read page: %w", err)
 	}
 
-	// Read just the first byte to determine page type
-	typeBuffer := make([]byte, 1)
-	if _, err := db.indexFile.ReadAt(typeBuffer, offset); err != nil {
-		return nil, fmt.Errorf("failed to read page type: %w", err)
-	}
-
-	contentType := typeBuffer[0]
+	contentType := data[0]
 	entry := &Page{
 		PageType: contentType,
 	}
@@ -1683,17 +1643,17 @@ func (db *DB) readPage(pageNumber uint32) (*Page, error) {
 	switch contentType {
 	case ContentTypeRadix:
 		// Read the radix page
-		radixPage, err := db.readRadixPage(pageNumber)
+		radixPage, err := db.parseRadixPage(data, pageNumber)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read radix page: %w", err)
+			return nil, fmt.Errorf("failed to parse radix page: %w", err)
 		}
 		entry.RadixPage = radixPage
 
 	case ContentTypeLeaf:
 		// Read the leaf page
-		leafPage, err := db.readLeafPage(pageNumber)
+		leafPage, err := db.parseLeafPage(data, pageNumber)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read leaf page: %w", err)
+			return nil, fmt.Errorf("failed to parse leaf page: %w", err)
 		}
 		entry.LeafPage = leafPage
 
@@ -1702,6 +1662,80 @@ func (db *DB) readPage(pageNumber uint32) (*Page, error) {
 	}
 
 	return entry, nil
+}
+
+// writeIndexPage writes an index page to either the WAL file or the index file
+func (db *DB) writeIndexPage(data []byte, pageNumber uint32) error {
+	// If WAL is used, write to WAL file
+	if db.useWAL {
+		return db.writeToWAL(data, pageNumber)
+	} else {
+		return db.writeToIndexFile(data, pageNumber)
+	}
+}
+
+// readIndexPage reads an index page from either the WAL file or the index file
+func (db *DB) readIndexPage(pageNumber uint32) ([]byte, error) {
+	var data []byte
+	var err error
+
+	debugPrint("Reading index page from page number %d\n", pageNumber)
+
+	if db.useWAL {
+		// Read from WAL file
+		data, err = db.readFromWAL(pageNumber)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read from WAL: %w", err)
+		}
+	}
+
+	// If WAL is not used, or the page is not found in WAL
+	if data == nil {
+		data, err = db.readFromIndexFile(pageNumber)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read from index file: %w", err)
+		}
+	}
+
+	return data, nil
+}
+
+// writeToIndexFile writes an index page to the index file
+func (db *DB) writeToIndexFile(data []byte, pageNumber uint32) error {
+	// Calculate file offset from page number
+	offset := int64(pageNumber) * PageSize
+
+	// Check if offset is valid
+	if offset < 0 || offset >= db.indexFileSize {
+		return fmt.Errorf("page number %d out of index file bounds", pageNumber)
+	}
+
+	// Write the page data
+	if _, err := db.indexFile.WriteAt(data, offset); err != nil {
+		return fmt.Errorf("failed to write page data to index file: %w", err)
+	}
+
+	return nil
+}
+
+// readFromIndexFile reads an index page from the index file
+func (db *DB) readFromIndexFile(pageNumber uint32) ([]byte, error) {
+	// Calculate file offset from page number
+	offset := int64(pageNumber) * PageSize
+
+	// Check if offset is valid
+	if offset < 0 || offset >= db.indexFileSize {
+		return nil, fmt.Errorf("page number %d out of index file bounds", pageNumber)
+	}
+
+	data := make([]byte, PageSize)
+
+	// Read the page data
+	if _, err := db.indexFile.ReadAt(data, offset); err != nil {
+		return nil, fmt.Errorf("failed to read page data from index file: %w", err)
+	}
+
+	return data, nil
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1796,6 +1830,10 @@ func (db *DB) getPageFromCache(pageNumber uint32) (*Page, bool) {
 	return entry, exists
 }
 
+// ------------------------------------------------------------------------------------------------
+// Page access
+// ------------------------------------------------------------------------------------------------
+
 // getPage gets a page from the cache or from the disk
 func (db *DB) getPage(pageNumber uint32) (*Page, error) {
 	// First check the cache
@@ -1810,36 +1848,50 @@ func (db *DB) getPage(pageNumber uint32) (*Page, error) {
 
 // getRadixPage returns a radix page from the cache or from the disk
 func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
-	// Check if the page is in the cache
+
+	// First try to get the page from the cache
 	entry, exists := db.getPageFromCache(pageNumber)
 
-	// If it exists and is a radix page, return it
-	if exists {
-		if entry.PageType != ContentTypeRadix || entry.RadixPage == nil {
-			return nil, fmt.Errorf("page %d is not a radix page", pageNumber)
+	// If not in cache, read it from disk
+	if !exists {
+		var err error
+		entry, err = db.readPage(pageNumber)
+		if err != nil {
+			return nil, err
 		}
-		return entry.RadixPage, nil
 	}
 
-	// If not, read it from disk
-	return db.readRadixPage(pageNumber)
+	// If the page is not a radix page, return an error
+	if entry.PageType != ContentTypeRadix || entry.RadixPage == nil {
+		return nil, fmt.Errorf("page %d is not a radix page", pageNumber)
+	}
+
+	// Return the radix page
+	return entry.RadixPage, nil
 }
 
 // getLeafPage returns a leaf page from the cache or from the disk
 func (db *DB) getLeafPage(pageNumber uint32) (*LeafPage, error) {
-	// Check if the page is in the cache
+
+	// First try to get the page from the cache
 	entry, exists := db.getPageFromCache(pageNumber)
 
-	// If it exists and is a leaf page, return it
-	if exists {
-		if entry.PageType != ContentTypeLeaf || entry.LeafPage == nil {
-			return nil, fmt.Errorf("page %d is not a leaf page", pageNumber)
+	// If not in cache, read it from disk
+	if !exists {
+		var err error
+		entry, err = db.readPage(pageNumber)
+		if err != nil {
+			return nil, err
 		}
-		return entry.LeafPage, nil
 	}
 
-	// If not, read it from disk
-	return db.readLeafPage(pageNumber)
+	// If the page is not a leaf page, return an error
+	if entry.PageType != ContentTypeLeaf || entry.LeafPage == nil {
+		return nil, fmt.Errorf("page %d is not a leaf page", pageNumber)
+	}
+
+	// Return the leaf page
+	return entry.LeafPage, nil
 }
 
 // GetCacheStats returns statistics about the page cache
@@ -1998,18 +2050,14 @@ func (db *DB) allocateRadixPage() (*RadixPage, error) {
 	// Calculate new page number
 	pageNumber := uint32(db.indexFileSize / PageSize)
 
-	// Calculate file offset
-	offset := db.indexFileSize
-
 	// Update file size
 	db.indexFileSize += PageSize
 
 	radixPage := &RadixPage{
 		BasePage: BasePage{
 			pageNumber:  pageNumber,
-			offset:      offset,
-			dirty:       false,
 			data:        data,
+			dirty:       false,
 		},
 		SubPagesUsed: 0,
 	}
@@ -2095,18 +2143,14 @@ func (db *DB) allocateLeafPage() (*LeafPage, error) {
 	// Calculate new page number
 	pageNumber := uint32(db.indexFileSize / PageSize)
 
-	// Calculate file offset
-	offset := db.indexFileSize
-
 	// Update file size
 	db.indexFileSize += PageSize
 
 	leafPage := &LeafPage{
 		BasePage: BasePage{
 			pageNumber:  pageNumber,
-			offset:      offset,
-			dirty:       false,
 			data:        data,
+			dirty:       false,
 		},
 		ContentSize: LeafHeaderSize,
 		Entries:     make([]LeafEntry, 0),
@@ -2482,7 +2526,6 @@ func (db *DB) convertLeafToRadix(leafPage *LeafPage, newSuffix []byte, newDataOf
 	radixPage := &RadixPage{
 		BasePage: BasePage{
 			pageNumber: leafPage.pageNumber,
-			offset:     leafPage.offset,
 			dirty:      true,
 			data:       make([]byte, PageSize),
 		},
