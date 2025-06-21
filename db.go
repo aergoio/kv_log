@@ -69,6 +69,18 @@ const (
 	WorkerThread_NoWAL_NoSync  = "WorkerThread_NoWAL_NoSync" // write directly to file on the background thread
 )
 
+// Commit modes
+const (
+	CallerThread = 1 // Commit on the caller thread
+	WorkerThread = 0 // Commit on a background worker thread
+)
+
+// Sync modes
+const (
+	SyncOn  = 1 // Sync after writes
+	SyncOff = 0 // Don't sync after writes
+)
+
 // debugPrint prints a message if debug mode is enabled
 func debugPrint(format string, args ...interface{}) {
 	if DebugMode {
@@ -94,6 +106,9 @@ type DB struct {
 	headerDirty    bool  // Track if the header needs to be written during sync
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
+	commitMode     int    // CallerThread or WorkerThread
+	useWAL         bool   // Whether to use WAL or not
+	syncMode       int    // SyncOn or SyncOff
 }
 
 // Content represents a piece of content in the database
@@ -262,6 +277,9 @@ func Open(path string, options ...Options) (*DB, error) {
 		nextWriteMode:  writeMode,
 	}
 
+	// Initialize internal write mode fields
+	db.updateWriteMode()
+
 	// Apply file lock if requested
 	if lockType != LockNone {
 		if err := db.Lock(lockType); err != nil {
@@ -336,6 +354,36 @@ func (db *DB) SetOption(name string, value interface{}) error {
 		return fmt.Errorf("WriteMode option value must be a string")
 	default:
 		return fmt.Errorf("unknown or immutable option: %s", name)
+	}
+}
+
+// updateWriteMode updates the internal write mode fields based on the writeMode string
+func (db *DB) updateWriteMode() {
+	switch db.writeMode {
+	case CallerThread_WAL_Sync:
+		db.commitMode = CallerThread
+		db.useWAL = true
+		db.syncMode = SyncOn
+
+	case CallerThread_WAL_NoSync:
+		db.commitMode = CallerThread
+		db.useWAL = true
+		db.syncMode = SyncOff
+
+	case WorkerThread_WAL:
+		db.commitMode = WorkerThread
+		db.useWAL = true
+		db.syncMode = SyncOff
+
+	case WorkerThread_NoWAL:
+		db.commitMode = WorkerThread
+		db.useWAL = false
+		db.syncMode = SyncOn
+
+	case WorkerThread_NoWAL_NoSync:
+		db.commitMode = WorkerThread
+		db.useWAL = false
+		db.syncMode = SyncOff
 	}
 }
 
