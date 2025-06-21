@@ -1059,7 +1059,7 @@ func (db *DB) initialize() error {
 
 	// Save the original journal mode and temporarily disable it during initialization
 	originalWriteMode := db.writeMode
-	db.updateWriteMode(CallerThread_Direct_NoSync)
+	db.updateWriteMode(WorkerThread_NoWAL_NoSync)
 
 	// Initialize main file
 	if err := db.initializeMainFile(); err != nil {
@@ -1211,7 +1211,7 @@ func (db *DB) readMainFileHeader() error {
 // readIndexFileHeader reads the index file header
 func (db *DB) readIndexFileHeader() error {
 	// Read the entire header page
-	header, err := db.readIndexPage(1)
+	header, err := db.readIndexPage(0)
 	if err != nil {
 		return fmt.Errorf("failed to read index file header: %w", err)
 	}
@@ -1286,8 +1286,13 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	// Set free sub-pages head pointer (4 bytes)
 	binary.LittleEndian.PutUint32(rootPage[16:20], nextFreePageNumber)
 
+	// If this is the first time we're writing the header, set the file size to PageSize
+	if isInit {
+		db.indexFileSize = PageSize
+	}
+
 	// Write the entire root page to disk
-	if err := db.writeIndexPage(rootPage, 1); err != nil {
+	if err := db.writeIndexPage(rootPage, 0); err != nil {
 		return fmt.Errorf("failed to write index file root page: %w", err)
 	}
 
