@@ -153,7 +153,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	if !mainFileExists && indexFileExists {
-		// Remove index file
+		// Remove index file if main file doesn't exist
 		if err := os.Remove(indexPath); err != nil {
 			return nil, fmt.Errorf("failed to remove index file: %w", err)
 		}
@@ -248,7 +248,13 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 	}
 
-	if !mainFileExists && !readOnly {
+	// Check if we need to initialize the database
+	needsInitialization := !mainFileExists && !readOnly
+
+	// Check if we need to rebuild the index
+	needsIndexInitialization := mainFileExists && (!indexFileExists || indexFileInfo.Size() == 0) && !readOnly
+
+	if needsInitialization {
 		// Initialize new database
 		if err := db.initialize(); err != nil {
 			db.Unlock()
@@ -256,6 +262,17 @@ func Open(path string, options ...Options) (*DB, error) {
 			indexFile.Close()
 			return nil, fmt.Errorf("failed to initialize database: %w", err)
 		}
+	} else if needsIndexInitialization {
+		// Main file exists but index file is missing or empty
+		// Initialize a new index file
+		debugPrint("Index file missing or empty, initializing new index\n")
+		if err := db.initializeIndexFile(); err != nil {
+			db.Unlock()
+			mainFile.Close()
+			indexFile.Close()
+			return nil, fmt.Errorf("failed to initialize index file: %w", err)
+		}
+		debugPrint("Index file rebuilt successfully\n")
 	} else {
 		// Read existing database headers
 		if err := db.readHeader(); err != nil {
@@ -264,18 +281,15 @@ func Open(path string, options ...Options) (*DB, error) {
 			indexFile.Close()
 			return nil, fmt.Errorf("failed to read database header: %w", err)
 		}
+	}
 
-		if !readOnly {
-			// If the index file is not up-to-date, reindex the remaining content
-			if db.lastIndexedOffset < db.mainFileSize {
-				debugPrint("Index file is not up-to-date, reindexing remaining content\n")
-				if err := db.recoverUnindexedContent(); err != nil {
-					db.Unlock()
-					mainFile.Close()
-					indexFile.Close()
-					return nil, fmt.Errorf("failed to reindex database: %w", err)
-				}
-			}
+	// If the index file is not up-to-date, reindex the remaining content
+	if db.lastIndexedOffset < db.mainFileSize {
+		if err := db.recoverUnindexedContent(); err != nil {
+			db.Unlock()
+			mainFile.Close()
+			indexFile.Close()
+			return nil, fmt.Errorf("failed to reindex database: %w", err)
 		}
 	}
 
@@ -2526,9 +2540,11 @@ func (db *DB) recoverUnindexedContent() error {
 		currentOffset += int64(len(content.data))
 	}
 
-	// Flush the index pages to disk
-	if err := db.flushIndexToDisk(); err != nil {
-		return fmt.Errorf("failed to flush index to disk: %w", err)
+	if !db.readOnly {
+		// Flush the index pages to disk
+		if err := db.flushIndexToDisk(); err != nil {
+			return fmt.Errorf("failed to flush index to disk: %w", err)
+		}
 	}
 
 	debugPrint("Recovery complete, reindexed content up to offset %d\n", db.mainFileSize)
