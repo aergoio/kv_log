@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"testing"
 )
 
@@ -779,4 +780,113 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 			t.Fatalf("Key '%s' was not found by iterator", key)
 		}
 	}
+}
+
+func TestDatabaseReindex(t *testing.T) {
+	// Create a test database
+	dbPath := "test_reindex.db"
+	indexPath := dbPath + "-index"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(indexPath)
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Test setting key-value pairs
+	err = db.Set([]byte("name"), []byte("hash-table-tree"))
+	if err != nil {
+		t.Fatalf("Failed to set 'name': %v", err)
+	}
+
+	err = db.Set([]byte("author"), []byte("Bernardo"))
+	if err != nil {
+		t.Fatalf("Failed to set 'author': %v", err)
+	}
+
+	err = db.Set([]byte("type"), []byte("key-value database"))
+	if err != nil {
+		t.Fatalf("Failed to set 'type': %v", err)
+	}
+
+	// Update a key
+	err = db.Set([]byte("name"), []byte("hash-table-tree DB"))
+	if err != nil {
+		t.Fatalf("Failed to update 'name': %v", err)
+	}
+
+	// Delete a key
+	err = db.Delete([]byte("author"))
+	if err != nil {
+		t.Fatalf("Failed to delete 'author': %v", err)
+	}
+
+	// Close the database
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Save the original index file for comparison
+	originalIndexPath := indexPath + ".original"
+	os.Rename(indexPath, originalIndexPath)
+
+	// Reopen the database - it should rebuild the index
+	reopenedDb, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database after index deletion: %v", err)
+	}
+
+	// Verify name has the updated value
+	nameVal, err := reopenedDb.Get([]byte("name"))
+	if err != nil {
+		t.Fatalf("Failed to get 'name' after reindex: %v", err)
+	}
+	if !bytes.Equal(nameVal, []byte("hash-table-tree DB")) {
+		t.Fatalf("Value mismatch for 'name' after reindex: got %s, want %s",
+			string(nameVal), "hash-table-tree DB")
+	}
+
+	// Verify author was deleted
+	_, err = reopenedDb.Get([]byte("author"))
+	if err == nil {
+		t.Fatalf("Expected error when getting deleted key 'author' after reindex, got nil")
+	}
+
+	// Verify type still exists with original value
+	typeVal, err := reopenedDb.Get([]byte("type"))
+	if err != nil {
+		t.Fatalf("Failed to get 'type' after reindex: %v", err)
+	}
+	if !bytes.Equal(typeVal, []byte("key-value database")) {
+		t.Fatalf("Value mismatch for 'type' after reindex: got %s, want %s",
+			string(typeVal), "key-value database")
+	}
+
+	// Close the database
+	if err := reopenedDb.Close(); err != nil {
+		t.Fatalf("Failed to close database after reindex: %v", err)
+	}
+
+	// Compare files using diff to verify index was rebuilt
+
+	// Run diff command to compare the index files
+	cmd := exec.Command("diff", "-q", originalIndexPath, indexPath)
+	output, err := cmd.CombinedOutput()
+
+	// If diff finds no differences, it returns exit status 0
+	// If files differ, it returns exit status 1
+	// For any other error, it returns other non-zero status
+	if err != nil {
+		// Files should be identical, so any difference is an error
+		t.Fatalf("Index files should be identical but differ: %v, output: %s", err, string(output))
+	}
+
+	// Clean up
+	os.Remove(dbPath)
+	os.Remove(indexPath)
+	os.Remove(originalIndexPath)
 }
