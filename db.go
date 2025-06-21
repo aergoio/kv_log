@@ -502,7 +502,7 @@ func (db *DB) Set(key, value []byte) error {
 			keyPos++
 		} else if entry.PageType == ContentTypeLeaf {
 			// It's a leaf page, attempt to set the key and value using the leaf page
-			return db.setOnLeafPage(key, value, entry.LeafPage, currentSubPage, byteValue, keyPos)
+			return db.setOnLeafPage(entry.LeafPage, key, keyPos, value, 0)
 		} else {
 			return fmt.Errorf("invalid page type")
 		}
@@ -511,6 +511,53 @@ func (db *DB) Set(key, value []byte) error {
 	// We've processed all bytes of the key
 	// Attempt to set the key and value on the empty suffix slot
 	return db.setOnEmptySuffix(currentSubPage, key, value, 0)
+}
+
+func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, dataOffset int64) error {
+
+	// Process the key byte by byte to find where to add it
+	currentSubPage := rootSubPage
+	keyPos := 0
+
+	// Traverse the radix trie until we reach a leaf page or the end of the key
+	for keyPos < len(key) {
+		// Get the current byte from the key
+		byteValue := key[keyPos]
+
+		// Get the next page number and sub-page index from the current sub-page
+		nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
+
+		// If there's no entry for this byte, create a new path
+		if nextPageNumber == 0 {
+			// Create a path for this byte
+			return db.createPathForByte(currentSubPage, key, keyPos, dataOffset)
+		}
+
+		// There's an entry for this byte, load the page
+		entry, err := db.getPage(nextPageNumber)
+		if err != nil {
+			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
+		}
+
+		// Check what type of page we got
+		if entry.PageType == ContentTypeRadix {
+			// It's a radix page, continue traversing
+			currentSubPage = &RadixSubPage{
+				Page:       entry.RadixPage,
+				SubPageIdx: nextSubPageIdx,
+			}
+			keyPos++
+		} else if entry.PageType == ContentTypeLeaf {
+			// It's a leaf page, attempt to set the key and value using the leaf page
+			return db.setOnLeafPage(entry.LeafPage, key, keyPos, value, dataOffset)
+		} else {
+			return fmt.Errorf("invalid page type")
+		}
+	}
+
+	// If we've processed all bytes of the key
+	// Set the content offset on the empty suffix slot
+	return db.setOnEmptySuffix(currentSubPage, key, value, dataOffset)
 }
 
 // setContentOnIndex sets a suffix + content offset pair on the index
@@ -608,7 +655,11 @@ func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, d
 }
 
 // setOnLeafPage attempts to set a key and value on a leaf page
-func (db *DB) setOnLeafPage(key, value []byte, leafPage *LeafPage, subPage *RadixSubPage, byteValue uint8, keyPos int) error {
+// If dataOffset is 0, we're setting a new key-value pair
+// Otherwise, it means we're reindexing already stored key-value pair
+func (db *DB) setOnLeafPage(leafPage *LeafPage, key []byte, keyPos int, value []byte, dataOffset int64) error {
+	var err error
+
 	// Check if we're deleting
 	isDelete := value == nil
 
@@ -618,15 +669,21 @@ func (db *DB) setOnLeafPage(key, value []byte, leafPage *LeafPage, subPage *Radi
 	// Search for the suffix in the leaf page entries
 	for i, entry := range leafPage.Entries {
 		if bytes.Equal(entry.Suffix, suffix) {
-			// Found the entry, read the content from the main file
-			content, err := db.readContent(entry.DataOffset)
-			if err != nil {
-				return fmt.Errorf("failed to read content: %w", err)
-			}
+			// Found the entry
+			var content *Content
 
-			// Verify that the key matches
-			if !equal(content.key, key) {
-				return fmt.Errorf("invalid indexed key")
+			// If we're setting a new key-value pair
+			if dataOffset == 0 {
+				// Read the content from the main file
+				content, err = db.readContent(entry.DataOffset)
+				if err != nil {
+					return fmt.Errorf("failed to read content: %w", err)
+				}
+
+				// Verify that the key matches
+				if !equal(content.key, key) {
+					return fmt.Errorf("invalid indexed key")
+				}
 			}
 
 			// If we're deleting
@@ -636,16 +693,19 @@ func (db *DB) setOnLeafPage(key, value []byte, leafPage *LeafPage, subPage *Radi
 				return nil
 			}
 
-			// Check if value is the same
-			if equal(content.value, value) {
-				// Value is the same, nothing to do
-				return nil
-			}
+			// If we're setting a new key-value pair
+			if dataOffset == 0 {
+				// Check if value is the same
+				if equal(content.value, value) {
+					// Value is the same, nothing to do
+					return nil
+				}
 
-			// Value is different, append new data
-			dataOffset, err := db.appendData(key, value)
-			if err != nil {
-				return fmt.Errorf("failed to append data: %w", err)
+				// Value is different, append new data
+				dataOffset, err = db.appendData(key, value)
+				if err != nil {
+					return fmt.Errorf("failed to append data: %w", err)
+				}
 			}
 
 			// Update the entry on the leaf page
@@ -663,10 +723,13 @@ func (db *DB) setOnLeafPage(key, value []byte, leafPage *LeafPage, subPage *Radi
 		return nil
 	}
 
-	// Suffix not found, append new data
-	dataOffset, err := db.appendData(key, value)
-	if err != nil {
-		return fmt.Errorf("failed to append data: %w", err)
+	// If we're setting a new key-value pair
+	if dataOffset == 0 {
+		// Suffix not found, append new data
+		dataOffset, err = db.appendData(key, value)
+		if err != nil {
+			return fmt.Errorf("failed to append data: %w", err)
+		}
 	}
 
 	// Try to add the entry with the suffix to the leaf page
@@ -679,7 +742,11 @@ func (db *DB) setOnLeafPage(key, value []byte, leafPage *LeafPage, subPage *Radi
 }
 
 // setOnEmptySuffix attempts to set a key and value on an empty suffix in a radix sub-page
+// If dataOffset is 0, we're setting a new key-value pair
+// Otherwise, it means we're reindexing already stored key-value pair
 func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOffset int64) error {
+	var err error
+
 	// Check if we're deleting
 	isDelete := value == nil
 
@@ -693,15 +760,20 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 
 	// If we have an empty suffix offset, read the content to verify the key
 	if emptySuffixOffset > 0 {
-		// Read the content at the offset
-		content, err := db.readContent(emptySuffixOffset)
-		if err != nil {
-			return fmt.Errorf("failed to read content: %w", err)
-		}
+		var content *Content
 
-		// Verify that the key matches
-		if !equal(content.key, key) {
-			return fmt.Errorf("invalid indexed key")
+		// If we're setting a new key-value pair
+		if dataOffset == 0 {
+			// Read the content at the offset
+			content, err = db.readContent(emptySuffixOffset)
+			if err != nil {
+				return fmt.Errorf("failed to read content: %w", err)
+			}
+
+			// Verify that the key matches
+			if !equal(content.key, key) {
+				return fmt.Errorf("invalid indexed key")
+			}
 		}
 
 		// If we're deleting
@@ -711,18 +783,20 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 			return nil
 		}
 
-		// Check if value is the same
-		if equal(content.value, value) {
-			// Value is the same, nothing to do
-			return nil
+		// If we're setting a new key-value pair
+		if dataOffset == 0 {
+			// Check if value is the same
+			if equal(content.value, value) {
+				// Value is the same, nothing to do
+				return nil
+			}
 		}
 
 		// Value is different, need to update it
 		// We'll fall through to append the new data
 	}
 
-	// If dataOffset is not 0, it means we're reindexing the database
-	var err error
+	// If we're setting a new key-value pair
 	if dataOffset == 0 {
 		// No empty suffix or key mismatch, append new data
 		dataOffset, err = db.appendData(key, value)
