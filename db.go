@@ -682,6 +682,14 @@ func (db *DB) setOnLeafPage(leafPage *LeafPage, key []byte, keyPos int, value []
 
 			// If we're deleting
 			if isDelete {
+				// If there is an existing value
+				if dataOffset == 0 && content != nil && content.value != nil {
+					// Log the deletion to the main file
+					dataOffset, err = db.appendData(key, nil)
+					if err != nil {
+						return fmt.Errorf("failed to append deletion: %w", err)
+					}
+				}
 				// Remove this entry
 				db.removeLeafEntryAt(leafPage, i)
 				return nil
@@ -772,6 +780,14 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 
 		// If we're deleting
 		if isDelete {
+			// If there is an existing value
+			if dataOffset == 0 && content != nil && content.value != nil {
+				// Log the deletion to the main file
+				dataOffset, err = db.appendData(key, nil)
+				if err != nil {
+					return fmt.Errorf("failed to append deletion: %w", err)
+				}
+			}
 			// Clear the empty suffix offset
 			db.setEmptySuffixOffset(subPage, 0)
 			return nil
