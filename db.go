@@ -1751,22 +1751,6 @@ func (db *DB) getLeafPage(pageNumber uint32) (*LeafPage, error) {
 	return db.readLeafPage(pageNumber)
 }
 
-// loadRadixPage loads a radix page into the cache if it's not already there
-func (db *DB) loadRadixPage(pageNumber uint32) (*RadixPage, error) {
-	// Check if the page is already in cache
-	entry, exists := db.getPageFromCache(pageNumber)
-
-	if exists {
-		if entry.PageType != ContentTypeRadix || entry.RadixPage == nil {
-			return nil, fmt.Errorf("page %d is not a radix page", pageNumber)
-		}
-		return entry.RadixPage, nil
-	}
-
-	// Not in cache, load it from disk
-	return db.readRadixPage(pageNumber)
-}
-
 // GetCacheStats returns statistics about the page cache
 func (db *DB) GetCacheStats() map[string]interface{} {
 	db.cacheMutex.RLock()
@@ -2350,7 +2334,7 @@ func (db *DB) preloadRadixLevels() error {
 		pageNumber, _ := db.getRadixEntry(rootSubPage, uint8(byteValue))
 		if pageNumber > 0 {
 			// Load this page into cache if not already there
-			_, err := db.loadRadixPage(pageNumber)
+			_, err := db.getRadixPage(pageNumber)
 			if err != nil {
 				// If it's not a radix page, just skip it
 				if strings.Contains(err.Error(), "not a radix page") {
