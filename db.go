@@ -449,7 +449,7 @@ func (db *DB) Set(key, value []byte) error {
 	}
 
 	// Check if we're deleting (value is nil)
-	isDelete := value == nil
+	isDelete := len(value) == 0
 
 	// Process the key byte by byte
 	currentSubPage := rootSubPage
@@ -655,7 +655,7 @@ func (db *DB) setOnLeafPage(leafPage *LeafPage, key []byte, keyPos int, value []
 	var err error
 
 	// Check if we're deleting
-	isDelete := value == nil
+	isDelete := len(value) == 0
 
 	// The remaining part of the key is the suffix
 	suffix := key[keyPos+1:]
@@ -683,7 +683,7 @@ func (db *DB) setOnLeafPage(leafPage *LeafPage, key []byte, keyPos int, value []
 			// If we're deleting
 			if isDelete {
 				// If there is an existing value
-				if dataOffset == 0 && content != nil && content.value != nil {
+				if dataOffset == 0 && content != nil && len(content.value) > 0 {
 					// Log the deletion to the main file
 					dataOffset, err = db.appendData(key, nil)
 					if err != nil {
@@ -750,7 +750,7 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 	var err error
 
 	// Check if we're deleting
-	isDelete := value == nil
+	isDelete := len(value) == 0
 
 	// Get the current empty suffix offset
 	emptySuffixOffset := db.getEmptySuffixOffset(subPage)
@@ -781,7 +781,7 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 		// If we're deleting
 		if isDelete {
 			// If there is an existing value
-			if dataOffset == 0 && content != nil && content.value != nil {
+			if dataOffset == 0 && content != nil && len(content.value) > 0 {
 				// Log the deletion to the main file
 				dataOffset, err = db.appendData(key, nil)
 				if err != nil {
