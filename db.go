@@ -60,6 +60,15 @@ const (
 	LockExclusive = 2 // Exclusive lock (read-write)
 )
 
+// Write modes
+const (
+	CallerThread_WAL_Sync      = "CallerThread_WAL_Sync"     // write to WAL on the caller thread, checkpoint on the background thread
+	CallerThread_WAL_NoSync    = "CallerThread_WAL_NoSync"   // write to WAL on the caller thread, checkpoint on the background thread
+	WorkerThread_WAL           = "WorkerThread_WAL"          // write to WAL and checkpoint on the background thread
+	WorkerThread_NoWAL         = "WorkerThread_NoWAL"        // write directly to file on the background thread
+	WorkerThread_NoWAL_NoSync  = "WorkerThread_NoWAL_NoSync" // write directly to file on the background thread
+)
+
 // debugPrint prints a message if debug mode is enabled
 func debugPrint(format string, args ...interface{}) {
 	if DebugMode {
@@ -83,6 +92,8 @@ type DB struct {
 	freeSubPagesHead *RadixPage // Head of linked list of radix pages with available sub-pages
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	headerDirty    bool  // Track if the header needs to be written during sync
+	writeMode      string // Current write mode
+	nextWriteMode  string // Next write mode to apply
 }
 
 // Content represents a piece of content in the database
@@ -163,6 +174,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	// Default options
 	lockType := LockNone // Default to no lock
 	readOnly := false
+	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
 
 	// Parse options
 	var opts Options
@@ -178,6 +190,15 @@ func Open(path string, options ...Options) (*DB, error) {
 		if val, ok := opts["ReadOnly"]; ok {
 			if ro, ok := val.(bool); ok {
 				readOnly = ro
+			}
+		}
+		if val, ok := opts["WriteMode"]; ok {
+			if jm, ok := val.(string); ok {
+				if jm == CallerThread_WAL_Sync || jm == CallerThread_WAL_NoSync || jm == WorkerThread_WAL || jm == WorkerThread_NoWAL || jm == WorkerThread_NoWAL_NoSync {
+					writeMode = jm
+				} else {
+					return nil, fmt.Errorf("invalid value for WriteMode option")
+				}
 			}
 		}
 	}
@@ -237,6 +258,8 @@ func Open(path string, options ...Options) (*DB, error) {
 		readOnly:       readOnly,
 		lockType:       LockNone,
 		pageCache:      make(map[uint32]*Page),
+		writeMode:      writeMode,
+		nextWriteMode:  writeMode,
 	}
 
 	// Apply file lock if requested
@@ -294,6 +317,26 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+// SetOption sets a database option after the database is open
+func (db *DB) SetOption(name string, value interface{}) error {
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
+
+	switch name {
+	case "WriteMode":
+		if jm, ok := value.(string); ok {
+			if jm == CallerThread_WAL_Sync || jm == CallerThread_WAL_NoSync || jm == WorkerThread_WAL || jm == WorkerThread_NoWAL || jm == WorkerThread_NoWAL_NoSync {
+				db.nextWriteMode = jm
+				return nil
+			}
+			return fmt.Errorf("invalid value for WriteMode option")
+		}
+		return fmt.Errorf("WriteMode option value must be a string")
+	default:
+		return fmt.Errorf("unknown or immutable option: %s", name)
+	}
 }
 
 // Lock acquires a lock on the database file based on the specified lock type
