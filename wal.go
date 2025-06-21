@@ -184,6 +184,9 @@ func (db *DB) createWALFile() error {
 	checksum := crc32.ChecksumIEEE(header[0:20])
 	binary.BigEndian.PutUint32(header[20:24], checksum)
 
+	// Store the header checksum
+	db.walInfo.checksum = checksum
+
 	// Write header to WAL file
 	if _, err := db.walInfo.file.WriteAt(header, 0); err != nil {
 		return fmt.Errorf("failed to write WAL header: %w", err)
