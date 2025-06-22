@@ -219,6 +219,192 @@ func TestMultipleKeyValues(t *testing.T) {
 	}
 }
 
+func TestShortKeys(t *testing.T) {
+	// Create a test database
+	dbPath := "test_short_keys.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Create test keys with 1, 2, and 3 bytes in length
+	oneByteKeys := []string{"a", "b", "c", "d", "e"}
+	twoByteKeys := []string{"ab", "ac", "cd", "ef", "gh", "ij"}
+	threeByteKeys := []string{"abc", "abd", "acd", "def", "ghi", "jkl", "mno"}
+
+	// Create values for each key
+	values := make(map[string]string)
+
+	// Add values for 1-byte keys
+	for i, key := range oneByteKeys {
+		values[key] = fmt.Sprintf("one-byte-value-%d", i)
+	}
+
+	// Add values for 2-byte keys
+	for i, key := range twoByteKeys {
+		values[key] = fmt.Sprintf("two-byte-value-%d", i)
+	}
+
+	// Add values for 3-byte keys
+	for i, key := range threeByteKeys {
+		values[key] = fmt.Sprintf("three-byte-value-%d", i)
+	}
+
+	// Insert all keys
+	for key, value := range values {
+		err := db.Set([]byte(key), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set '%s': %v", key, err)
+		}
+	}
+
+	// Verify all keys can be retrieved
+	for key, expectedValue := range values {
+		result, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get '%s': %v", key, err)
+		}
+		if !bytes.Equal(result, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for '%s': got %s, want %s", key, string(result), expectedValue)
+		}
+	}
+
+	// Delete some keys (one of each length)
+	keysToDelete := []string{oneByteKeys[0], twoByteKeys[0], threeByteKeys[0]}
+	for _, key := range keysToDelete {
+		err := db.Delete([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to delete '%s': %v", key, err)
+		}
+		// Remove from our tracking map
+		delete(values, key)
+	}
+
+	// Verify deleted keys are gone
+	for _, key := range keysToDelete {
+		_, err := db.Get([]byte(key))
+		if err == nil {
+			t.Fatalf("Expected error when getting deleted key '%s', got nil", key)
+		}
+	}
+
+	// Verify remaining keys still exist
+	for key, expectedValue := range values {
+		result, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get '%s' after deletions: %v", key, err)
+		}
+		if !bytes.Equal(result, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for '%s' after deletions: got %s, want %s",
+				key, string(result), expectedValue)
+		}
+	}
+
+	// Close the database
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen the database
+	reopenedDb, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	// Verify all remaining keys still exist after reopening
+	for key, expectedValue := range values {
+		result, err := reopenedDb.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get '%s' after reopen: %v", key, err)
+		}
+		if !bytes.Equal(result, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for '%s' after reopen: got %s, want %s",
+				key, string(result), expectedValue)
+		}
+	}
+
+	// Delete more keys (another one of each length)
+	moreKeysToDelete := []string{oneByteKeys[1], twoByteKeys[1], threeByteKeys[1]}
+	for _, key := range moreKeysToDelete {
+		err := reopenedDb.Delete([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to delete '%s' after reopen: %v", key, err)
+		}
+		// Remove from our tracking map
+		delete(values, key)
+	}
+
+	// Add new keys (one of each length)
+	newKeys := map[string]string{
+		"x":   "new-one-byte",
+		"yz":  "new-two-byte",
+		"xyz": "new-three-byte",
+	}
+
+	for key, value := range newKeys {
+		err := reopenedDb.Set([]byte(key), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set new key '%s': %v", key, err)
+		}
+		// Add to our tracking map
+		values[key] = value
+	}
+
+	// Verify all current keys exist
+	for key, expectedValue := range values {
+		result, err := reopenedDb.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get '%s' after additions: %v", key, err)
+		}
+		if !bytes.Equal(result, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for '%s' after additions: got %s, want %s",
+				key, string(result), expectedValue)
+		}
+	}
+
+	// Close the database again
+	if err := reopenedDb.Close(); err != nil {
+		t.Fatalf("Failed to close reopened database: %v", err)
+	}
+
+	// Reopen the database again
+	reopenedDb2, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database second time: %v", err)
+	}
+	defer func() {
+		reopenedDb2.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Final verification of all keys
+	for key, expectedValue := range values {
+		result, err := reopenedDb2.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get '%s' after second reopen: %v", key, err)
+		}
+		if !bytes.Equal(result, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for '%s' after second reopen: got %s, want %s",
+				key, string(result), expectedValue)
+		}
+	}
+}
+
 func TestDeleteOperations(t *testing.T) {
 	// Create a test database
 	dbPath := "test_delete.db"
