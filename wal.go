@@ -101,6 +101,13 @@ func (db *DB) writeToWAL(pageData []byte, pageNumber uint32) error {
 	if !db.useWAL {
 		return nil
 	}
+	// Open or create the WAL file if it doesn't exist
+	if db.walInfo == nil {
+		err := db.openWAL()
+		if err != nil {
+			return err
+		}
+	}
 
 	// Write the frame to the WAL file
 	err := db.writeFrame(pageNumber, pageData)
@@ -115,17 +122,29 @@ func (db *DB) writeToWAL(pageData []byte, pageNumber uint32) error {
 }
 
 func (db *DB) readFromWAL(pageNumber uint32) ([]byte, error) {
-	// First check if the page is in the WAL cache
+	// Check if we're in WAL mode
+	if !db.useWAL {
+		return nil, nil
+	}
+	// Open or create the WAL file if it doesn't exist
+	if db.walInfo == nil {
+		err := db.openWAL()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Check if the page is in the WAL cache
 	if cachedData := db.getLatestFromWalCache(pageNumber); cachedData != nil {
 		return cachedData, nil
 	}
-
-	// TODO: If not in cache, implement reading from the WAL file
+	// The page is not in cache so it is not in the WAL file
+	// There is no need to read from the WAL file again because all pages are already loaded when the WAL file is opened
 	return nil, nil
 }
 
-// createWALFile creates a new WAL file
-func (db *DB) createWALFile() error {
+// createWAL creates a new WAL file
+func (db *DB) createWAL() error {
 
 	// If WAL file is already open, return
 	if db.walInfo != nil {
@@ -134,12 +153,6 @@ func (db *DB) createWALFile() error {
 
 	// Generate WAL file path by appending "-wal" to the main db file path
 	walPath := db.filePath + "-wal"
-
-	// Check if WAL file exists
-	if _, err := os.Stat(walPath); err == nil {
-		// WAL file exists, open it instead of creating a new one
-		return db.openWAL()
-	}
 
 	// Create a new WAL file
 	walFile, err := os.OpenFile(walPath, os.O_RDWR|os.O_CREATE, 0666)
@@ -204,13 +217,6 @@ func (db *DB) createWALFile() error {
 
 // writeFrameHeader writes a frame header to the WAL file
 func (db *DB) writeFrameHeader(pageNumber uint32, commitFlag int, data []byte) (int64, error) {
-	// Create or open the WAL file if it doesn't exist
-	if db.walInfo == nil {
-		err := db.createWALFile()
-		if err != nil {
-			return 0, err
-		}
-	}
 
 	// Use the nextWritePosition instead of getting the file size
 	frameOffset := db.walInfo.nextWritePosition
@@ -329,6 +335,9 @@ func (db *DB) scanWAL() error {
 	runningChecksum := headerChecksum
 	lastCommitChecksum := headerChecksum
 
+	// Track the maximum page number to update index file size
+	maxPageNumber := uint32(0)
+
 	for offset+WalFrameHeaderSize <= walFileInfo.Size() {
 		// Read frame header
 		frameHeader := make([]byte, WalFrameHeaderSize)
@@ -387,6 +396,11 @@ func (db *DB) scanWAL() error {
 		// Extract page number from frame header
 		pageNumber := binary.BigEndian.Uint32(frameHeader[0:4])
 
+		// Track the maximum page number
+		if pageNumber > maxPageNumber {
+			maxPageNumber = pageNumber
+		}
+
 		// Read the page data
 		pageData := make([]byte, pageSize)
 		if _, err := db.walInfo.file.ReadAt(pageData, offset+WalFrameHeaderSize); err != nil {
@@ -419,6 +433,14 @@ func (db *DB) scanWAL() error {
 	// Store the final checksum value
 	db.walInfo.lastCommitChecksum = lastCommitChecksum
 	db.walInfo.checksum = lastCommitChecksum
+
+	// Update index file size to account for WAL pages
+	if maxPageNumber > 0 {
+		requiredSize := int64(maxPageNumber+1) * PageSize
+		if requiredSize > db.indexFileSize {
+			db.indexFileSize = requiredSize
+		}
+	}
 
 	return nil
 }
@@ -540,8 +562,8 @@ func (db *DB) openWAL() error {
 
 	// Check if WAL file exists
 	if _, err := os.Stat(walPath); err != nil {
-		// WAL file doesn't exist, do nothing
-		return nil
+		// WAL file doesn't exist, create it
+		return db.createWAL()
 	}
 
 	// Open the existing WAL file

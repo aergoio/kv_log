@@ -277,6 +277,13 @@ func Open(path string, options ...Options) (*DB, error) {
 		pageCache:      make(map[uint32]*Page),
 	}
 
+	// Ensure indexFileSize is properly aligned to page boundaries for existing files
+	if indexFileExists && indexFileInfo.Size() > 0 {
+		// Round up to the nearest page boundary to ensure correct page allocation
+		actualPages := (indexFileInfo.Size() + PageSize - 1) / PageSize
+		db.indexFileSize = actualPages * PageSize
+	}
+
 	// Initialize internal write mode fields
 	db.updateWriteMode(writeMode)
 	db.nextWriteMode = writeMode
@@ -1114,9 +1121,6 @@ func (db *DB) initializeIndexFile() error {
 	if err := db.writeIndexHeader(true); err != nil {
 		return fmt.Errorf("failed to write index file header: %w", err)
 	}
-
-	// Update file size to include the root page
-	db.indexFileSize = PageSize
 
 	// Allocate root radix page at page 1
 	rootRadixPage, err := db.allocateRadixPage()
