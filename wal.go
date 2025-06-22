@@ -15,7 +15,7 @@ const (
 	// WAL magic string for identification
 	WalMagicString = "KV_WAL"
 	// WAL header size
-	WalHeaderSize = 24
+	WalHeaderSize = 32
 	// WAL frame header size
 	WalFrameHeaderSize = 20
 )
@@ -193,9 +193,12 @@ func (db *DB) createWAL() error {
 	binary.BigEndian.PutUint32(header[12:16], db.walInfo.salt1)
 	binary.BigEndian.PutUint32(header[16:20], db.walInfo.salt2)
 
-	// Calculate checksum for header (first 20 bytes)
-	checksum := crc32.ChecksumIEEE(header[0:20])
-	binary.BigEndian.PutUint32(header[20:24], checksum)
+	// Write database ID
+	binary.BigEndian.PutUint64(header[20:28], db.databaseID)
+
+	// Calculate checksum for header (first 28 bytes)
+	checksum := crc32.ChecksumIEEE(header[0:28])
+	binary.BigEndian.PutUint32(header[28:32], checksum)
 
 	// Store the header checksum
 	db.walInfo.checksum = checksum
@@ -311,8 +314,8 @@ func (db *DB) scanWAL() error {
 	}
 
 	// Verify header checksum
-	headerChecksum := binary.BigEndian.Uint32(headerBuf[20:24])
-	calculatedHeaderChecksum := crc32.ChecksumIEEE(headerBuf[0:20])
+	headerChecksum := binary.BigEndian.Uint32(headerBuf[28:32])
+	calculatedHeaderChecksum := crc32.ChecksumIEEE(headerBuf[0:28])
 	if headerChecksum != calculatedHeaderChecksum {
 		return fmt.Errorf("invalid WAL file: header checksum mismatch")
 	}
@@ -321,6 +324,20 @@ func (db *DB) scanWAL() error {
 	db.walInfo.sequenceNumber = int64(binary.BigEndian.Uint32(headerBuf[8:12]))
 	db.walInfo.salt1 = binary.BigEndian.Uint32(headerBuf[12:16])
 	db.walInfo.salt2 = binary.BigEndian.Uint32(headerBuf[16:20])
+
+	// Extract database ID from header
+	walDatabaseID := binary.BigEndian.Uint64(headerBuf[20:28])
+
+	// Check if database ID matches
+	if walDatabaseID != db.databaseID {
+		// Database ID mismatch, delete the WAL file
+		debugPrint("WAL database ID mismatch: %d vs %d, deleting WAL file\n", walDatabaseID, db.databaseID)
+		if err := db.deleteWAL(); err != nil {
+			return fmt.Errorf("failed to delete mismatched WAL file: %w", err)
+		}
+		// Create a new WAL file with the correct database ID
+		return db.createWAL()
+	}
 
 	// Initialize page cache if needed
 	if db.walInfo.pageCache == nil {
@@ -597,7 +614,9 @@ func (db *DB) openWAL() error {
 
 	// Scan the WAL file to load any existing frames
 	if err := db.scanWAL(); err != nil {
-		return fmt.Errorf("failed to scan WAL file: %w", err)
+		// If there's an error scanning the WAL (which could be due to a database ID mismatch),
+		// the scanWAL function will handle it by deleting and recreating the WAL file
+		return err
 	}
 
 	return nil

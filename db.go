@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math/rand"
 	"os"
 	"sort"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/aergoio/kv_log/varint"
 )
@@ -90,6 +92,7 @@ func debugPrint(format string, args ...interface{}) {
 
 // DB represents the database instance
 type DB struct {
+	databaseID     uint64 // Unique identifier for the database
 	filePath       string
 	mainFile       *os.File
 	indexFile      *os.File
@@ -267,6 +270,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	db := &DB{
+		databaseID:     0, // Will be set on read or initialize
 		filePath:       path,
 		mainFile:       mainFile,
 		indexFile:      indexFile,
@@ -313,6 +317,13 @@ func Open(path string, options ...Options) (*DB, error) {
 		}
 	} else if needsIndexInitialization {
 		// Main file exists but index file is missing or empty
+		// Read the main file header first to get the database ID
+		if err := db.readMainFileHeader(); err != nil {
+			db.Unlock()
+			mainFile.Close()
+			indexFile.Close()
+			return nil, fmt.Errorf("failed to read main file header: %w", err)
+		}
 		// Initialize a new index file
 		debugPrint("Index file missing or empty, initializing new index\n")
 		if err := db.initializeIndexFile(); err != nil {
@@ -1066,6 +1077,11 @@ func (db *DB) initialize() error {
 
 	debugPrint("Initializing database\n")
 
+	// Generate a random database ID
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	db.databaseID = r.Uint64()
+	debugPrint("Generated new database ID: %d\n", db.databaseID)
+
 	// Save the original journal mode and temporarily disable it during initialization
 	originalWriteMode := db.writeMode
 	db.updateWriteMode(WorkerThread_NoWAL_NoSync)
@@ -1098,6 +1114,9 @@ func (db *DB) initializeMainFile() error {
 
 	// Write the 2-byte version
 	copy(rootPage[6:8], VersionString)
+
+	// Write the 8-byte database ID
+	binary.LittleEndian.PutUint64(rootPage[8:16], db.databaseID)
 
 	// The rest of the root page is reserved for future use
 
@@ -1191,8 +1210,8 @@ func (db *DB) readHeader() error {
 
 // readMainFileHeader reads the main file header
 func (db *DB) readMainFileHeader() error {
-	// Read the header (8 bytes) in root page (page 1)
-	header := make([]byte, 8)
+	// Read the header (16 bytes) in root page (page 1)
+	header := make([]byte, 16)
 	if _, err := db.mainFile.ReadAt(header, 0); err != nil {
 		return err
 	}
@@ -1210,6 +1229,9 @@ func (db *DB) readMainFileHeader() error {
 	if fileVersion != VersionString {
 		return fmt.Errorf("unsupported main database version")
 	}
+
+	// Extract database ID (8 bytes)
+	db.databaseID = binary.LittleEndian.Uint64(header[8:16])
 
 	return nil
 }
@@ -1236,15 +1258,43 @@ func (db *DB) readIndexFileHeader() error {
 		return fmt.Errorf("unsupported index database version")
 	}
 
+	// Extract database ID (8 bytes)
+	indexDatabaseID := binary.LittleEndian.Uint64(header[8:16])
+
+	// Check if the database ID matches the main file
+	if db.databaseID != 0 && indexDatabaseID != db.databaseID {
+		// Database ID mismatch, delete the index file and recreate it
+		debugPrint("Index file database ID mismatch: %d vs %d, recreating index file\n", indexDatabaseID, db.databaseID)
+
+		// Close the index file
+		if err := db.indexFile.Close(); err != nil {
+			return fmt.Errorf("failed to close index file: %w", err)
+		}
+
+		// Delete the index file
+		if err := os.Remove(db.filePath + "-index"); err != nil {
+			return fmt.Errorf("failed to delete index file: %w", err)
+		}
+
+		// Reopen the index file
+		db.indexFile, err = os.OpenFile(db.filePath + "-index", os.O_RDWR|os.O_CREATE, 0666)
+		if err != nil {
+			return fmt.Errorf("failed to reopen index file: %w", err)
+		}
+
+		// Initialize a new index file with the correct database ID
+		return db.initializeIndexFile()
+	}
+
 	// Parse the last indexed offset from the header
-	db.lastIndexedOffset = int64(binary.LittleEndian.Uint64(header[8:16]))
+	db.lastIndexedOffset = int64(binary.LittleEndian.Uint64(header[16:24]))
 	if db.lastIndexedOffset == 0 {
 		// If the last indexed offset is 0, default to PageSize
 		db.lastIndexedOffset = PageSize
 	}
 
 	// Parse the free sub-pages head pointer
-	freePageNum := binary.LittleEndian.Uint32(header[16:20])
+	freePageNum := binary.LittleEndian.Uint32(header[24:28])
 
 	// If we have a valid free page pointer
 	if freePageNum > 0 {
@@ -1286,11 +1336,14 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	// Write the 2-byte version
 	copy(rootPage[6:8], VersionString)
 
+	// Write the 8-byte database ID
+	binary.LittleEndian.PutUint64(rootPage[8:16], db.databaseID)
+
 	// Set last indexed offset (8 bytes)
-	binary.LittleEndian.PutUint64(rootPage[8:16], uint64(lastIndexedOffset))
+	binary.LittleEndian.PutUint64(rootPage[16:24], uint64(lastIndexedOffset))
 
 	// Set free sub-pages head pointer (4 bytes)
-	binary.LittleEndian.PutUint32(rootPage[16:20], nextFreePageNumber)
+	binary.LittleEndian.PutUint32(rootPage[24:28], nextFreePageNumber)
 
 	// If this is the first time we're writing the header, set the file size to PageSize
 	if isInit {
