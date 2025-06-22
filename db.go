@@ -192,7 +192,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	// Default options
-	lockType := LockNone // Default to no lock
+	lockType := LockExclusive // Default to use an exclusive lock
 	readOnly := false
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
 
@@ -202,11 +202,13 @@ func Open(path string, options ...Options) (*DB, error) {
 		opts = options[0]
 	}
 	if opts != nil {
+		/*
 		if val, ok := opts["LockType"]; ok {
 			if lt, ok := val.(int); ok {
 				lockType = lt
 			}
 		}
+		*/
 		if val, ok := opts["ReadOnly"]; ok {
 			if ro, ok := val.(bool); ok {
 				readOnly = ro

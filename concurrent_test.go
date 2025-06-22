@@ -18,7 +18,7 @@ func TestConcurrentAccess(t *testing.T) {
 	os.Remove(dbPath + "-index")
 	os.Remove(dbPath + "-wal")
 
-	// Open a new database with default settings (no lock)
+	// Open a new database
 	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
@@ -169,69 +169,53 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 }
 
-func TestConcurrentReadersWithExclusiveWriter(t *testing.T) {
+func TestExclusiveAccess(t *testing.T) {
 	// Create a test database
-	dbPath := "test_concurrent_lock.db"
+	dbPath := "test_exclusive.db"
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
 	os.Remove(dbPath + "-index")
 	os.Remove(dbPath + "-wal")
 
-	// Insert initial data with a writer that has an exclusive lock
-	writerDB, err := Open(dbPath, Options{"LockType": LockExclusive})
+	// Open a new database connection
+	db1, err := Open(dbPath)
 	if err != nil {
-		t.Fatalf("Failed to open database with exclusive lock: %v", err)
+		t.Fatalf("Failed to open first database connection: %v", err)
 	}
-
-	// Insert some initial data
-	for i := 0; i < 10; i++ {
-		key := fmt.Sprintf("init-key-%d", i)
-		value := fmt.Sprintf("init-value-%d", i)
-		if err := writerDB.Set([]byte(key), []byte(value)); err != nil {
-			writerDB.Close()
-			t.Fatalf("Failed to set initial data: %v", err)
-		}
-	}
-
-	// Keep the writer open to maintain the exclusive lock
 	defer func() {
-		writerDB.Close()
+		db1.Close()
 		os.Remove(dbPath)
 		os.Remove(dbPath + "-index")
 		os.Remove(dbPath + "-wal")
 	}()
 
-	// Try to open the same database with a shared lock (should fail)
-	_, err = Open(dbPath, Options{"LockType": LockShared})
-	if err == nil {
-		t.Fatalf("Expected error when opening database with shared lock while exclusive lock is held")
+	// Insert some initial data
+	for i := 0; i < 5; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		value := fmt.Sprintf("value-%d", i)
+		if err := db1.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set initial data: %v", err)
+		}
 	}
 
-	// Try to open the same database with no lock (should succeed for reading)
-	readerDB, err := Open(dbPath, Options{"LockType": LockNone})
+	// Try to open a second connection to the same database
+	// This should fail because the database only allows one connection at a time
+	db2, err := Open(dbPath)
+
+	// The second connection should fail
+	if err == nil {
+		db2.Close() // Make sure to close it if it somehow succeeded
+		t.Fatalf("Expected second database connection to fail, but it succeeded")
+	}
+
+	// Verify the first connection still works
+	value, err := db1.Get([]byte("key-0"))
 	if err != nil {
-		t.Fatalf("Failed to open database with no lock: %v", err)
+		t.Fatalf("Failed to read from first connection after attempting second connection: %v", err)
 	}
-	defer readerDB.Close()
-
-	// Try to read from the database
-	for i := 0; i < 10; i++ {
-		key := fmt.Sprintf("init-key-%d", i)
-		value, err := readerDB.Get([]byte(key))
-		if err != nil {
-			t.Fatalf("Failed to read key %s with no lock: %v", key, err)
-		}
-		expectedValue := fmt.Sprintf("init-value-%d", i)
-		if !bytes.Equal(value, []byte(expectedValue)) {
-			t.Fatalf("Value mismatch for key %s: got %s, want %s", key, string(value), expectedValue)
-		}
-	}
-
-	// Try to write to the database with no lock (should succeed but might corrupt data)
-	err = readerDB.Set([]byte("test-key"), []byte("test-value"))
-	if err == nil {
-		t.Errorf("Write with no lock unexpectedly succeeded, this might lead to data corruption")
+	if !bytes.Equal(value, []byte("value-0")) {
+		t.Fatalf("Value mismatch: got %s, want %s", string(value), "value-0")
 	}
 }
 
@@ -302,19 +286,10 @@ func TestReadOnlyMode(t *testing.T) {
 		t.Fatalf("Expected error when deleting in read-only mode, but got nil")
 	}
 
-	// Test multiple read-only connections
+	// Try to open a second read-only connection (should fail due to exclusive access)
 	readDB2, err := Open(dbPath, Options{"ReadOnly": true})
-	if err != nil {
-		t.Fatalf("Failed to open second read-only connection: %v", err)
-	}
-	defer readDB2.Close()
-
-	// Verify second connection can also read
-	value, err := readDB2.Get([]byte("key-5"))
-	if err != nil {
-		t.Fatalf("Failed to read from second read-only connection: %v", err)
-	}
-	if !bytes.Equal(value, []byte("value-5")) {
-		t.Fatalf("Value mismatch in second read-only connection: got %s, want %s", string(value), "value-5")
+	if err == nil {
+		readDB2.Close()
+		t.Fatalf("Expected second read-only connection to fail, but it succeeded")
 	}
 }

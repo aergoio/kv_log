@@ -11,7 +11,7 @@ import (
 )
 
 // TestMultiProcessAccess tests database access from multiple processes
-// This test creates temporary Go programs that access the same database file
+// This test verifies that only one process can access the database at a time
 func TestMultiProcessAccess(t *testing.T) {
 	// Skip if running in short mode
 	if testing.Short() {
@@ -49,12 +49,9 @@ func TestMultiProcessAccess(t *testing.T) {
 		t.Fatalf("Failed to close database: %v", err)
 	}
 
-	// Create a file to indicate when readers are ready
-	readersReadyFile := filepath.Join(tempDir, "readers_ready")
-
 	// Create a reader program
 	readerPath := filepath.Join(tempDir, "reader.go")
-	if err := createReaderProgram(readerPath, dbPath, readersReadyFile); err != nil {
+	if err := createReaderProgram(readerPath, dbPath); err != nil {
 		t.Fatalf("Failed to create reader program: %v", err)
 	}
 
@@ -64,38 +61,21 @@ func TestMultiProcessAccess(t *testing.T) {
 		t.Fatalf("Failed to create writer program: %v", err)
 	}
 
-	// Run multiple reader processes with shared locks
-	var readerCmds []*exec.Cmd
-	for i := 0; i < 3; i++ {
-		cmd := exec.Command("go", "run", readerPath)
-		cmd.Stdout = &bytes.Buffer{}
-		cmd.Stderr = &bytes.Buffer{}
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("Failed to start reader process %d: %v", i, err)
-		}
-		readerCmds = append(readerCmds, cmd)
+	// Start a reader process first
+	readerCmd := exec.Command("go", "run", readerPath)
+	readerOutput := &bytes.Buffer{}
+	readerCmd.Stdout = readerOutput
+	readerCmd.Stderr = readerOutput
+	if err := readerCmd.Start(); err != nil {
+		t.Fatalf("Failed to start reader process: %v", err)
 	}
 
-	// Wait for readers to signal they've acquired locks
-	t.Log("Waiting for readers to acquire shared locks...")
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if _, err := os.Stat(readersReadyFile); err == nil {
-			// File exists, readers are ready
-			break
-		}
-		
-		if time.Now().After(deadline) {
-			t.Fatalf("Timed out waiting for readers to acquire locks")
-		}
-		
-		time.Sleep(100 * time.Millisecond)
-	}
-	t.Log("Readers have acquired shared locks")
+	// Give the reader a moment to acquire the connection
+	time.Sleep(100 * time.Millisecond)
 
-	// Run a writer process with exclusive lock - this should fail if readers have shared locks
-	t.Log("Starting writer with exclusive lock (should fail)...")
-	writerCmd := exec.Command("go", "run", writerPath, "exclusive")
+	// Try to start a second process (writer) while the first one is running
+	// This should fail because the database only allows one connection at a time
+	writerCmd := exec.Command("go", "run", writerPath)
 	writerOutput := &bytes.Buffer{}
 	writerCmd.Stdout = writerOutput
 	writerCmd.Stderr = writerOutput
@@ -106,73 +86,52 @@ func TestMultiProcessAccess(t *testing.T) {
 	// Wait for the writer to finish
 	err = writerCmd.Wait()
 
-	// Check if the writer failed as expected (it should fail to acquire an exclusive lock)
-	if err == nil {
-		// If readers are using shared locks, writer with exclusive lock should fail
-		t.Errorf("Writer with exclusive lock unexpectedly succeeded: %s", writerOutput.String())
+	// Check if the writer failed as expected (it should fail to acquire a connection)
+	if err == nil && !bytes.Contains(writerOutput.Bytes(), []byte("Failed to open database")) {
+		t.Errorf("Writer unexpectedly succeeded while reader was active: %s", writerOutput.String())
 	}
 
-	// Wait for readers to finish
-	for i, cmd := range readerCmds {
-		if err := cmd.Wait(); err != nil {
+	// Wait for the reader to finish
+	if err := readerCmd.Wait(); err != nil {
+		t.Fatalf("Reader failed: %v\nOutput: %s", err, readerOutput.String())
+	}
+
+	// Now that the reader is done, start a new process which should succeed
+	newWriterCmd := exec.Command("go", "run", writerPath)
+	newWriterOutput := &bytes.Buffer{}
+	newWriterCmd.Stdout = newWriterOutput
+	newWriterCmd.Stderr = newWriterOutput
+	if err := newWriterCmd.Start(); err != nil {
+		t.Fatalf("Failed to start new writer process: %v", err)
+	}
+
+	// Wait for the new writer to finish
+	if err := newWriterCmd.Wait(); err != nil {
+		t.Fatalf("New writer failed: %v\nOutput: %s", err, newWriterOutput.String())
+	}
+
+	// Verify the writer succeeded
+	if !bytes.Contains(newWriterOutput.Bytes(), []byte("Writer completed successfully")) {
+		t.Errorf("New writer did not complete successfully: %s", newWriterOutput.String())
+	}
+
+	// Run multiple processes one after another
+	for i := 0; i < 5; i++ {
+		cmd := exec.Command("go", "run", writerPath)
+		cmd.Stdout = &bytes.Buffer{}
+		cmd.Stderr = &bytes.Buffer{}
+
+		if err := cmd.Run(); err != nil {
 			stdout := cmd.Stdout.(*bytes.Buffer).String()
 			stderr := cmd.Stderr.(*bytes.Buffer).String()
-			t.Fatalf("Reader %d failed: %v\nStdout: %s\nStderr: %s", i, err, stdout, stderr)
-		}
-		stdout := cmd.Stdout.(*bytes.Buffer).String()
-		if !bytes.Contains([]byte(stdout), []byte("Reader completed")) {
-			t.Fatalf("Reader %d did not complete successfully: %s", i, stdout)
+			t.Errorf("Sequential writer %d failed: %v\nStdout: %s\nStderr: %s", i, err, stdout, stderr)
+		} else {
+			stdout := cmd.Stdout.(*bytes.Buffer).String()
+			if !bytes.Contains([]byte(stdout), []byte("Writer completed successfully")) {
+				t.Errorf("Sequential writer %d did not complete successfully: %s", i, stdout)
+			}
 		}
 	}
-
-	// Run a concurrent test with multiple writers and readers using no locks
-	// (they should acquire temporary locks during operations)
-	t.Run("ConcurrentProcesses", func(t *testing.T) {
-		// Run multiple writers with no lock (they should acquire temporary locks)
-		var writerCmds []*exec.Cmd
-		for i := 0; i < 3; i++ {
-			cmd := exec.Command("go", "run", writerPath, "none")
-			cmd.Stdout = &bytes.Buffer{}
-			cmd.Stderr = &bytes.Buffer{}
-			if err := cmd.Start(); err != nil {
-				t.Fatalf("Failed to start concurrent writer process %d: %v", i, err)
-			}
-			writerCmds = append(writerCmds, cmd)
-		}
-
-		// Run multiple readers at the same time
-		var concurrentReaderCmds []*exec.Cmd
-		for i := 0; i < 5; i++ {
-			cmd := exec.Command("go", "run", readerPath, "none") // Pass "none" to use no lock
-			cmd.Stdout = &bytes.Buffer{}
-			cmd.Stderr = &bytes.Buffer{}
-			if err := cmd.Start(); err != nil {
-				t.Fatalf("Failed to start concurrent reader process %d: %v", i, err)
-			}
-			concurrentReaderCmds = append(concurrentReaderCmds, cmd)
-		}
-
-		// Wait for all processes to finish
-		for i, cmd := range writerCmds {
-			err := cmd.Wait()
-			if err != nil {
-				// Only log failures that are unexpected
-				stdout := cmd.Stdout.(*bytes.Buffer).String()
-				stderr := cmd.Stderr.(*bytes.Buffer).String()
-				t.Errorf("Writer %d failed unexpectedly: %v\nStdout: %s\nStderr: %s", i, err, stdout, stderr)
-			}
-		}
-
-		for i, cmd := range concurrentReaderCmds {
-			err := cmd.Wait()
-			if err != nil {
-				// Only log failures that are unexpected
-				stdout := cmd.Stdout.(*bytes.Buffer).String()
-				stderr := cmd.Stderr.(*bytes.Buffer).String()
-				t.Errorf("Reader %d failed unexpectedly: %v\nStdout: %s\nStderr: %s", i, err, stdout, stderr)
-			}
-		}
-	})
 
 	// Verify the database is still intact
 	finalDB, err := Open(dbPath)
@@ -185,7 +144,7 @@ func TestMultiProcessAccess(t *testing.T) {
 	for i, key := range initialKeys {
 		value, err := finalDB.Get([]byte(key))
 		if err != nil {
-			// Key might have been deleted during concurrent operations - this is expected
+			// Key might have been deleted during operations - this is expected
 			continue
 		}
 
@@ -206,7 +165,7 @@ func TestMultiProcessAccess(t *testing.T) {
 }
 
 // createReaderProgram creates a Go program that reads from the database
-func createReaderProgram(filePath, dbPath string, signalFile string) error {
+func createReaderProgram(filePath, dbPath string) error {
 	programContent := fmt.Sprintf(`package main
 
 import (
@@ -218,56 +177,40 @@ import (
 )
 
 func main() {
-	// Determine lock type from command line arg
-	lockType := kv_log.LockShared
-	if len(os.Args) > 1 && os.Args[1] == "none" {
-		lockType = kv_log.LockNone
-	}
-
-	// Open the database with the specified lock
-	db, err := kv_log.Open(%q, kv_log.Options{"LockType": lockType})
+	// Open the database
+	db, err := kv_log.Open(%q)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open database: %%v\n", err)
 		os.Exit(1)
 	}
-	defer db.Close()
-	
-	// If using shared lock, signal that we've acquired it
-	if lockType == kv_log.LockShared {
-		// Signal that we've acquired the lock by creating a file
-		signalFile, err := os.Create(%q)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to create signal file: %%v\n", err)
-		} else {
-			signalFile.Close()
-		}
-		
-		// Keep the lock for a bit to ensure the writer has time to try
-		time.Sleep(500 * time.Millisecond)
-	}
+
+	// Hold the database connection for a moment to simulate work
+	// This ensures the connection stays open while we try to open another one
+	time.Sleep(500 * time.Millisecond)
 
 	// Read some keys
 	keys := []string{"key1", "key2", "key3", "key4", "key5", "writer-key"}
-
-	// Try multiple times in case the writer hasn't written yet
-	for attempt := 0; attempt < 5; attempt++ {
-		for _, key := range keys {
-			value, err := db.Get([]byte(key))
-			if err != nil {
-				// Don't fail on writer-key as it might not exist yet
-				if key != "writer-key" {
-					fmt.Fprintf(os.Stderr, "Failed to get key %%s: %%v\n", key, err)
-				}
-			} else {
-				fmt.Printf("Read key %%s: %%s\n", key, string(value))
+	for _, key := range keys {
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			// Don't fail on writer-key as it might not exist yet
+			if key != "writer-key" {
+				fmt.Fprintf(os.Stderr, "Failed to get key %%s: %%v\n", key, err)
 			}
+		} else {
+			fmt.Printf("Read key %%s: %%s\n", key, string(value))
 		}
-		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Close the database
+	if err := db.Close(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to close database: %%v\n", err)
+		os.Exit(1)
 	}
 
 	fmt.Println("Reader completed successfully")
 }
-`, dbPath, signalFile)
+`, dbPath)
 
 	return os.WriteFile(filePath, []byte(programContent), 0644)
 }
@@ -285,15 +228,8 @@ import (
 )
 
 func main() {
-	// Determine lock type from command line arg
-	lockType := kv_log.LockNone
-	if len(os.Args) > 1 && os.Args[1] == "exclusive" {
-		lockType = kv_log.LockExclusive
-		fmt.Println("Acquiring exclusive lock on database file")
-	}
-
-	// Open the database with specified lock type
-	db, err := kv_log.Open(%q, kv_log.Options{"LockType": lockType})
+	// Open the database
+	db, err := kv_log.Open(%q)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to open database: %%v\n", err)
 		os.Exit(1)
