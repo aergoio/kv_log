@@ -180,10 +180,12 @@ func Open(path string, options ...Options) (*DB, error) {
 
 	if !mainFileExists && indexFileExists {
 		// Remove index file if main file doesn't exist
-		if err := os.Remove(indexPath); err != nil {
-			return nil, fmt.Errorf("failed to remove index file: %w", err)
-		}
+		os.Remove(indexPath)
 		indexFileExists = false
+	}
+	if !indexFileExists {
+		// Remove WAL file if index file doesn't exist
+		os.Remove(path + "-wal")
 	}
 
 	// Default options
@@ -1940,6 +1942,13 @@ func (db *DB) flushIndexToDisk() error {
 	// Write index header
 	if err := db.writeIndexHeader(false); err != nil {
 		return fmt.Errorf("failed to update index header: %w", err)
+	}
+
+	// WallCommit if using WAL
+	if db.useWAL {
+		if err := db.WallCommit(); err != nil {
+			return fmt.Errorf("failed to commit WAL: %w", err)
+		}
 	}
 
 	return nil
