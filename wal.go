@@ -442,6 +442,9 @@ func (db *DB) scanWAL() error {
 		}
 	}
 
+	// Increment sequence number after successful scan
+	db.walInfo.sequenceNumber++
+
 	return nil
 }
 
