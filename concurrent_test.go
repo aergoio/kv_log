@@ -15,6 +15,8 @@ func TestConcurrentAccess(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Open a new database with default settings (no lock)
 	db, err := Open(dbPath)
@@ -24,6 +26,8 @@ func TestConcurrentAccess(t *testing.T) {
 	defer func() {
 		db.Close()
 		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Insert some initial data
@@ -171,6 +175,8 @@ func TestConcurrentReadersWithExclusiveWriter(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Insert initial data with a writer that has an exclusive lock
 	writerDB, err := Open(dbPath, Options{"LockType": LockExclusive})
@@ -192,6 +198,8 @@ func TestConcurrentReadersWithExclusiveWriter(t *testing.T) {
 	defer func() {
 		writerDB.Close()
 		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Try to open the same database with a shared lock (should fail)
@@ -233,6 +241,8 @@ func TestReadOnlyMode(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Create and populate the database
 	writeDB, err := Open(dbPath)
@@ -263,6 +273,8 @@ func TestReadOnlyMode(t *testing.T) {
 	defer func() {
 		readDB.Close()
 		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Verify we can read data

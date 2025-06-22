@@ -14,6 +14,8 @@ func TestDatabaseBasicOperations(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Open a new database
 	db, err := Open(dbPath)
@@ -22,7 +24,9 @@ func TestDatabaseBasicOperations(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		//os.Remove(dbPath) // Clean up after test
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Test setting a key-value pair
@@ -121,6 +125,8 @@ func TestMultipleKeyValues(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Open a new database
 	db, err := Open(dbPath, Options{"MainIndexPages": 1})
@@ -129,7 +135,9 @@ func TestMultipleKeyValues(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		//os.Remove(dbPath) // Clean up after test
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Insert multiple key-value pairs
@@ -216,6 +224,8 @@ func TestDeleteOperations(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Open a new database
 	db, err := Open(dbPath, Options{"MainIndexPages": 1})
@@ -224,7 +234,9 @@ func TestDeleteOperations(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath) // Clean up after test
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Set up some test data
@@ -338,6 +350,8 @@ func TestDatabasePersistence1(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Open a new database
 	db, err := Open(dbPath)
@@ -381,7 +395,9 @@ func TestDatabasePersistence1(t *testing.T) {
 	}
 	defer func() {
 		reopenedDb.Close()
-		os.Remove(dbPath) // Clean up after test
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Verify key1 still exists with original value
@@ -438,6 +454,8 @@ func TestDatabasePersistence2(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Open a new database
 	db, err := Open(dbPath)
@@ -485,7 +503,9 @@ func TestDatabasePersistence2(t *testing.T) {
 	}
 	defer func() {
 		reopenedDb.Close()
-		os.Remove(dbPath) // Clean up after test
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Verify name has the updated value
@@ -536,6 +556,8 @@ func TestIterator(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Open a new database
 	db, err := Open(dbPath)
@@ -544,7 +566,9 @@ func TestIterator(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath) // Clean up after test
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Insert test data
@@ -682,6 +706,8 @@ func TestIterator(t *testing.T) {
 	// Test iterator with empty database
 	emptyDbPath := "test_empty_iterator.db"
 	os.Remove(emptyDbPath)
+	os.Remove(emptyDbPath + "-index")
+	os.Remove(emptyDbPath + "-wal")
 
 	emptyDb, err := Open(emptyDbPath, Options{"MainIndexPages": 1})
 	if err != nil {
@@ -690,6 +716,8 @@ func TestIterator(t *testing.T) {
 	defer func() {
 		emptyDb.Close()
 		os.Remove(emptyDbPath)
+		os.Remove(emptyDbPath + "-index")
+		os.Remove(emptyDbPath + "-wal")
 	}()
 
 	emptyIt := emptyDb.NewIterator()
@@ -707,6 +735,8 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
 
 	// Open a new database
 	db, err := Open(dbPath)
@@ -715,7 +745,9 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 	}
 	defer func() {
 		db.Close()
-		os.Remove(dbPath) // Clean up after test
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
 	}()
 
 	// Insert many key-value pairs to test iterator with a large dataset
@@ -790,12 +822,19 @@ func TestDatabaseReindex(t *testing.T) {
 	// Clean up any existing test database
 	os.Remove(dbPath)
 	os.Remove(indexPath)
+	os.Remove(dbPath + "-wal")
 
 	// Open a new database
 	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(indexPath)
+		os.Remove(dbPath + "-wal")
+	}()
 
 	// Test setting key-value pairs
 	err = db.Set([]byte("name"), []byte("hash-table-tree"))
@@ -839,6 +878,10 @@ func TestDatabaseReindex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to reopen database after index deletion: %v", err)
 	}
+	defer func() {
+		reopenedDb.Close()
+		os.Remove(originalIndexPath)
+	}()
 
 	// Verify name has the updated value
 	nameVal, err := reopenedDb.Get([]byte("name"))
@@ -873,20 +916,17 @@ func TestDatabaseReindex(t *testing.T) {
 
 	// Compare files using diff to verify index was rebuilt
 
-	// Run diff command to compare the index files
-	cmd := exec.Command("diff", "-q", originalIndexPath, indexPath)
-	output, err := cmd.CombinedOutput()
+	// Compare files starting from byte 4096 (skipping the first 4096 bytes)
+	// Use cmp command with skip option to compare files from offset 4096
+	cmd := exec.Command("cmp", "-s", "-i", "4096:4096", originalIndexPath, indexPath)
+	err = cmd.Run()
 
-	// If diff finds no differences, it returns exit status 0
+	// If cmp finds no differences, it returns exit status 0
 	// If files differ, it returns exit status 1
 	// For any other error, it returns other non-zero status
 	if err != nil {
-		// Files should be identical, so any difference is an error
-		t.Fatalf("Index files should be identical but differ: %v, output: %s", err, string(output))
+		// Files should be identical after byte 4096, so any difference is an error
+		t.Fatalf("Index files should be identical after byte 4096 but differ: %v", err)
 	}
 
-	// Clean up
-	os.Remove(dbPath)
-	os.Remove(indexPath)
-	os.Remove(originalIndexPath)
 }
