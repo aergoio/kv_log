@@ -25,7 +25,7 @@ type WalPageEntry struct {
 	PageNumber     uint32     // Page number of the page in the main db file
 	Data           []byte     // The page data
 	SequenceNumber int64      // Transaction sequence number when this page was written
-	Next           *WalPageEntry // Pointer to the next entry with the same offset (for rollback)
+	Next           *WalPageEntry // Pointer to the next entry with the same page number (for rollback)
 }
 
 // WalInfo represents the WAL file information
@@ -66,7 +66,7 @@ func (db *DB) addToWalCache(pageNumber uint32, data []byte) {
 		Next:           nil,
 	}
 
-	// Check if there's already an entry for this page offset
+	// Check if there's already an entry for this page
 	if existingEntry, ok := db.walInfo.pageCache[pageNumber]; ok {
 		// Add the new entry at the beginning of the linked list
 		newEntry.Next = existingEntry
@@ -86,7 +86,7 @@ func (db *DB) getLatestFromWalCache(pageNumber uint32) []byte {
 	db.walInfo.cacheMutex.RLock()
 	defer db.walInfo.cacheMutex.RUnlock()
 
-	// Check if there's an entry for this page offset
+	// Check if there's an entry for this page
 	if entry, ok := db.walInfo.pageCache[pageNumber]; ok {
 		// Return the most recent version (first in the linked list)
 		return entry.Data
@@ -238,7 +238,7 @@ func (db *DB) writeFrameHeader(pageNumber uint32, commitFlag int, data []byte) (
 	// Start with the current checksum value
 	checksum := db.walInfo.checksum
 
-	// Update checksum with first 12 bytes of frame header (page offset and commit flag)
+	// Update checksum with first 12 bytes of frame header (page number and commit flag)
 	checksum = crc32.Update(checksum, db.walInfo.hasher, frameHeader[0:8])
 
 	// Update checksum with page data if provided
@@ -362,7 +362,7 @@ func (db *DB) scanWAL() error {
 		frameChecksum := binary.BigEndian.Uint32(frameHeader[16:20])
 
 		// Calculate expected checksum
-		// Update running checksum with first 12 bytes of frame header (page offset and commit flag)
+		// Update running checksum with first 12 bytes of frame header (page number and commit flag)
 		runningChecksum = crc32.Update(runningChecksum, db.walInfo.hasher, frameHeader[0:8])
 
 		if isCommit {
@@ -479,6 +479,21 @@ func (db *DB) WallCommit() error {
 		}
 	}
 
+	// Clean up old page versions from cache after successful commit
+	db.walInfo.cacheMutex.Lock()
+	// Iterate through all pages in the cache
+	for _, entry := range db.walInfo.pageCache {
+		// Keep only the most recent version (head of the list) and remove older versions
+		if entry != nil && entry.Next != nil {
+			// This is the current transaction being committed, keep it but remove older versions
+			entry.Next = nil
+		}
+	}
+	db.walInfo.cacheMutex.Unlock()
+
+	// Increment sequence number after successful commit
+	db.walInfo.sequenceNumber++
+
 	// maybe notify the checkpoint thread worker that a commit record has been written
 	//db.checkpointNotify <- true
 
@@ -505,7 +520,7 @@ func (db *DB) WallRollback() error {
 	currentSeq := db.walInfo.sequenceNumber
 
 	// Iterate through all pages in the cache
-	for offset, entry := range db.walInfo.pageCache {
+	for pageNumber, entry := range db.walInfo.pageCache {
 		// Find the first entry that's not from the current transaction
 		var newHead *WalPageEntry = entry
 		for newHead != nil && newHead.SequenceNumber == currentSeq {
@@ -513,9 +528,9 @@ func (db *DB) WallRollback() error {
 		}
 		// Update the cache with the new head (or delete if no valid entries remain)
 		if newHead != nil {
-			db.walInfo.pageCache[offset] = newHead
+			db.walInfo.pageCache[pageNumber] = newHead
 		} else {
-			delete(db.walInfo.pageCache, offset)
+			delete(db.walInfo.pageCache, pageNumber)
 		}
 	}
 
@@ -543,9 +558,6 @@ func (db *DB) doCheckpoint() error {
 	// Reset the checksum for the next WAL cycle
 	db.walInfo.checksum = 0
 	db.walInfo.lastCommitChecksum = 0
-
-	// Increment the sequence number for the next WAL cycle
-	db.walInfo.sequenceNumber++
 
 	return nil
 }
