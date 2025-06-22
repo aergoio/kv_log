@@ -1948,9 +1948,9 @@ func (db *DB) flushIndexToDisk() error {
 		return fmt.Errorf("failed to update index header: %w", err)
 	}
 
-	// WallCommit if using WAL
+	// WalCommit if using WAL
 	if db.useWAL {
-		if err := db.WallCommit(); err != nil {
+		if err := db.WalCommit(); err != nil {
 			return fmt.Errorf("failed to commit WAL: %w", err)
 		}
 	}

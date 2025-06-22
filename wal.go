@@ -445,8 +445,8 @@ func (db *DB) scanWAL() error {
 	return nil
 }
 
-// WallCommit writes a commit record to the WAL file
-func (db *DB) WallCommit() error {
+// WalCommit writes a commit record to the WAL file
+func (db *DB) WalCommit() error {
 	// If WAL info is not initialized, return
 	if db.walInfo == nil {
 		return nil
@@ -500,8 +500,8 @@ func (db *DB) WallCommit() error {
 	return nil
 }
 
-// WallRollback
-func (db *DB) WallRollback() error {
+// WalRollback
+func (db *DB) WalRollback() error {
 	if db.walInfo == nil {
 		return nil
 	}
