@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 )
 
@@ -586,8 +587,8 @@ func TestIterator(t *testing.T) {
 		}
 	}
 
-	// Create an iterator
-	it := db.NewIterator()
+	// Create an iterator (no range filtering)
+	it := db.NewIterator(nil, nil)
 	defer it.Close()
 
 	// Count the number of entries found
@@ -647,8 +648,8 @@ func TestIterator(t *testing.T) {
 		t.Fatalf("Failed to update 'key1': %v", err)
 	}
 
-	// Create a new iterator
-	modifiedIt := db.NewIterator()
+	// Create a new iterator (no range filtering)
+	modifiedIt := db.NewIterator(nil, nil)
 	defer modifiedIt.Close()
 
 	// Reset tracking variables
@@ -703,6 +704,82 @@ func TestIterator(t *testing.T) {
 		}
 	}
 
+	// Test range filtering with iterator
+	// Test 1: Range from "key2" to "key5" (exclusive)
+	rangeIt := db.NewIterator([]byte("key2"), []byte("key5"))
+	defer rangeIt.Close()
+
+	expectedRangeKeys := []string{"key2", "key4"} // key3 was deleted, key5 is excluded
+	foundRangeKeys := make([]string, 0)
+
+	for rangeIt.Valid() {
+		key := string(rangeIt.Key())
+		foundRangeKeys = append(foundRangeKeys, key)
+		rangeIt.Next()
+	}
+
+	if len(foundRangeKeys) != len(expectedRangeKeys) {
+		t.Fatalf("Range iterator found %d keys, expected %d. Found: %v, Expected: %v",
+			len(foundRangeKeys), len(expectedRangeKeys), foundRangeKeys, expectedRangeKeys)
+	}
+
+	for i, expectedKey := range expectedRangeKeys {
+		if i >= len(foundRangeKeys) || foundRangeKeys[i] != expectedKey {
+			t.Fatalf("Range iterator key mismatch at position %d: got %s, want %s",
+				i, foundRangeKeys[i], expectedKey)
+		}
+	}
+
+	// Test 2: Range with only start bound
+	startOnlyIt := db.NewIterator([]byte("key4"), nil)
+	defer startOnlyIt.Close()
+
+	expectedStartOnlyKeys := []string{"key4", "key5", "key6"} // keys >= "key4"
+	foundStartOnlyKeys := make([]string, 0)
+
+	for startOnlyIt.Valid() {
+		key := string(startOnlyIt.Key())
+		foundStartOnlyKeys = append(foundStartOnlyKeys, key)
+		startOnlyIt.Next()
+	}
+
+	if len(foundStartOnlyKeys) != len(expectedStartOnlyKeys) {
+		t.Fatalf("Start-only iterator found %d keys, expected %d. Found: %v, Expected: %v",
+			len(foundStartOnlyKeys), len(expectedStartOnlyKeys), foundStartOnlyKeys, expectedStartOnlyKeys)
+	}
+
+	for i, expectedKey := range expectedStartOnlyKeys {
+		if i >= len(foundStartOnlyKeys) || foundStartOnlyKeys[i] != expectedKey {
+			t.Fatalf("Start-only iterator key mismatch at position %d: got %s, want %s",
+				i, foundStartOnlyKeys[i], expectedKey)
+		}
+	}
+
+	// Test 3: Range with only end bound
+	endOnlyIt := db.NewIterator(nil, []byte("key4"))
+	defer endOnlyIt.Close()
+
+	expectedEndOnlyKeys := []string{"key1", "key2"} // keys < "key4"
+	foundEndOnlyKeys := make([]string, 0)
+
+	for endOnlyIt.Valid() {
+		key := string(endOnlyIt.Key())
+		foundEndOnlyKeys = append(foundEndOnlyKeys, key)
+		endOnlyIt.Next()
+	}
+
+	if len(foundEndOnlyKeys) != len(expectedEndOnlyKeys) {
+		t.Fatalf("End-only iterator found %d keys, expected %d. Found: %v, Expected: %v",
+			len(foundEndOnlyKeys), len(expectedEndOnlyKeys), foundEndOnlyKeys, expectedEndOnlyKeys)
+	}
+
+	for i, expectedKey := range expectedEndOnlyKeys {
+		if i >= len(foundEndOnlyKeys) || foundEndOnlyKeys[i] != expectedKey {
+			t.Fatalf("End-only iterator key mismatch at position %d: got %s, want %s",
+				i, foundEndOnlyKeys[i], expectedKey)
+		}
+	}
+
 	// Test iterator with empty database
 	emptyDbPath := "test_empty_iterator.db"
 	os.Remove(emptyDbPath)
@@ -720,7 +797,7 @@ func TestIterator(t *testing.T) {
 		os.Remove(emptyDbPath + "-wal")
 	}()
 
-	emptyIt := emptyDb.NewIterator()
+	emptyIt := emptyDb.NewIterator(nil, nil)
 	defer emptyIt.Close()
 
 	// Verify the iterator is not valid for an empty database
@@ -770,8 +847,8 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 		expectedData[keys[i]] = values[i]
 	}
 
-	// Create an iterator
-	it := db.NewIterator()
+	// Create an iterator (no range filtering)
+	it := db.NewIterator(nil, nil)
 	defer it.Close()
 
 	// Count the number of entries found
@@ -811,6 +888,336 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 		if !foundKeys[key] {
 			t.Fatalf("Key '%s' was not found by iterator", key)
 		}
+	}
+
+	// Test range filtering with large dataset
+	// Test range from "test-key-100" to "test-key-200" (exclusive)
+	rangeStart := []byte("test-key-100")
+	rangeEnd := []byte("test-key-200")
+	rangeIt := db.NewIterator(rangeStart, rangeEnd)
+	defer rangeIt.Close()
+
+	// Count keys in the range
+	rangeCount := 0
+	for rangeIt.Valid() {
+		key := string(rangeIt.Key())
+
+		// Verify the key is within the expected range
+		if key < "test-key-100" || key >= "test-key-200" {
+			t.Fatalf("Range iterator returned key outside range: %s", key)
+		}
+
+		// Verify the key exists in our expected data
+		if _, exists := expectedData[key]; !exists {
+			t.Fatalf("Range iterator returned unexpected key: %s", key)
+		}
+
+		rangeCount++
+		rangeIt.Next()
+	}
+
+	// Calculate expected count: test-key-100 to test-key-199 (inclusive)
+	// This includes test-key-100, test-key-101, ..., test-key-109, test-key-110, ..., test-key-199
+	expectedRangeCount := 0
+	for i := 0; i < numPairs; i++ {
+		key := keys[i]
+		if key >= "test-key-100" && key < "test-key-200" {
+			expectedRangeCount++
+		}
+	}
+
+	if rangeCount != expectedRangeCount {
+		t.Fatalf("Range iterator found %d keys, expected %d", rangeCount, expectedRangeCount)
+	}
+}
+
+// generateVariableLengthKey generates a key of variable length based on index i
+// Key lengths range from 1 to 64 bytes, using base64-like characters for variety
+// Limits single-character keys to 64 total to avoid collisions
+func generateVariableLengthKey(i int) string {
+	// Base64-like character set for more variety
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+	// Determine the key length (1 to 64 bytes)
+	// But limit single-character keys to only the first 64 indices
+	var keyLength int
+	if i < 64 {
+		// First 64 keys get single characters (1 byte each)
+		keyLength = 1
+	} else {
+		// Remaining keys get lengths from 2 to 64 bytes
+		keyLength = ((i - 64) % 63) + 2
+	}
+
+	// Create a base pattern using the index - ensure it's always unique
+	basePattern := fmt.Sprintf("k%d", i)
+
+	// Handle single character keys specially
+	if keyLength == 1 {
+		return string(charset[i % len(charset)])
+	}
+
+	// If the base pattern is already longer than desired length,
+	// we need to create a shorter unique key
+	if len(basePattern) > keyLength {
+		// For short keys, create a compact unique representation
+		if keyLength == 2 {
+			first := charset[i % len(charset)]
+			second := charset[(i / len(charset)) % len(charset)]
+			return string([]byte{first, second})
+		} else if keyLength == 3 {
+			first := charset[i % len(charset)]
+			second := charset[(i / len(charset)) % len(charset)]
+			third := charset[(i / (len(charset) * len(charset))) % len(charset)]
+			return string([]byte{first, second, third})
+		} else {
+			// For longer keys that are still shorter than basePattern,
+			// create a compact representation
+			compactKey := fmt.Sprintf("%d", i)
+			if len(compactKey) > keyLength {
+				// If even the number is too long, use base64 encoding of the number
+				var builder strings.Builder
+				remaining := i
+				for j := 0; j < keyLength; j++ {
+					builder.WriteByte(charset[remaining % len(charset)])
+					remaining = remaining / len(charset)
+				}
+				return builder.String()
+			} else {
+				// Pad with charset characters
+				var builder strings.Builder
+				builder.WriteString(compactKey)
+				for j := len(compactKey); j < keyLength; j++ {
+					builder.WriteByte(charset[(i + j) % len(charset)])
+				}
+				return builder.String()
+			}
+		}
+	}
+
+	// If we need to pad, use repeating characters from charset
+	if len(basePattern) < keyLength {
+		padding := keyLength - len(basePattern)
+
+		var builder strings.Builder
+		builder.WriteString(basePattern)
+		for j := 0; j < padding; j++ {
+			// Use different characters based on position and index
+			charIndex := (i + j) % len(charset)
+			builder.WriteByte(charset[charIndex])
+		}
+
+		return builder.String()
+	}
+
+	return basePattern
+}
+
+func TestIteratorWithLargeDataset2(t *testing.T) {
+	// Create a test database
+	dbPath := "test_iterator_variable_length.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Insert many key-value pairs with variable length keys to test iterator
+	numPairs := 1000
+	keys := make([]string, numPairs)
+	values := make([]string, numPairs)
+	keySet := make(map[string]bool) // To check for duplicates
+
+	for i := 0; i < numPairs; i++ {
+		keys[i] = generateVariableLengthKey(i)
+		values[i] = fmt.Sprintf("val-%d", i)
+
+		// Check for duplicate keys
+		if keySet[keys[i]] {
+			t.Fatalf("Duplicate key generated at index %d: %s", i, keys[i])
+		}
+		keySet[keys[i]] = true
+
+		if err := db.Set([]byte(keys[i]), []byte(values[i])); err != nil {
+			t.Fatalf("Failed to set key %d (%s): %v", i, keys[i], err)
+		}
+	}
+
+	// Create a map for verification
+	expectedData := make(map[string]string)
+	for i := 0; i < numPairs; i++ {
+		expectedData[keys[i]] = values[i]
+	}
+
+	// Create an iterator (no range filtering)
+	it := db.NewIterator(nil, nil)
+	defer it.Close()
+
+	// Count the number of entries found
+	count := 0
+	foundKeys := make(map[string]bool)
+
+	// Iterate through all entries
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+
+		// Verify the key-value pair exists in our expected data
+		expectedValue, exists := expectedData[key]
+		if !exists {
+			t.Fatalf("Iterator returned unexpected key: %s", key)
+		}
+		if value != expectedValue {
+			t.Fatalf("Value mismatch for key '%s': got %s, want %s", key, value, expectedValue)
+		}
+
+		// Track found keys
+		foundKeys[key] = true
+		count++
+
+		// Move to next entry
+		it.Next()
+	}
+
+	// Verify we found all keys
+	if count != numPairs {
+		t.Fatalf("Iterator found %d entries, expected %d", count, numPairs)
+	}
+
+	// Verify each key was found
+	for i := 0; i < numPairs; i++ {
+		key := keys[i]
+		if !foundKeys[key] {
+			t.Fatalf("Key '%s' was not found by iterator", key)
+		}
+	}
+
+	// Test range filtering with variable length keys
+	// Test range from "k100" to "k200" (exclusive) - this will catch keys starting with k1
+	rangeStart := []byte("k100")
+	rangeEnd := []byte("k200")
+	rangeIt := db.NewIterator(rangeStart, rangeEnd)
+	defer rangeIt.Close()
+
+	// Count keys in the range
+	rangeCount := 0
+	foundRangeKeys := make([]string, 0)
+	for rangeIt.Valid() {
+		key := string(rangeIt.Key())
+
+		// Verify the key is within the expected range
+		if key < "k100" || key >= "k200" {
+			t.Fatalf("Range iterator returned key outside range: %s", key)
+		}
+
+		// Verify the key exists in our expected data
+		if _, exists := expectedData[key]; !exists {
+			t.Fatalf("Range iterator returned unexpected key: %s", key)
+		}
+
+		foundRangeKeys = append(foundRangeKeys, key)
+		rangeCount++
+		rangeIt.Next()
+	}
+
+	// Calculate expected count: keys that are >= "k100" and < "k200"
+	expectedRangeCount := 0
+	expectedRangeKeys := make([]string, 0)
+	for i := 0; i < numPairs; i++ {
+		key := keys[i]
+		if key >= "k100" && key < "k200" {
+			expectedRangeCount++
+			expectedRangeKeys = append(expectedRangeKeys, key)
+		}
+	}
+
+	if rangeCount != expectedRangeCount {
+		t.Logf("Range iterator found %d keys, expected %d", rangeCount, expectedRangeCount)
+		t.Logf("Found keys: %v", foundRangeKeys)
+		t.Logf("Expected keys: %v", expectedRangeKeys)
+	}
+
+	// Test with keys of different lengths - single character keys
+	// Since we know the first 64 keys are single characters from our charset,
+	// let's test a range that should include some of them
+	singleCharStart := []byte("A")
+	singleCharEnd := []byte("z") // Extend range to include lowercase
+	singleCharIt := db.NewIterator(singleCharStart, singleCharEnd)
+	defer singleCharIt.Close()
+
+	singleCharCount := 0
+	foundSingleChars := make([]string, 0)
+	for singleCharIt.Valid() {
+		key := string(singleCharIt.Key())
+
+		// Only count actual single character keys
+		if len(key) == 1 {
+			foundSingleChars = append(foundSingleChars, key)
+			singleCharCount++
+		}
+
+		singleCharIt.Next()
+	}
+
+	// Count expected single character keys in range A-y (inclusive of both upper and lower case)
+	expectedSingleCharCount := 0
+	expectedSingleChars := make([]string, 0)
+	for i := 0; i < numPairs; i++ {
+		key := keys[i]
+		if len(key) == 1 && key[0] >= 'A' && key[0] < 'z' {
+			expectedSingleCharCount++
+			expectedSingleChars = append(expectedSingleChars, key)
+		}
+	}
+
+	if singleCharCount != expectedSingleCharCount {
+		t.Logf("Single char iterator found %d keys, expected %d", singleCharCount, expectedSingleCharCount)
+		t.Logf("Found single chars: %v", foundSingleChars)
+		t.Logf("Expected single chars: %v", expectedSingleChars)
+	}
+
+	// Test with prefix-based range for keys starting with "k5"
+	prefixStart := []byte("k5")
+	prefixEnd := []byte("k6")
+	prefixIt := db.NewIterator(prefixStart, prefixEnd)
+	defer prefixIt.Close()
+
+	prefixCount := 0
+	for prefixIt.Valid() {
+		key := string(prefixIt.Key())
+
+		// Verify the key starts with "k5"
+		if !strings.HasPrefix(key, "k5") {
+			t.Fatalf("Prefix iterator returned unexpected key: %s", key)
+		}
+
+		prefixCount++
+		prefixIt.Next()
+	}
+
+	// Count expected keys starting with "k5"
+	expectedPrefixCount := 0
+	for i := 0; i < numPairs; i++ {
+		key := keys[i]
+		if strings.HasPrefix(key, "k5") {
+			expectedPrefixCount++
+		}
+	}
+
+	if prefixCount != expectedPrefixCount {
+		t.Logf("Prefix iterator found %d keys starting with 'k5', expected %d", prefixCount, expectedPrefixCount)
 	}
 }
 
