@@ -2368,42 +2368,6 @@ func (db *DB) rebuildLeafPageData(leafPage *LeafPage) {
 	leafPage.ContentSize = uint16(pos)
 }
 
-// getLeafEntries returns all entries in a leaf page
-func (db *DB) getLeafEntries(leafPage *LeafPage) ([]LeafEntry, error) {
-	var entries []LeafEntry
-
-	// Start at header size
-	pos := int(LeafHeaderSize)
-
-	// Read entries until we reach content size
-	for pos < int(leafPage.ContentSize) {
-		// Read suffix length
-		suffixLen64, bytesRead := varint.Read(leafPage.data[pos:])
-		if bytesRead == 0 {
-			return nil, fmt.Errorf("failed to read suffix length")
-		}
-		suffixLen := int(suffixLen64)
-		pos += bytesRead
-
-		// Read suffix
-		suffix := make([]byte, suffixLen)
-		copy(suffix, leafPage.data[pos:pos+suffixLen])
-		pos += suffixLen
-
-		// Read data offset
-		dataOffset := int64(binary.LittleEndian.Uint64(leafPage.data[pos:]))
-		pos += 8
-
-		// Add entry to list
-		entries = append(entries, LeafEntry{
-			Suffix:     suffix,
-			DataOffset: dataOffset,
-		})
-	}
-
-	return entries, nil
-}
-
 // ------------------------------------------------------------------------------------------------
 // Radix entries (on sub-pages)
 // ------------------------------------------------------------------------------------------------
