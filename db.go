@@ -123,19 +123,25 @@ type Content struct {
 	value       []byte // Parsed value for ContentTypeData
 }
 
-// BasePage contains common fields for all page types
-type BasePage struct {
-	pageNumber  uint32
-	data        []byte
-	dirty       bool
-}
-
-// RadixPage represents a radix page with sub-pages
-type RadixPage struct {
-	BasePage     // Embed the base Page
+// Page is a unified struct containing fields for both RadixPage and LeafPage
+type Page struct {
+	pageNumber   uint32
+	pageType     byte
+	data         []byte
+	dirty        bool
+	// Fields for RadixPage
 	SubPagesUsed uint8  // Number of sub-pages used
 	NextFreePage uint32 // Pointer to the next radix page with free sub-pages (0 if none)
+	// Fields for LeafPage
+	ContentSize  uint16      // Total size of content on this page
+	Entries      []LeafEntry // Parsed entries
 }
+
+// RadixPage is an alias for Page
+type RadixPage = Page
+
+// LeafPage is an alias for Page
+type LeafPage = Page
 
 // RadixSubPage represents a specific sub-page within a radix page
 type RadixSubPage struct {
@@ -147,20 +153,6 @@ type RadixSubPage struct {
 type LeafEntry struct {
 	Suffix     []byte
 	DataOffset int64
-}
-
-// LeafPage represents a leaf page with entries
-type LeafPage struct {
-	BasePage    // Embed the base Page
-	ContentSize uint16      // Total size of content on this page
-	Entries     []LeafEntry // Parsed entries
-}
-
-// Page represents a generic page in the cache
-type Page struct {
-	PageType   byte
-	RadixPage  *RadixPage
-	LeafPage   *LeafPage
 }
 
 // Options represents configuration options for the database
@@ -611,22 +603,22 @@ func (db *DB) Set(key, value []byte) error {
 		}
 
 		// There's an entry for this byte, load the page
-		entry, err := db.getPage(nextPageNumber)
+		page, err := db.getPage(nextPageNumber)
 		if err != nil {
 			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
 		}
 
 		// Check what type of page we got
-		if entry.PageType == ContentTypeRadix {
+		if page.pageType == ContentTypeRadix {
 			// It's a radix page, continue traversing
 			currentSubPage = &RadixSubPage{
-				Page:       entry.RadixPage,
+				Page:       page,
 				SubPageIdx: nextSubPageIdx,
 			}
 			keyPos++
-		} else if entry.PageType == ContentTypeLeaf {
+		} else if page.pageType == ContentTypeLeaf {
 			// It's a leaf page, attempt to set the key and value using the leaf page
-			return db.setOnLeafPage(entry.LeafPage, key, keyPos, value, 0)
+			return db.setOnLeafPage(page, key, keyPos, value, 0)
 		} else {
 			return fmt.Errorf("invalid page type")
 		}
@@ -658,22 +650,22 @@ func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, dataOff
 		}
 
 		// There's an entry for this byte, load the page
-		entry, err := db.getPage(nextPageNumber)
+		page, err := db.getPage(nextPageNumber)
 		if err != nil {
 			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
 		}
 
 		// Check what type of page we got
-		if entry.PageType == ContentTypeRadix {
+		if page.pageType == ContentTypeRadix {
 			// It's a radix page, continue traversing
 			currentSubPage = &RadixSubPage{
-				Page:       entry.RadixPage,
+				Page:       page,
 				SubPageIdx: nextSubPageIdx,
 			}
 			keyPos++
-		} else if entry.PageType == ContentTypeLeaf {
+		} else if page.pageType == ContentTypeLeaf {
 			// It's a leaf page, attempt to set the key and value using the leaf page
-			return db.setOnLeafPage(entry.LeafPage, key, keyPos, value, dataOffset)
+			return db.setOnLeafPage(page, key, keyPos, value, dataOffset)
 		} else {
 			return fmt.Errorf("invalid page type")
 		}
@@ -705,28 +697,28 @@ func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos 
 		}
 
 		// There's an entry for this byte, load the page
-		entry, err := db.getPage(nextPageNumber)
+		page, err := db.getPage(nextPageNumber)
 		if err != nil {
 			return fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
 		}
 
 		// Check what type of page we got
-		if entry.PageType == ContentTypeRadix {
+		if page.pageType == ContentTypeRadix {
 			// It's a radix page, continue traversing
 			currentSubPage = &RadixSubPage{
-				Page:       entry.RadixPage,
+				Page:       page,
 				SubPageIdx: nextSubPageIdx,
 			}
 			suffixPos++
-		} else if entry.PageType == ContentTypeLeaf {
+		} else if page.pageType == ContentTypeLeaf {
 			// It's a leaf page
 			suffix = suffix[suffixPos+1:]
 			// Try to add the entry with the suffix to the leaf page
-			if db.addLeafEntry(entry.LeafPage, suffix, contentOffset) {
+			if db.addLeafEntry(page, suffix, contentOffset) {
 				return nil
 			}
 			// Leaf page is full, convert it to a radix page
-			return db.convertLeafToRadix(entry.LeafPage, suffix, contentOffset)
+			return db.convertLeafToRadix(page, suffix, contentOffset)
 		} else {
 			return fmt.Errorf("invalid page type")
 		}
@@ -989,22 +981,22 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		}
 
 		// Load the next page
-		entry, err := db.getPage(nextPageNumber)
+		page, err := db.getPage(nextPageNumber)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
 		}
 
 		// Check what type of page we got
-		if entry.PageType == ContentTypeRadix {
+		if page.pageType == ContentTypeRadix {
 			// It's a radix page, continue traversing
 			currentSubPage = &RadixSubPage{
-				Page:       entry.RadixPage,
+				Page:       page,
 				SubPageIdx: nextSubPageIdx,
 			}
 			keyPos++
-		} else if entry.PageType == ContentTypeLeaf {
+		} else if page.pageType == ContentTypeLeaf {
 			// It's a leaf page, search for the suffix
-			leafPage := entry.LeafPage
+			leafPage := page
 
 			// The remaining part of the key is the suffix
 			suffix := key[keyPos+1:]
@@ -1552,11 +1544,10 @@ func (db *DB) parseRadixPage(data []byte, pageNumber uint32) (*RadixPage, error)
 
 	// Create structured radix page
 	radixPage := &RadixPage{
-		BasePage: BasePage{
-			pageNumber:  pageNumber,
-			dirty:       false,
-			data:        data,
-		},
+		pageNumber:   pageNumber,
+		pageType:     ContentTypeRadix,
+		data:         data,
+		dirty:        false,
 		SubPagesUsed: subPagesUsed,
 		NextFreePage: nextFreePage,
 	}
@@ -1632,11 +1623,10 @@ func (db *DB) parseLeafPage(data []byte, pageNumber uint32) (*LeafPage, error) {
 
 	// Create structured leaf page
 	leafPage := &LeafPage{
-		BasePage: BasePage{
-			pageNumber:  pageNumber,
-			data:        data,
-			dirty:       false,
-		},
+		pageNumber:  pageNumber,
+		pageType:    ContentTypeLeaf,
+		data:        data,
+		dirty:       false,
 		ContentSize: contentSize,
 	}
 
@@ -1694,40 +1684,26 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 // first read 1 byte to check the page type
 // then read the page data
 func (db *DB) readPage(pageNumber uint32) (*Page, error) {
-
 	data, err := db.readIndexPage(pageNumber)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read page: %w", err)
 	}
 
 	contentType := data[0]
-	entry := &Page{
-		PageType: contentType,
-	}
 
 	// Based on the page type, read the full page
 	switch contentType {
 	case ContentTypeRadix:
 		// Read the radix page
-		radixPage, err := db.parseRadixPage(data, pageNumber)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse radix page: %w", err)
-		}
-		entry.RadixPage = radixPage
+		return db.parseRadixPage(data, pageNumber)
 
 	case ContentTypeLeaf:
 		// Read the leaf page
-		leafPage, err := db.parseLeafPage(data, pageNumber)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse leaf page: %w", err)
-		}
-		entry.LeafPage = leafPage
+		return db.parseLeafPage(data, pageNumber)
 
 	default:
 		return nil, fmt.Errorf("unknown page type: %c", contentType)
 	}
-
-	return entry, nil
 }
 
 // writeIndexPage writes an index page to either the WAL file or the index file
@@ -1857,43 +1833,28 @@ func (db *DB) RefreshFileSize() error {
 // ------------------------------------------------------------------------------------------------
 
 // addToCache adds a page to the cache
-func (db *DB) addToCache(page interface{}) {
-	entry := &Page{}
-
-	switch p := page.(type) {
-	case *RadixPage:
-		entry.PageType = ContentTypeRadix
-		entry.RadixPage = p
-	case *LeafPage:
-		entry.PageType = ContentTypeLeaf
-		entry.LeafPage = p
-	default:
-		return // Unknown page type
+func (db *DB) addToCache(page *Page) {
+	if page == nil {
+		return
 	}
 
-	pageNumber := uint32(0)
-	if entry.PageType == ContentTypeRadix {
-		pageNumber = entry.RadixPage.pageNumber
-	} else if entry.PageType == ContentTypeLeaf {
-		pageNumber = entry.LeafPage.pageNumber
-	}
-
+	pageNumber := page.pageNumber
 	if pageNumber == 0 {
 		return // Invalid page number
 	}
 
 	db.cacheMutex.Lock()
-	db.pageCache[pageNumber] = entry
+	db.pageCache[pageNumber] = page
 	db.cacheMutex.Unlock()
 }
 
-// getPageFromCache gets a page from the cache by page number and type
+// getPageFromCache gets a page from the cache by page number
 func (db *DB) getPageFromCache(pageNumber uint32) (*Page, bool) {
 	db.cacheMutex.RLock()
-	entry, exists := db.pageCache[pageNumber]
+	page, exists := db.pageCache[pageNumber]
 	db.cacheMutex.RUnlock()
 
-	return entry, exists
+	return page, exists
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1903,9 +1864,9 @@ func (db *DB) getPageFromCache(pageNumber uint32) (*Page, bool) {
 // getPage gets a page from the cache or from the disk
 func (db *DB) getPage(pageNumber uint32) (*Page, error) {
 	// First check the cache
-	entry, exists := db.getPageFromCache(pageNumber)
+	page, exists := db.getPageFromCache(pageNumber)
 	if exists {
-		return entry, nil
+		return page, nil
 	}
 
 	// If not in cache, read it from disk
@@ -1914,50 +1875,48 @@ func (db *DB) getPage(pageNumber uint32) (*Page, error) {
 
 // getRadixPage returns a radix page from the cache or from the disk
 func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
-
 	// First try to get the page from the cache
-	entry, exists := db.getPageFromCache(pageNumber)
+	page, exists := db.getPageFromCache(pageNumber)
 
 	// If not in cache, read it from disk
 	if !exists {
 		var err error
-		entry, err = db.readPage(pageNumber)
+		page, err = db.readPage(pageNumber)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	// If the page is not a radix page, return an error
-	if entry.PageType != ContentTypeRadix || entry.RadixPage == nil {
+	if page.pageType != ContentTypeRadix {
 		return nil, fmt.Errorf("page %d is not a radix page", pageNumber)
 	}
 
 	// Return the radix page
-	return entry.RadixPage, nil
+	return page, nil
 }
 
 // getLeafPage returns a leaf page from the cache or from the disk
 func (db *DB) getLeafPage(pageNumber uint32) (*LeafPage, error) {
-
 	// First try to get the page from the cache
-	entry, exists := db.getPageFromCache(pageNumber)
+	page, exists := db.getPageFromCache(pageNumber)
 
 	// If not in cache, read it from disk
 	if !exists {
 		var err error
-		entry, err = db.readPage(pageNumber)
+		page, err = db.readPage(pageNumber)
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	// If the page is not a leaf page, return an error
-	if entry.PageType != ContentTypeLeaf || entry.LeafPage == nil {
+	if page.pageType != ContentTypeLeaf {
 		return nil, fmt.Errorf("page %d is not a leaf page", pageNumber)
 	}
 
 	// Return the leaf page
-	return entry.LeafPage, nil
+	return page, nil
 }
 
 // GetCacheStats returns statistics about the page cache
@@ -1972,10 +1931,10 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 	radixPages := 0
 	leafPages := 0
 
-	for _, entry := range db.pageCache {
-		if entry.PageType == ContentTypeRadix {
+	for _, page := range db.pageCache {
+		if page.pageType == ContentTypeRadix {
 			radixPages++
-		} else if entry.PageType == ContentTypeLeaf {
+		} else if page.pageType == ContentTypeLeaf {
 			leafPages++
 		}
 	}
@@ -2031,13 +1990,13 @@ func (db *DB) flushAllIndexPages() error {
 
 	// Process pages in order
 	for _, pageNumber := range pageNumbers {
-		entry := db.pageCache[pageNumber]
-		if entry.PageType == ContentTypeRadix && entry.RadixPage != nil {
-			if err := db.writeRadixPage(entry.RadixPage); err != nil {
+		page := db.pageCache[pageNumber]
+		if page.pageType == ContentTypeRadix {
+			if err := db.writeRadixPage(page); err != nil {
 				return err
 			}
-		} else if entry.PageType == ContentTypeLeaf && entry.LeafPage != nil {
-			if err := db.writeLeafPage(entry.LeafPage); err != nil {
+		} else if page.pageType == ContentTypeLeaf {
+			if err := db.writeLeafPage(page); err != nil {
 				return err
 			}
 		}
@@ -2064,14 +2023,16 @@ func (db *DB) flushDirtyIndexPages() error {
 
 	// Process pages in order
 	for _, pageNumber := range pageNumbers {
-		entry := db.pageCache[pageNumber]
-		if entry.PageType == ContentTypeRadix && entry.RadixPage != nil && entry.RadixPage.dirty {
-			if err := db.writeRadixPage(entry.RadixPage); err != nil {
-				return err
-			}
-		} else if entry.PageType == ContentTypeLeaf && entry.LeafPage != nil && entry.LeafPage.dirty {
-			if err := db.writeLeafPage(entry.LeafPage); err != nil {
-				return err
+		page := db.pageCache[pageNumber]
+		if page.dirty {
+			if page.pageType == ContentTypeRadix {
+				if err := db.writeRadixPage(page); err != nil {
+					return err
+				}
+			} else if page.pageType == ContentTypeLeaf {
+				if err := db.writeLeafPage(page); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -2127,11 +2088,10 @@ func (db *DB) allocateRadixPage() (*RadixPage, error) {
 	db.indexFileSize += PageSize
 
 	radixPage := &RadixPage{
-		BasePage: BasePage{
-			pageNumber:  pageNumber,
-			data:        data,
-			dirty:       false,
-		},
+		pageNumber:  pageNumber,
+		pageType:    ContentTypeRadix,
+		data:        data,
+		dirty:       false,
 		SubPagesUsed: 0,
 	}
 
@@ -2220,11 +2180,10 @@ func (db *DB) allocateLeafPage() (*LeafPage, error) {
 	db.indexFileSize += PageSize
 
 	leafPage := &LeafPage{
-		BasePage: BasePage{
-			pageNumber:  pageNumber,
-			data:        data,
-			dirty:       false,
-		},
+		pageNumber:  pageNumber,
+		pageType:    ContentTypeLeaf,
+		data:        data,
+		dirty:       false,
 		ContentSize: LeafHeaderSize,
 		Entries:     make([]LeafEntry, 0),
 	}
@@ -2597,11 +2556,10 @@ func (db *DB) convertLeafToRadix(leafPage *LeafPage, newSuffix []byte, newDataOf
 
 	// Create a new radix page with the same page number
 	radixPage := &RadixPage{
-		BasePage: BasePage{
-			pageNumber: leafPage.pageNumber,
-			dirty:      true,
-			data:       make([]byte, PageSize),
-		},
+		pageNumber:   leafPage.pageNumber,
+		pageType:     ContentTypeRadix,
+		data:         make([]byte, PageSize),
+		dirty:        true,
 		SubPagesUsed: 1, // Start with one sub-page
 	}
 

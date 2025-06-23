@@ -209,7 +209,7 @@ func (it *Iterator) processRadixPage(pos *radixIterPos) bool {
 		it.keyPrefix = append(it.keyPrefix, byteValue)
 
 		// Push the new page to the stack
-		if page.PageType == ContentTypeRadix {
+		if page.pageType == ContentTypeRadix {
 			it.stack = append(it.stack, radixIterPos{
 				pageNumber: nextPageNumber,
 				pageType:   ContentTypeRadix,
@@ -217,7 +217,7 @@ func (it *Iterator) processRadixPage(pos *radixIterPos) bool {
 				subPageIdx: nextSubPageIdx,
 			})
 			return it.processRadixPage(&it.stack[len(it.stack)-1])
-		} else if page.PageType == ContentTypeLeaf {
+		} else if page.pageType == ContentTypeLeaf {
 			it.stack = append(it.stack, radixIterPos{
 				pageNumber: nextPageNumber,
 				pageType:   ContentTypeLeaf,
@@ -399,14 +399,14 @@ func (it *Iterator) seekToStart() {
 				pos.emptySuffix = true // We'll check empty suffix when we process this page
 
 				// Push the new page to the stack
-				if page.PageType == ContentTypeRadix {
+				if page.pageType == ContentTypeRadix {
 					it.stack = append(it.stack, radixIterPos{
 						pageNumber: nextPageNumber,
 						pageType:   ContentTypeRadix,
 						byteValue:  -1,
 						subPageIdx: nextSubPageIdx,
 					})
-				} else if page.PageType == ContentTypeLeaf {
+				} else if page.pageType == ContentTypeLeaf {
 					it.stack = append(it.stack, radixIterPos{
 						pageNumber: nextPageNumber,
 						pageType:   ContentTypeLeaf,
