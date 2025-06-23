@@ -2217,9 +2217,8 @@ func (db *DB) parseLeafEntries(leafPage *LeafPage) ([]LeafEntry, error) {
 		suffixLen := int(suffixLen64)
 		pos += bytesRead
 
-		// Read suffix
-		suffix := make([]byte, suffixLen)
-		copy(suffix, leafPage.data[pos:pos+suffixLen])
+		// Get suffix as a slice of the page data
+		suffix := leafPage.data[pos:pos+suffixLen]
 		pos += suffixLen
 
 		// Read data offset
@@ -2252,12 +2251,14 @@ func (db *DB) addLeafEntry(leafPage *LeafPage, suffix []byte, dataOffset int64) 
 	pos := int(leafPage.ContentSize)
 
 	// Write suffix length
-	suffixLenWritten := varint.Write(leafPage.data[pos:], uint64(len(suffix)))
+	suffixLen := len(suffix)
+	suffixLenWritten := varint.Write(leafPage.data[pos:], uint64(suffixLen))
 	pos += suffixLenWritten
 
 	// Write suffix
+	suffixPos := pos
 	copy(leafPage.data[pos:], suffix)
-	pos += len(suffix)
+	pos += suffixLen
 
 	// Write data offset
 	binary.LittleEndian.PutUint64(leafPage.data[pos:], uint64(dataOffset))
@@ -2268,7 +2269,7 @@ func (db *DB) addLeafEntry(leafPage *LeafPage, suffix []byte, dataOffset int64) 
 
 	// Add to entries list
 	leafPage.Entries = append(leafPage.Entries, LeafEntry{
-		Suffix:     suffix,
+		Suffix:     leafPage.data[suffixPos:suffixPos+suffixLen],
 		DataOffset: dataOffset,
 	})
 
@@ -2339,30 +2340,46 @@ func (db *DB) updateLeafEntryOffset(leafPage *LeafPage, index int, dataOffset in
 
 // rebuildLeafPageData rebuilds the leaf page data from the entries list
 func (db *DB) rebuildLeafPageData(leafPage *LeafPage) {
-	// Reset content size to header size
-	leafPage.ContentSize = LeafHeaderSize
 
-	// Clear data after header
-	for i := LeafHeaderSize; i < PageSize; i++ {
-		leafPage.data[i] = 0
-	}
+	// Create new entries list
+	newEntries := make([]LeafEntry, 0, len(leafPage.Entries))
 
-	// Rebuild data from entries
+	// Create a new data buffer
+	newData := make([]byte, PageSize)
+
+	// Copy the header
+	copy(newData[:LeafHeaderSize], leafPage.data[:LeafHeaderSize])
+
+	// Rebuild data from old entries (that reference the old data buffer)
 	pos := int(LeafHeaderSize)
 
 	for _, entry := range leafPage.Entries {
 		// Write suffix length
-		suffixLenWritten := varint.Write(leafPage.data[pos:], uint64(len(entry.Suffix)))
+		suffixLen := len(entry.Suffix)
+		suffixLenWritten := varint.Write(newData[pos:], uint64(suffixLen))
 		pos += suffixLenWritten
 
-		// Write suffix
-		copy(leafPage.data[pos:], entry.Suffix)
-		pos += len(entry.Suffix)
+		// Write suffix to new data
+		suffixPos := pos
+		copy(newData[pos:], entry.Suffix)
+		pos += suffixLen
 
 		// Write data offset
-		binary.LittleEndian.PutUint64(leafPage.data[pos:], uint64(entry.DataOffset))
+		binary.LittleEndian.PutUint64(newData[pos:], uint64(entry.DataOffset))
 		pos += 8
+
+		// Add to new entries list with suffix as slice of new data
+		newEntries = append(newEntries, LeafEntry{
+			Suffix:     newData[suffixPos:suffixPos+suffixLen],
+			DataOffset: entry.DataOffset,
+		})
 	}
+
+	// Replace the old data with the new data
+	leafPage.data = newData
+
+	// Replace entries list with the new one
+	leafPage.Entries = newEntries
 
 	// Update content size
 	leafPage.ContentSize = uint16(pos)
