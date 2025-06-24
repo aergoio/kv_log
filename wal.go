@@ -23,7 +23,7 @@ const (
 
 // WalPageEntry represents a page entry in the WAL cache
 type WalPageEntry struct {
-	PageNumber     uint32     // Page number of the page in the main db file
+	PageNumber     uint32     // Page number of the page in the index file
 	Data           []byte     // The page data
 	SequenceNumber int64      // Transaction sequence number when this page was written
 	Next           *WalPageEntry // Pointer to the next entry with the same page number (for rollback)
@@ -43,6 +43,8 @@ type WalInfo struct {
 	cacheMutex     sync.RWMutex // Mutex to protect the page cache
 	lastCommitPosition int64    // Position just after the last valid commit
 	nextWritePosition  int64    // Position where the next frame will be written
+	lastCommitSequence int64    // Sequence number of the last committed transaction
+	lastCheckpointSequence int64 // Sequence number of the last checkpointed transaction
 }
 
 // addToWalCache adds a page to the WAL cache
@@ -188,12 +190,17 @@ func (db *DB) createWAL() error {
 	var salt1 uint32  // this salt is incremented on each WAL reset
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
+	var lastCommitSequence int64 = 0
+	var lastCheckpointSequence int64 = 0
+
 	if db.walInfo == nil {
 		// Generate a new salt1 for a new WAL file
 		salt1 = r.Uint32()
 	} else {
 		// Use the salt1 from the existing WAL file
 		salt1 = db.walInfo.salt1 + 1 // increment the salt1 on each WAL reset
+		lastCommitSequence = db.walInfo.lastCommitSequence
+		lastCheckpointSequence = db.walInfo.lastCheckpointSequence
 	}
 
 	// Generate WAL file path by appending "-wal" to the main db file path
@@ -220,6 +227,8 @@ func (db *DB) createWAL() error {
 	db.walInfo.sequenceNumber = 1
 	db.walInfo.lastCommitPosition = WalHeaderSize // For a new file, commit position is right after header
 	db.walInfo.nextWritePosition = WalHeaderSize  // Start writing after the header
+	db.walInfo.lastCommitSequence = lastCommitSequence
+	db.walInfo.lastCheckpointSequence = lastCheckpointSequence
 
 	// Create header buffer
 	header := make([]byte, WalHeaderSize)
@@ -376,12 +385,8 @@ func (db *DB) scanWAL() error {
 	if walDatabaseID != db.databaseID {
 		// Database ID mismatch, reset the WAL file
 		debugPrint("WAL database ID mismatch: %d vs %d, resetting WAL file\n", walDatabaseID, db.databaseID)
-		// Truncate the WAL file
-		if err := db.truncateWAL(); err != nil {
-			return fmt.Errorf("failed to truncate WAL file: %w", err)
-		}
-		// Create a new WAL file with the correct database ID
-		return db.createWAL()
+		// Reset the WAL file
+		return db.resetWAL()
 	}
 
 	// Initialize page cache if needed
@@ -525,16 +530,14 @@ func (db *DB) scanWAL() error {
 		}
 	}
 
-	// Increment sequence number after successful scan
-	db.walInfo.sequenceNumber++
+	// Update the transaction sequence number
+	db.txnSequence = commitSequence
+	db.walInfo.lastCommitSequence = commitSequence
+	db.walInfo.lastCheckpointSequence = commitSequence
 
 	if !db.readOnly {
 		// Reset the WAL file as all content was checkpointed
-		if err := db.truncateWAL(); err != nil {
-			return fmt.Errorf("failed to truncate WAL file: %w", err)
-		}
-		// Create a new WAL file
-		return db.createWAL()
+		return db.resetWAL()
 	}
 
 	return nil
@@ -564,10 +567,6 @@ func (db *DB) walCommit() error {
 
 	// Sync if in full sync mode
 	if db.syncMode == SyncOn {
-		// Sync the main db file
-		if err := db.indexFile.Sync(); err != nil {
-			return fmt.Errorf("failed to sync index file after commit: %w", err)
-		}
 		// Sync the WAL file
 		if err := db.walInfo.file.Sync(); err != nil {
 			return fmt.Errorf("failed to sync WAL file after commit: %w", err)
@@ -577,8 +576,8 @@ func (db *DB) walCommit() error {
 	// Clean up old page versions from cache after successful commit
 	db.discardOldPageVersions()
 
-	// Increment sequence number after successful commit
-	db.walInfo.sequenceNumber++
+	// Update sequence number after successful commit
+	db.walInfo.lastCommitSequence = db.txnSequence
 
 	// maybe notify the checkpoint thread worker that a commit record has been written
 	//db.checkpointNotify <- true
@@ -599,7 +598,7 @@ func (db *DB) walRollback() error {
 	db.walInfo.checksum = db.walInfo.lastCommitChecksum
 
 	// Get current sequence number before rollback
-	currentSeq := db.walInfo.sequenceNumber
+	currentSeq := db.txnSequence
 
 	// Remove pages that are from the current transaction from the cache
 	db.discardNewerPages(currentSeq)
@@ -610,29 +609,47 @@ func (db *DB) walRollback() error {
 	return nil
 }
 
-// doCheckpoint writes the current WAL file to the main db file and clears the cache
-func (db *DB) doCheckpoint() error {
+// checkpointWAL writes the current WAL file to the index file and clears the cache
+func (db *DB) checkpointWAL() error {
 	if db.walInfo == nil {
 		return nil
 	}
 
 	// Lock the cache during checkpoint
+	//db.walInfo.cacheMutex.Lock()
+
+	// First, sync the WAL file to ensure all changes are persisted
+	if err := db.walInfo.file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync WAL file before checkpoint: %w", err)
+	}
+
+	// Get the start sequence number for the checkpoint
+	startSequence := db.walInfo.lastCheckpointSequence
+
+	// Copy WAL pages to the index file
+	if err := db.copyPagesToIndexFile(startSequence); err != nil {
+		return fmt.Errorf("failed to copy pages to index file: %w", err)
+	}
+
+	// Sync the index file to ensure all changes are persisted
+	if err := db.indexFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync index file after checkpoint: %w", err)
+	}
+
+	// Update the last checkpoint sequence number
+	db.walInfo.lastCheckpointSequence = db.walInfo.lastCommitSequence + 1
+
+	// Clear the cache
 	db.walInfo.cacheMutex.Lock()
-	defer db.walInfo.cacheMutex.Unlock()
-
-	// TODO: Implement writing WAL pages to the main db file
-
-	// After successful checkpoint, clear the cache
 	db.walInfo.pageCache = make(map[uint32]*WalPageEntry)
+	db.walInfo.cacheMutex.Unlock()
 
-	// Reset the checksum for the next WAL cycle
-	db.walInfo.checksum = 0
-	db.walInfo.lastCommitChecksum = 0
-
-	return nil
+	// Reset the WAL file
+	return db.resetWAL()
 }
 
-// copyPagesToIndexFile copies pages with the specified sequence number from the WAL cache to the index file
+// copyPagesToIndexFile copies pages from the WAL cache to the index file
+// only pages with the specified commit sequence number or higher are copied
 func (db *DB) copyPagesToIndexFile(commitSequence int64) error {
 	if db.walInfo == nil || db.walInfo.pageCache == nil {
 		return nil
@@ -645,7 +662,7 @@ func (db *DB) copyPagesToIndexFile(commitSequence int64) error {
 	// Get the list of page numbers to copy
 	pageNumbers := make([]uint32, 0, len(db.walInfo.pageCache))
 	for pageNumber, entry := range db.walInfo.pageCache {
-		if entry.SequenceNumber == commitSequence {
+		if entry.SequenceNumber >= commitSequence {
 			pageNumbers = append(pageNumbers, pageNumber)
 		}
 	}
@@ -736,8 +753,8 @@ func (db *DB) closeWAL() error {
 	return nil
 }
 
-// truncateWAL truncates the WAL file
-func (db *DB) truncateWAL() error {
+// resetWAL resets the WAL file
+func (db *DB) resetWAL() error {
 	if db.walInfo == nil {
 		return nil
 	}
@@ -752,7 +769,8 @@ func (db *DB) truncateWAL() error {
 		return fmt.Errorf("failed to close WAL file: %w", err)
 	}
 
-	return nil
+	// Create a new WAL file
+	return db.createWAL()
 }
 
 // deleteWAL deletes the WAL file associated with the database
