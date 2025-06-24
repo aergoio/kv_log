@@ -113,6 +113,7 @@ type DB struct {
 	useWAL         bool   // Whether to use WAL or not
 	syncMode       int    // SyncOn or SyncOff
 	walInfo        *WalInfo // WAL file information
+	txnSequence    int64  // Transaction sequence number
 }
 
 // Content represents a piece of content in the database

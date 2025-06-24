@@ -16,7 +16,7 @@ const (
 	// WAL magic string for identification
 	WalMagicString = "KV_WAL"
 	// WAL header size
-	WalHeaderSize = 32
+	WalHeaderSize = 28
 	// WAL frame header size
 	WalFrameHeaderSize = 20
 )
@@ -32,7 +32,6 @@ type WalPageEntry struct {
 // WalInfo represents the WAL file information
 type WalInfo struct {
 	file           *os.File
-	sequenceNumber int64
 	salt1          uint32
 	salt2          uint32
 	walPath        string
@@ -224,7 +223,6 @@ func (db *DB) createWAL() error {
 	// Initialize the WAL info
 	db.walInfo.salt1 = salt1
 	db.walInfo.salt2 = r.Uint32()
-	db.walInfo.sequenceNumber = 1
 	db.walInfo.lastCommitPosition = WalHeaderSize // For a new file, commit position is right after header
 	db.walInfo.nextWritePosition = WalHeaderSize  // Start writing after the header
 	db.walInfo.lastCommitSequence = lastCommitSequence
@@ -239,19 +237,16 @@ func (db *DB) createWAL() error {
 	// Write version (currently 1)
 	binary.BigEndian.PutUint16(header[6:8], 1)
 
-	// Write sequence number
-	binary.BigEndian.PutUint32(header[8:12], uint32(db.walInfo.sequenceNumber))
-
 	// Write salts
-	binary.BigEndian.PutUint32(header[12:16], db.walInfo.salt1)
-	binary.BigEndian.PutUint32(header[16:20], db.walInfo.salt2)
+	binary.BigEndian.PutUint32(header[8:12], db.walInfo.salt1)
+	binary.BigEndian.PutUint32(header[12:16], db.walInfo.salt2)
 
 	// Write database ID
-	binary.BigEndian.PutUint64(header[20:28], db.databaseID)
+	binary.BigEndian.PutUint64(header[16:24], db.databaseID)
 
-	// Calculate checksum for header (first 28 bytes)
-	checksum := crc32.ChecksumIEEE(header[0:28])
-	binary.BigEndian.PutUint32(header[28:32], checksum)
+	// Calculate checksum for header (first 24 bytes)
+	checksum := crc32.ChecksumIEEE(header[0:24])
+	binary.BigEndian.PutUint32(header[24:28], checksum)
 
 	// Store the header checksum
 	db.walInfo.checksum = checksum
@@ -367,19 +362,18 @@ func (db *DB) scanWAL() error {
 	}
 
 	// Verify header checksum
-	headerChecksum := binary.BigEndian.Uint32(headerBuf[28:32])
-	calculatedHeaderChecksum := crc32.ChecksumIEEE(headerBuf[0:28])
+	headerChecksum := binary.BigEndian.Uint32(headerBuf[24:28])
+	calculatedHeaderChecksum := crc32.ChecksumIEEE(headerBuf[0:24])
 	if headerChecksum != calculatedHeaderChecksum {
 		return fmt.Errorf("invalid WAL file: header checksum mismatch")
 	}
 
-	// Extract sequence number and salts from header
-	db.walInfo.sequenceNumber = int64(binary.BigEndian.Uint32(headerBuf[8:12]))
-	db.walInfo.salt1 = binary.BigEndian.Uint32(headerBuf[12:16])
-	db.walInfo.salt2 = binary.BigEndian.Uint32(headerBuf[16:20])
+	// Extract salts from header
+	db.walInfo.salt1 = binary.BigEndian.Uint32(headerBuf[8:12])
+	db.walInfo.salt2 = binary.BigEndian.Uint32(headerBuf[12:16])
 
 	// Extract database ID from header
-	walDatabaseID := binary.BigEndian.Uint64(headerBuf[20:28])
+	walDatabaseID := binary.BigEndian.Uint64(headerBuf[16:24])
 
 	// Check if database ID matches
 	if walDatabaseID != db.databaseID {
