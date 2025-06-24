@@ -6,6 +6,7 @@ import (
 	"hash/crc32"
 	"math/rand"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
@@ -184,16 +185,21 @@ func (db *DB) readFromWAL(pageNumber uint32) ([]byte, error) {
 
 // createWAL creates a new WAL file
 func (db *DB) createWAL() error {
+	var salt1 uint32  // this salt is incremented on each WAL reset
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	// If WAL file is already open, return
-	if db.walInfo != nil {
-		return nil
+	if db.walInfo == nil {
+		// Generate a new salt1 for a new WAL file
+		salt1 = r.Uint32()
+	} else {
+		// Use the salt1 from the existing WAL file
+		salt1 = db.walInfo.salt1 + 1 // increment the salt1 on each WAL reset
 	}
 
 	// Generate WAL file path by appending "-wal" to the main db file path
 	walPath := db.filePath + "-wal"
 
-	// Create a new WAL file
+	// Open or create the WAL file
 	walFile, err := os.OpenFile(walPath, os.O_RDWR|os.O_CREATE, 0666)
 	if err != nil {
 		return fmt.Errorf("failed to create WAL file: %w", err)
@@ -209,8 +215,7 @@ func (db *DB) createWAL() error {
 	}
 
 	// Initialize the WAL info
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	db.walInfo.salt1 = r.Uint32()
+	db.walInfo.salt1 = salt1
 	db.walInfo.salt2 = r.Uint32()
 	db.walInfo.sequenceNumber = 1
 	db.walInfo.lastCommitPosition = WalHeaderSize // For a new file, commit position is right after header
@@ -369,10 +374,11 @@ func (db *DB) scanWAL() error {
 
 	// Check if database ID matches
 	if walDatabaseID != db.databaseID {
-		// Database ID mismatch, delete the WAL file
-		debugPrint("WAL database ID mismatch: %d vs %d, deleting WAL file\n", walDatabaseID, db.databaseID)
-		if err := db.deleteWAL(); err != nil {
-			return fmt.Errorf("failed to delete mismatched WAL file: %w", err)
+		// Database ID mismatch, reset the WAL file
+		debugPrint("WAL database ID mismatch: %d vs %d, resetting WAL file\n", walDatabaseID, db.databaseID)
+		// Truncate the WAL file
+		if err := db.truncateWAL(); err != nil {
+			return fmt.Errorf("failed to truncate WAL file: %w", err)
 		}
 		// Create a new WAL file with the correct database ID
 		return db.createWAL()
@@ -432,9 +438,6 @@ func (db *DB) scanWAL() error {
 				break
 			}
 
-			// Increment the commit sequence number
-			commitSequence++
-
 			// Update the last commit offset
 			lastCommitOffset = offset + WalFrameHeaderSize
 
@@ -443,6 +446,14 @@ func (db *DB) scanWAL() error {
 
 			// Clean up old page versions after commit
 			db.discardOldPageVersions()
+
+			if !db.readOnly {
+				// Copy these pages to the index file
+				db.copyPagesToIndexFile(commitSequence)
+			}
+
+			// Increment the commit sequence number
+			commitSequence++
 
 			// Move to the next frame
 			offset = lastCommitOffset
@@ -517,11 +528,20 @@ func (db *DB) scanWAL() error {
 	// Increment sequence number after successful scan
 	db.walInfo.sequenceNumber++
 
+	if !db.readOnly {
+		// Reset the WAL file as all content was checkpointed
+		if err := db.truncateWAL(); err != nil {
+			return fmt.Errorf("failed to truncate WAL file: %w", err)
+		}
+		// Create a new WAL file
+		return db.createWAL()
+	}
+
 	return nil
 }
 
-// WalCommit writes a commit record to the WAL file
-func (db *DB) WalCommit() error {
+// walCommit writes a commit record to the WAL file
+func (db *DB) walCommit() error {
 	// If WAL info is not initialized, return
 	if db.walInfo == nil {
 		return nil
@@ -566,8 +586,8 @@ func (db *DB) WalCommit() error {
 	return nil
 }
 
-// WalRollback
-func (db *DB) WalRollback() error {
+// walRollback rolls back the current transaction
+func (db *DB) walRollback() error {
 	if db.walInfo == nil {
 		return nil
 	}
@@ -612,6 +632,54 @@ func (db *DB) doCheckpoint() error {
 	return nil
 }
 
+// copyPagesToIndexFile copies pages with the specified sequence number from the WAL cache to the index file
+func (db *DB) copyPagesToIndexFile(commitSequence int64) error {
+	if db.walInfo == nil || db.walInfo.pageCache == nil {
+		return nil
+	}
+
+	// Lock the cache during the copy operation
+	db.walInfo.cacheMutex.RLock()
+	defer db.walInfo.cacheMutex.RUnlock()
+
+	// Get the list of page numbers to copy
+	pageNumbers := make([]uint32, 0, len(db.walInfo.pageCache))
+	for pageNumber, entry := range db.walInfo.pageCache {
+		if entry.SequenceNumber == commitSequence {
+			pageNumbers = append(pageNumbers, pageNumber)
+		}
+	}
+
+	// Sort page numbers for sequential access (faster writes)
+	sort.Slice(pageNumbers, func(i, j int) bool {
+		return pageNumbers[i] < pageNumbers[j]
+	})
+
+	// Copy pages to the index file in sorted order
+	for _, pageNumber := range pageNumbers {
+		entry := db.walInfo.pageCache[pageNumber]
+		if entry.SequenceNumber != commitSequence {
+			continue // Skip if sequence number doesn't match
+		}
+
+		// Calculate the offset in the index file
+		offset := int64(pageNumber) * PageSize
+
+		// Write the page data to the index file
+		if _, err := db.indexFile.WriteAt(entry.Data, offset); err != nil {
+			return fmt.Errorf("failed to write page %d to index file: %w", pageNumber, err)
+		}
+
+		// Ensure the index file size is updated if necessary
+		requiredSize := offset + PageSize
+		if requiredSize > db.indexFileSize {
+			db.indexFileSize = requiredSize
+		}
+	}
+
+	return nil
+}
+
 // openWAL opens an existing WAL file without creating it
 func (db *DB) openWAL() error {
 	// If WAL file is already open, return
@@ -647,6 +715,41 @@ func (db *DB) openWAL() error {
 		// If there's an error scanning the WAL (which could be due to a database ID mismatch),
 		// the scanWAL function will handle it by deleting and recreating the WAL file
 		return err
+	}
+
+	return nil
+}
+
+func (db *DB) closeWAL() error {
+	if db.walInfo == nil {
+		return nil
+	}
+
+	// Close the WAL file
+	if err := db.walInfo.file.Close(); err != nil {
+		return fmt.Errorf("failed to close WAL file: %w", err)
+	}
+
+	// Reset the WAL info
+	db.walInfo = nil
+
+	return nil
+}
+
+// truncateWAL truncates the WAL file
+func (db *DB) truncateWAL() error {
+	if db.walInfo == nil {
+		return nil
+	}
+
+	// Truncate the WAL file
+	if err := db.walInfo.file.Truncate(0); err != nil {
+		return fmt.Errorf("failed to truncate WAL file: %w", err)
+	}
+
+	// Close the WAL file
+	if err := db.walInfo.file.Close(); err != nil {
+		return fmt.Errorf("failed to close WAL file: %w", err)
 	}
 
 	return nil
