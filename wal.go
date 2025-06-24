@@ -397,9 +397,6 @@ func (db *DB) scanWAL() error {
 	runningChecksum := headerChecksum
 	lastCommitChecksum := headerChecksum
 
-	// Track the maximum page number to update index file size
-	maxPageNumber := uint32(0)
-
 	for offset+WalFrameHeaderSize <= walFileInfo.Size() {
 		// Read frame header
 		frameHeader := make([]byte, WalFrameHeaderSize)
@@ -469,11 +466,6 @@ func (db *DB) scanWAL() error {
 		// Extract page number from frame header
 		pageNumber := binary.BigEndian.Uint32(frameHeader[0:4])
 
-		// Track the maximum page number
-		if pageNumber > maxPageNumber {
-			maxPageNumber = pageNumber
-		}
-
 		// Read the page data
 		pageData := make([]byte, pageSize)
 		if _, err := db.walInfo.file.ReadAt(pageData, offset+WalFrameHeaderSize); err != nil {
@@ -516,14 +508,6 @@ func (db *DB) scanWAL() error {
 	db.walInfo.lastCommitChecksum = lastCommitChecksum
 	db.walInfo.checksum = lastCommitChecksum
 
-	// Update index file size to account for WAL pages
-	if maxPageNumber > 0 {
-		requiredSize := int64(maxPageNumber+1) * PageSize
-		if requiredSize > db.indexFileSize {
-			db.indexFileSize = requiredSize
-		}
-	}
-
 	// Update the transaction sequence number
 	db.txnSequence = commitSequence
 	db.walInfo.lastCommitSequence = commitSequence
@@ -534,7 +518,8 @@ func (db *DB) scanWAL() error {
 		return db.resetWAL()
 	}
 
-	return nil
+	// Update the index file size to account for WAL pages
+	return db.RefreshFileSize()
 }
 
 // walCommit writes a commit record to the WAL file
