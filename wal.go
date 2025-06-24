@@ -45,7 +45,7 @@ type WalInfo struct {
 }
 
 // addToWalCache adds a page to the WAL cache
-func (db *DB) addToWalCache(pageNumber uint32, data []byte) {
+func (db *DB) addToWalCache(pageNumber uint32, data []byte, commitSequence int64) {
 	if db.walInfo == nil {
 		return
 	}
@@ -58,22 +58,61 @@ func (db *DB) addToWalCache(pageNumber uint32, data []byte) {
 		db.walInfo.pageCache = make(map[uint32]*WalPageEntry)
 	}
 
+	// Check if there's already an entry for this page from the current transaction
+	existingEntry, exists := db.walInfo.pageCache[pageNumber]
+
+	if exists && existingEntry.SequenceNumber == commitSequence {
+		// Page from current transaction already exists, replace its data
+		existingEntry.Data = data
+		return
+	}
+
 	// Create a new entry with the current sequence number
 	newEntry := &WalPageEntry{
 		PageNumber:     pageNumber,
 		Data:           data,
-		SequenceNumber: db.walInfo.sequenceNumber,
-		Next:           nil,
-	}
-
-	// Check if there's already an entry for this page
-	if existingEntry, ok := db.walInfo.pageCache[pageNumber]; ok {
-		// Add the new entry at the beginning of the linked list
-		newEntry.Next = existingEntry
+		SequenceNumber: commitSequence,
+		Next:           existingEntry, // Link to previous version if it exists
 	}
 
 	// Update the cache with the new entry as the head of the list
 	db.walInfo.pageCache[pageNumber] = newEntry
+}
+
+// discardNewerPages removes pages from the current transaction from the cache
+func (db *DB) discardNewerPages(currentSeq int64) {
+	db.walInfo.cacheMutex.Lock()
+	defer db.walInfo.cacheMutex.Unlock()
+
+	// Iterate through all pages in the cache
+	for pageNumber, entry := range db.walInfo.pageCache {
+		// Find the first entry that's not from the current transaction
+		var newHead *WalPageEntry = entry
+		for newHead != nil && newHead.SequenceNumber == currentSeq {
+			newHead = newHead.Next
+		}
+		// Update the cache with the new head (or delete if no valid entries remain)
+		if newHead != nil {
+			db.walInfo.pageCache[pageNumber] = newHead
+		} else {
+			delete(db.walInfo.pageCache, pageNumber)
+		}
+	}
+}
+
+// discardOldPageVersions removes older versions of pages after a commit
+func (db *DB) discardOldPageVersions() {
+	db.walInfo.cacheMutex.Lock()
+	defer db.walInfo.cacheMutex.Unlock()
+
+	// Iterate through all pages in the cache
+	for _, entry := range db.walInfo.pageCache {
+		// Keep only the most recent version (head of the list) and remove older versions
+		if entry != nil && entry.Next != nil {
+			// This page is from the current transaction being committed, keep it and remove older versions
+			entry.Next = nil
+		}
+	}
 }
 
 // getLatestFromWalCache gets the most recent version of a page from the WAL cache
@@ -116,7 +155,7 @@ func (db *DB) writeToWAL(pageData []byte, pageNumber uint32) error {
 	}
 
 	// Add the page to the in-memory WAL cache
-	db.addToWalCache(pageNumber, pageData)
+	db.addToWalCache(pageNumber, pageData, 0)  // TODO: add the correct sequence number
 
 	return nil
 }
@@ -347,6 +386,7 @@ func (db *DB) scanWAL() error {
 	// Start reading frames from after the header
 	offset := int64(WalHeaderSize)
 	lastCommitOffset := offset // Initialize to just after header
+	commitSequence := int64(1)
 
 	// Initialize running checksum for frame validation
 	runningChecksum := headerChecksum
@@ -392,11 +432,17 @@ func (db *DB) scanWAL() error {
 				break
 			}
 
+			// Increment the commit sequence number
+			commitSequence++
+
 			// Update the last commit offset
 			lastCommitOffset = offset + WalFrameHeaderSize
 
 			// Store the checksum from the commit record
 			lastCommitChecksum = frameChecksum
+
+			// Clean up old page versions after commit
+			db.discardOldPageVersions()
 
 			// Move to the next frame
 			offset = lastCommitOffset
@@ -434,13 +480,22 @@ func (db *DB) scanWAL() error {
 			break
 		}
 
-		// TODO: only add to the cache when a commit record is found, or add now and remove later if no commit record is found
+		// For pages from the current transaction, we need to handle them specially
+		// If we already have this page in the cache from the current transaction, the new version should replace it
+		// If we have this page only from a previous transaction, we should add the new version
 
 		// Add the page directly to the in-memory cache
-		db.addToWalCache(pageNumber, pageData)
+		db.addToWalCache(pageNumber, pageData, commitSequence)
 
 		// Move to the next frame
 		offset += WalFrameHeaderSize + pageSize
+	}
+
+	// If the last scanned position is beyond the last commit position, there were frames without a commit
+	// In this case, we need to remove all pages from the uncommitted transaction from the cache
+	if offset > lastCommitOffset {
+		// Remove pages from the current uncommitted transaction from the cache
+		db.discardNewerPages(commitSequence)
 	}
 
 	// Update the position fields
@@ -500,16 +555,7 @@ func (db *DB) WalCommit() error {
 	}
 
 	// Clean up old page versions from cache after successful commit
-	db.walInfo.cacheMutex.Lock()
-	// Iterate through all pages in the cache
-	for _, entry := range db.walInfo.pageCache {
-		// Keep only the most recent version (head of the list) and remove older versions
-		if entry != nil && entry.Next != nil {
-			// This is the current transaction being committed, keep it but remove older versions
-			entry.Next = nil
-		}
-	}
-	db.walInfo.cacheMutex.Unlock()
+	db.discardOldPageVersions()
 
 	// Increment sequence number after successful commit
 	db.walInfo.sequenceNumber++
@@ -526,10 +572,6 @@ func (db *DB) WalRollback() error {
 		return nil
 	}
 
-	// Lock the cache during rollback
-	db.walInfo.cacheMutex.Lock()
-	defer db.walInfo.cacheMutex.Unlock()
-
 	// Reset the write position to the last commit position
 	db.walInfo.nextWritePosition = db.walInfo.lastCommitPosition
 
@@ -539,20 +581,8 @@ func (db *DB) WalRollback() error {
 	// Get current sequence number before rollback
 	currentSeq := db.walInfo.sequenceNumber
 
-	// Iterate through all pages in the cache
-	for pageNumber, entry := range db.walInfo.pageCache {
-		// Find the first entry that's not from the current transaction
-		var newHead *WalPageEntry = entry
-		for newHead != nil && newHead.SequenceNumber == currentSeq {
-			newHead = newHead.Next
-		}
-		// Update the cache with the new head (or delete if no valid entries remain)
-		if newHead != nil {
-			db.walInfo.pageCache[pageNumber] = newHead
-		} else {
-			delete(db.walInfo.pageCache, pageNumber)
-		}
-	}
+	// Remove pages that are from the current transaction from the cache
+	db.discardNewerPages(currentSeq)
 
 	// Keep the same sequence number for the next transaction attempt
 	// This is important to maintain consistency
