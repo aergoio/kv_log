@@ -7,7 +7,6 @@ import (
 	"math/rand"
 	"os"
 	"sort"
-	"sync"
 	"time"
 )
 
@@ -21,14 +20,6 @@ const (
 	WalFrameHeaderSize = 20
 )
 
-// WalPageEntry represents a page entry in the WAL cache
-type WalPageEntry struct {
-	PageNumber     uint32     // Page number of the page in the index file
-	Data           []byte     // The page data
-	SequenceNumber int64      // Transaction sequence number when this page was written
-	Next           *WalPageEntry // Pointer to the next entry with the same page number (for rollback)
-}
-
 // WalInfo represents the WAL file information
 type WalInfo struct {
 	file           *os.File
@@ -38,30 +29,31 @@ type WalInfo struct {
 	hasher         *crc32.Table // CRC32 table for checksum calculations
 	checksum       uint32       // Current cumulative checksum
 	lastCommitChecksum uint32   // Checksum value at the last commit
-	pageCache      map[uint32]*WalPageEntry // In-memory cache of pages in the WAL
-	cacheMutex     sync.RWMutex // Mutex to protect the page cache
 	lastCommitPosition int64    // Position just after the last valid commit
 	nextWritePosition  int64    // Position where the next frame will be written
 	lastCommitSequence int64    // Sequence number of the last committed transaction
 	lastCheckpointSequence int64 // Sequence number of the last checkpointed transaction
 }
 
-// addToWalCache adds a page to the WAL cache
-func (db *DB) addToWalCache(pageNumber uint32, data []byte, commitSequence int64) {
-	if db.walInfo == nil {
-		return
-	}
+// ------------------------------------------------------------------------------------------------
+// Local WAL cache (used only at initialization when scanning the WAL file)
+// ------------------------------------------------------------------------------------------------
 
-	db.walInfo.cacheMutex.Lock()
-	defer db.walInfo.cacheMutex.Unlock()
+// WalPageEntry represents a page entry in the WAL cache
+type WalPageEntry struct {
+	PageNumber     uint32     // Page number of the page in the index file
+	Data           []byte     // The page data
+	SequenceNumber int64      // Transaction sequence number when this page was written
+	Next           *WalPageEntry // Pointer to the next entry with the same page number (for rollback)
+}
 
-	// Create the cache map if it doesn't exist
-	if db.walInfo.pageCache == nil {
-		db.walInfo.pageCache = make(map[uint32]*WalPageEntry)
-	}
+// localCache handles operations on the local WAL page cache
+type localCache map[uint32]*WalPageEntry
 
+// add adds a page to the WAL cache
+func (cache localCache) add(pageNumber uint32, data []byte, commitSequence int64) {
 	// Check if there's already an entry for this page from the current transaction
-	existingEntry, exists := db.walInfo.pageCache[pageNumber]
+	existingEntry, exists := cache[pageNumber]
 
 	if exists && existingEntry.SequenceNumber == commitSequence {
 		// Page from current transaction already exists, replace its data
@@ -78,16 +70,13 @@ func (db *DB) addToWalCache(pageNumber uint32, data []byte, commitSequence int64
 	}
 
 	// Update the cache with the new entry as the head of the list
-	db.walInfo.pageCache[pageNumber] = newEntry
+	cache[pageNumber] = newEntry
 }
 
 // discardNewerPages removes pages from the current transaction from the cache
-func (db *DB) discardNewerPages(currentSeq int64) {
-	db.walInfo.cacheMutex.Lock()
-	defer db.walInfo.cacheMutex.Unlock()
-
+func (cache localCache) discardNewerPages(currentSeq int64) {
 	// Iterate through all pages in the cache
-	for pageNumber, entry := range db.walInfo.pageCache {
+	for pageNumber, entry := range cache {
 		// Find the first entry that's not from the current transaction
 		var newHead *WalPageEntry = entry
 		for newHead != nil && newHead.SequenceNumber == currentSeq {
@@ -95,20 +84,17 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 		}
 		// Update the cache with the new head (or delete if no valid entries remain)
 		if newHead != nil {
-			db.walInfo.pageCache[pageNumber] = newHead
+			cache[pageNumber] = newHead
 		} else {
-			delete(db.walInfo.pageCache, pageNumber)
+			delete(cache, pageNumber)
 		}
 	}
 }
 
 // discardOldPageVersions removes older versions of pages after a commit
-func (db *DB) discardOldPageVersions() {
-	db.walInfo.cacheMutex.Lock()
-	defer db.walInfo.cacheMutex.Unlock()
-
+func (cache localCache) discardOldPageVersions() {
 	// Iterate through all pages in the cache
-	for _, entry := range db.walInfo.pageCache {
+	for _, entry := range cache {
 		// Keep only the most recent version (head of the list) and remove older versions
 		if entry != nil && entry.Next != nil {
 			// This page is from the current transaction being committed, keep it and remove older versions
@@ -117,24 +103,9 @@ func (db *DB) discardOldPageVersions() {
 	}
 }
 
-// getLatestFromWalCache gets the most recent version of a page from the WAL cache
-func (db *DB) getLatestFromWalCache(pageNumber uint32) []byte {
-	// If the WAL info is not initialized or the page cache is nil, return nil
-	if db.walInfo == nil || db.walInfo.pageCache == nil {
-		return nil
-	}
-
-	db.walInfo.cacheMutex.RLock()
-	defer db.walInfo.cacheMutex.RUnlock()
-
-	// Check if there's an entry for this page
-	if entry, ok := db.walInfo.pageCache[pageNumber]; ok {
-		// Return the most recent version (first in the linked list)
-		return entry.Data
-	}
-
-	return nil
-}
+// ------------------------------------------------------------------------------------------------
+// WAL file operations
+// ------------------------------------------------------------------------------------------------
 
 // writeToWAL writes an index page to the WAL file
 func (db *DB) writeToWAL(pageData []byte, pageNumber uint32) error {
@@ -157,31 +128,9 @@ func (db *DB) writeToWAL(pageData []byte, pageNumber uint32) error {
 	}
 
 	// Add the page to the in-memory WAL cache
-	db.addToWalCache(pageNumber, pageData, 0)  // TODO: add the correct sequence number
+	//db.addToWalCache(pageNumber, pageData, db.txnSequence)
 
 	return nil
-}
-
-func (db *DB) readFromWAL(pageNumber uint32) ([]byte, error) {
-	// Check if we're in WAL mode
-	if !db.useWAL {
-		return nil, nil
-	}
-	// Open or create the WAL file if it doesn't exist
-	if db.walInfo == nil {
-		err := db.openWAL()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Check if the page is in the WAL cache
-	if cachedData := db.getLatestFromWalCache(pageNumber); cachedData != nil {
-		return cachedData, nil
-	}
-	// The page is not in cache so it is not in the WAL file
-	// There is no need to read from the WAL file again because all pages are already loaded when the WAL file is opened
-	return nil, nil
 }
 
 // createWAL creates a new WAL file
@@ -217,7 +166,6 @@ func (db *DB) createWAL() error {
 		walPath:   walPath,
 		hasher:    crc32.IEEETable,
 		checksum:  0,
-		pageCache: make(map[uint32]*WalPageEntry), // Initialize the page cache
 	}
 
 	// Initialize the WAL info
@@ -383,10 +331,8 @@ func (db *DB) scanWAL() error {
 		return db.resetWAL()
 	}
 
-	// Initialize page cache if needed
-	if db.walInfo.pageCache == nil {
-		db.walInfo.pageCache = make(map[uint32]*WalPageEntry)
-	}
+	// Initialize page cache as a local variable
+	localCache := make(localCache)
 
 	// Start reading frames from after the header
 	offset := int64(WalHeaderSize)
@@ -441,11 +387,11 @@ func (db *DB) scanWAL() error {
 			lastCommitChecksum = frameChecksum
 
 			// Clean up old page versions after commit
-			db.discardOldPageVersions()
+			localCache.discardOldPageVersions()
 
 			if !db.readOnly {
 				// Copy these pages to the index file
-				db.copyPagesToIndexFile(commitSequence)
+				db.copyPagesToIndexFile(localCache, commitSequence)
 			}
 
 			// Increment the commit sequence number
@@ -487,7 +433,7 @@ func (db *DB) scanWAL() error {
 		// If we have this page only from a previous transaction, we should add the new version
 
 		// Add the page directly to the in-memory cache
-		db.addToWalCache(pageNumber, pageData, commitSequence)
+		localCache.add(pageNumber, pageData, commitSequence)
 
 		// Move to the next frame
 		offset += WalFrameHeaderSize + pageSize
@@ -497,7 +443,7 @@ func (db *DB) scanWAL() error {
 	// In this case, we need to remove all pages from the uncommitted transaction from the cache
 	if offset > lastCommitOffset {
 		// Remove pages from the current uncommitted transaction from the cache
-		db.discardNewerPages(commitSequence)
+		localCache.discardNewerPages(commitSequence)
 	}
 
 	// Update the position fields
@@ -512,6 +458,28 @@ func (db *DB) scanWAL() error {
 	db.txnSequence = commitSequence
 	db.walInfo.lastCommitSequence = commitSequence
 	db.walInfo.lastCheckpointSequence = commitSequence
+
+	// Transfer the cached pages to the global page cache
+	for pageNumber, entry := range localCache {
+		if entry.Data[0] == ContentTypeRadix {
+			_, err := db.parseRadixPage(entry.Data, pageNumber)
+			if err != nil {
+				return fmt.Errorf("failed to parse radix page: %w", err)
+			}
+		} else if entry.Data[0] == ContentTypeLeaf {
+			_, err := db.parseLeafPage(entry.Data, pageNumber)
+			if err != nil {
+				return fmt.Errorf("failed to parse leaf page: %w", err)
+			}
+		} else if pageNumber == 0 {
+			_, err := db.parseHeaderPage(entry.Data, pageNumber)
+			if err != nil {
+				return fmt.Errorf("failed to parse header page: %w", err)
+			}
+		} else {
+			return fmt.Errorf("unknown page type: %d", entry.Data[0])
+		}
+	}
 
 	if !db.readOnly {
 		// Reset the WAL file as all content was checkpointed
@@ -553,13 +521,13 @@ func (db *DB) walCommit() error {
 	}
 
 	// Clean up old page versions from cache after successful commit
-	db.discardOldPageVersions()
+	db.discardOldPageVersions(true)
 
 	// Update sequence number after successful commit
 	db.walInfo.lastCommitSequence = db.txnSequence
 
-	// maybe notify the checkpoint thread worker that a commit record has been written
-	//db.checkpointNotify <- true
+	// maybe notify the worker thread that a commit record has been written
+	//db.workerChannel <- "checkpoint"
 
 	return nil
 }
@@ -603,10 +571,10 @@ func (db *DB) checkpointWAL() error {
 	}
 
 	// Get the start sequence number for the checkpoint
-	startSequence := db.walInfo.lastCheckpointSequence
+	//startSequence := db.walInfo.lastCheckpointSequence
 
 	// Copy WAL pages to the index file
-	if err := db.copyPagesToIndexFile(startSequence); err != nil {
+	if err := db.copyWALPagesToIndexFile(); err != nil {
 		return fmt.Errorf("failed to copy pages to index file: %w", err)
 	}
 
@@ -619,9 +587,9 @@ func (db *DB) checkpointWAL() error {
 	db.walInfo.lastCheckpointSequence = db.walInfo.lastCommitSequence + 1
 
 	// Clear the cache
-	db.walInfo.cacheMutex.Lock()
-	db.walInfo.pageCache = make(map[uint32]*WalPageEntry)
-	db.walInfo.cacheMutex.Unlock()
+	db.clearWALCache()  // set isWAL to false for all pages, then remove older versions
+				// BUT: can the main thread be writing to the WAL while this is happening?
+				// it should block the main thread.
 
 	// Reset the WAL file
 	return db.resetWAL()
@@ -629,18 +597,14 @@ func (db *DB) checkpointWAL() error {
 
 // copyPagesToIndexFile copies pages from the WAL cache to the index file
 // only pages with the specified commit sequence number or higher are copied
-func (db *DB) copyPagesToIndexFile(commitSequence int64) error {
-	if db.walInfo == nil || db.walInfo.pageCache == nil {
+func (db *DB) copyPagesToIndexFile(localCache localCache, commitSequence int64) error {
+	if db.walInfo == nil || localCache == nil {
 		return nil
 	}
 
-	// Lock the cache during the copy operation
-	db.walInfo.cacheMutex.RLock()
-	defer db.walInfo.cacheMutex.RUnlock()
-
 	// Get the list of page numbers to copy
-	pageNumbers := make([]uint32, 0, len(db.walInfo.pageCache))
-	for pageNumber, entry := range db.walInfo.pageCache {
+	pageNumbers := make([]uint32, 0, len(localCache))
+	for pageNumber, entry := range localCache {
 		if entry.SequenceNumber >= commitSequence {
 			pageNumbers = append(pageNumbers, pageNumber)
 		}
@@ -653,7 +617,7 @@ func (db *DB) copyPagesToIndexFile(commitSequence int64) error {
 
 	// Copy pages to the index file in sorted order
 	for _, pageNumber := range pageNumbers {
-		entry := db.walInfo.pageCache[pageNumber]
+		entry := localCache[pageNumber]
 		if entry.SequenceNumber != commitSequence {
 			continue // Skip if sequence number doesn't match
 		}
@@ -670,6 +634,57 @@ func (db *DB) copyPagesToIndexFile(commitSequence int64) error {
 		requiredSize := offset + PageSize
 		if requiredSize > db.indexFileSize {
 			db.indexFileSize = requiredSize
+		}
+	}
+
+	return nil
+}
+
+// copyWALPagesToIndexFile copies pages from the WAL cache to the index file
+func (db *DB) copyWALPagesToIndexFile() error {
+	if db.walInfo == nil {
+		return nil
+	}
+
+	db.cacheMutex.RLock()
+	defer db.cacheMutex.RUnlock()
+
+	// Get the list of page numbers to copy
+	pageNumbers := make([]uint32, 0, len(db.pageCache))
+	for pageNumber := range db.pageCache {
+		pageNumbers = append(pageNumbers, pageNumber)
+	}
+
+	// Sort page numbers for sequential access (faster writes)
+	sort.Slice(pageNumbers, func(i, j int) bool {
+		return pageNumbers[i] < pageNumbers[j]
+	})
+
+	// Copy pages to the index file in sorted order
+	for _, pageNumber := range pageNumbers {
+		// Get the head of the linked list for this page number
+		headPage := db.pageCache[pageNumber]
+
+		// Find the first WAL page in the linked list
+		var walPage *Page = nil
+		for page := headPage; page != nil; page = page.next {
+			if page.isWAL {
+				walPage = page
+				break
+			}
+		}
+
+		// Skip if no WAL page was found
+		if walPage == nil {
+			continue
+		}
+
+		// Calculate the offset in the index file
+		offset := int64(pageNumber) * PageSize
+
+		// Write the page data to the index file
+		if _, err := db.indexFile.WriteAt(walPage.data, offset); err != nil {
+			return fmt.Errorf("failed to write page %d to index file: %w", pageNumber, err)
 		}
 	}
 
@@ -703,7 +718,6 @@ func (db *DB) openWAL() error {
 		file:      walFile,
 		walPath:   walPath,
 		hasher:    crc32.IEEETable,
-		pageCache: make(map[uint32]*WalPageEntry),
 	}
 
 	// Scan the WAL file to load any existing frames

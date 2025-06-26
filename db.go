@@ -116,6 +116,11 @@ type DB struct {
 	inTransaction  bool   // Track if a transaction is open
 	calledByTransaction bool // Track if the method was called by a transaction
 	txnSequence    int64  // Current transaction sequence number
+	flushSequence  int64  // Current flush up to this transaction sequence number
+	accessCounter  uint64 // Counter for page access times
+	dirtyPageCount int    // Count of dirty pages in cache
+	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
+	dirtyPageThreshold int // Maximum number of dirty pages before flush
 }
 
 // Transaction represents a database transaction
@@ -136,7 +141,11 @@ type Page struct {
 	pageNumber   uint32
 	pageType     byte
 	data         []byte
-	dirty        bool
+	dirty        bool   // Whether this page contains unsaved changes
+	isWAL        bool   // Whether this page is part of the WAL
+	accessTime   uint64 // Last time this page was accessed
+	txnSequence  int64  // Transaction sequence number
+	next         *Page  // Pointer to the next entry with the same page number
 	// Fields for RadixPage
 	SubPagesUsed uint8  // Number of sub-pages used
 	NextFreePage uint32 // Pointer to the next radix page with free sub-pages (0 if none)
@@ -666,6 +675,7 @@ func (db *DB) set(key, value []byte) error {
 	return db.setOnEmptySuffix(currentSubPage, key, value, 0)
 }
 
+// setKvOnIndex sets an existing key-value pair on the index (reindexing)
 func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, dataOffset int64) error {
 
 	// Process the key byte by byte to find where to add it
@@ -714,6 +724,7 @@ func (db *DB) setKvOnIndex(rootSubPage *RadixSubPage, key, value []byte, dataOff
 }
 
 // setContentOnIndex sets a suffix + content offset pair on the index
+// it is used when converting a leaf page into a radix page
 func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos int, contentOffset int64) error {
 
 	// Process the suffix byte by byte
@@ -751,11 +762,8 @@ func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos 
 			// It's a leaf page
 			suffix = suffix[suffixPos+1:]
 			// Try to add the entry with the suffix to the leaf page
-			if db.addLeafEntry(page, suffix, contentOffset) {
-				return nil
-			}
-			// Leaf page is full, convert it to a radix page
-			return db.convertLeafToRadix(page, suffix, contentOffset)
+			// If the leaf page is full, convert it to a radix page
+			return db.addLeafEntry(page, suffix, contentOffset)
 		} else {
 			return fmt.Errorf("invalid page type")
 		}
@@ -763,8 +771,7 @@ func (db *DB) setContentOnIndex(subPage *RadixSubPage, suffix []byte, suffixPos 
 
 	// We've processed all bytes of the key
 	// Set the content offset on the empty suffix slot
-	db.setEmptySuffixOffset(currentSubPage, contentOffset)
-	return nil
+	return db.setEmptySuffixOffset(currentSubPage, contentOffset)
 }
 
 // createPathForByte creates a new path for a byte in the key
@@ -785,10 +792,16 @@ func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, d
 		}
 
 		// Set the empty suffix offset
-		db.setEmptySuffixOffset(childSubPage, dataOffset)
+		err = db.setEmptySuffixOffset(childSubPage, dataOffset)
+		if err != nil {
+			return fmt.Errorf("failed to set empty suffix offset: %w", err)
+		}
 
 		// Update the radix entry to point to the new radix page
-		db.setRadixEntry(subPage, byteValue, childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
+		err = db.setRadixEntry(subPage, byteValue, childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
+		if err != nil {
+			return fmt.Errorf("failed to set radix entry for byte %d: %w", byteValue, err)
+		}
 	} else {
 		// For non-empty suffix, create a new leaf page
 		leafPage, err := db.allocateLeafPage()
@@ -797,10 +810,16 @@ func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, d
 		}
 
 		// Add the entry with the suffix to the leaf page
-		db.addLeafEntry(leafPage, suffix, dataOffset)
+		err = db.addLeafEntry(leafPage, suffix, dataOffset)
+		if err != nil {
+			return fmt.Errorf("failed to add leaf entry: %w", err)
+		}
 
 		// Update the radix entry to point to the new leaf page
-		db.setRadixEntry(subPage, byteValue, leafPage.pageNumber, 0)
+		err = db.setRadixEntry(subPage, byteValue, leafPage.pageNumber, 0)
+		if err != nil {
+			return fmt.Errorf("failed to set radix entry for byte %d: %w", byteValue, err)
+		}
 	}
 
 	// Don't write to disk, just keep pages in cache
@@ -850,7 +869,11 @@ func (db *DB) setOnLeafPage(leafPage *LeafPage, key []byte, keyPos int, value []
 					}
 				}
 				// Remove this entry
-				db.removeLeafEntryAt(leafPage, i)
+				if ok, err := db.removeLeafEntryAt(leafPage, i); err != nil {
+					return fmt.Errorf("failed to remove leaf entry: %w", err)
+				} else if !ok {
+					return fmt.Errorf("failed to remove leaf entry")
+				}
 				return nil
 			}
 
@@ -870,7 +893,10 @@ func (db *DB) setOnLeafPage(leafPage *LeafPage, key []byte, keyPos int, value []
 			}
 
 			// Update the entry on the leaf page
-			db.updateLeafEntryOffset(leafPage, i, dataOffset)
+			err = db.updateLeafEntryOffset(leafPage, i, dataOffset)
+			if err != nil {
+				return fmt.Errorf("failed to update leaf entry offset: %w", err)
+			}
 
 			// Mark the leaf page as dirty
 			leafPage.dirty = true
@@ -894,12 +920,8 @@ func (db *DB) setOnLeafPage(leafPage *LeafPage, key []byte, keyPos int, value []
 	}
 
 	// Try to add the entry with the suffix to the leaf page
-	if db.addLeafEntry(leafPage, suffix, dataOffset) {
-		return nil
-	}
-
-	// Leaf page is full, convert it to a radix page
-	return db.convertLeafToRadix(leafPage, suffix, dataOffset)
+	// If the leaf page is full, it converts it to a radix page
+	return db.addLeafEntry(leafPage, suffix, dataOffset)
 }
 
 // setOnEmptySuffix attempts to set a key and value on an empty suffix in a radix sub-page
@@ -948,8 +970,7 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 				}
 			}
 			// Clear the empty suffix offset
-			db.setEmptySuffixOffset(subPage, 0)
-			return nil
+			return db.setEmptySuffixOffset(subPage, 0)
 		}
 
 		// If we're setting a new key-value pair
@@ -975,15 +996,16 @@ func (db *DB) setOnEmptySuffix(subPage *RadixSubPage, key, value []byte, dataOff
 	}
 
 	// Set the empty suffix offset
-	db.setEmptySuffixOffset(subPage, dataOffset)
-
-	return nil
+	return db.setEmptySuffixOffset(subPage, dataOffset)
 }
 
 // Get retrieves a value for the given key
 func (db *DB) Get(key []byte) ([]byte, error) {
 	db.mutex.RLock()
-	defer db.mutex.RUnlock()
+	defer func() {
+		db.mutex.RUnlock()
+		db.checkPageCache(false)
+	}()
 
 	// Validate key length
 	keyLen := len(key)
@@ -1550,6 +1572,28 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// Header page
+// ------------------------------------------------------------------------------------------------
+
+func (db *DB) parseHeaderPage(data []byte, pageNumber uint32) (*Page, error) {
+
+	// Just store the data on the cache
+	headerPage := &Page{
+		pageNumber: pageNumber,
+		data:       data,
+	}
+
+	// Add to cache
+	db.addToCache(headerPage)
+
+	// Update the access time
+	db.accessCounter++   // TODO: not sure if this is correct for page 0
+	headerPage.accessTime = db.accessCounter
+
+	return headerPage, nil
+}
+
+// ------------------------------------------------------------------------------------------------
 // Radix pages
 // ------------------------------------------------------------------------------------------------
 
@@ -1626,6 +1670,10 @@ func (db *DB) writeRadixPage(radixPage *RadixPage) error {
 	if err == nil {
 		// Mark it as clean
 		radixPage.dirty = false
+		// If WAL is used, mark the page as part of the WAL
+		if db.useWAL {
+			radixPage.isWAL = true
+		}
 	}
 
 	return err
@@ -1708,6 +1756,10 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 	if err == nil {
 		// Mark it as clean
 		leafPage.dirty = false
+		// If WAL is used, mark the page as part of the WAL
+		if db.useWAL {
+			leafPage.isWAL = true
+		}
 	}
 
 	return err
@@ -1753,30 +1805,9 @@ func (db *DB) writeIndexPage(data []byte, pageNumber uint32) error {
 	}
 }
 
-// readIndexPage reads an index page from either the WAL file or the index file
+// readIndexPage reads an index page from the index file
 func (db *DB) readIndexPage(pageNumber uint32) ([]byte, error) {
-	var data []byte
-	var err error
-
-	debugPrint("Reading index page from page number %d\n", pageNumber)
-
-	if db.useWAL {
-		// Read from WAL file
-		data, err = db.readFromWAL(pageNumber)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read from WAL: %w", err)
-		}
-	}
-
-	// If WAL is not used, or the page is not found in WAL
-	if data == nil {
-		data, err = db.readFromIndexFile(pageNumber)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read from index file: %w", err)
-		}
-	}
-
-	return data, nil
+	return db.readFromIndexFile(pageNumber)
 }
 
 // writeToIndexFile writes an index page to the index file
@@ -2004,13 +2035,22 @@ func (db *DB) addToCache(page *Page) {
 	}
 
 	pageNumber := page.pageNumber
-	if pageNumber == 0 {
-		return // Invalid page number
-	}
 
 	db.cacheMutex.Lock()
+	defer db.cacheMutex.Unlock()
+
+	// If there is already a page with the same page number
+	existingPage, exists := db.pageCache[pageNumber]
+	if exists {
+		// Link the new page to the existing page
+		page.next = existingPage
+	} else {
+		// Clear the next pointer
+		page.next = nil
+	}
+
+	// Add the new page to the cache
 	db.pageCache[pageNumber] = page
-	db.cacheMutex.Unlock()
 }
 
 // getPageFromCache gets a page from the cache by page number
@@ -2022,6 +2062,294 @@ func (db *DB) getPageFromCache(pageNumber uint32) (*Page, bool) {
 	return page, exists
 }
 
+// getWritablePage gets a writable version of a page
+// if the given page is already writable, it returns the page itself
+func (db *DB) getWritablePage(page *Page) (*Page, error) {
+	// We cannot write to a page that is part of the WAL
+	needsClone := page.isWAL
+	// If the page is marked to be flushed, we cannot modify its data
+	if db.flushSequence != 0 && page.txnSequence <= db.flushSequence {
+		needsClone = true
+	}
+
+	// If the page needs to be cloned, clone it
+	if needsClone {
+		var err error
+		page, err = db.clonePage(page)
+		if err != nil {
+			return nil, fmt.Errorf("failed to clone page: %w", err)
+		}
+	}
+
+	// Update the transaction sequence
+	page.txnSequence = db.txnSequence
+
+	// Return the page
+	return page, nil
+}
+
+// clonePage clones a page
+func (db *DB) clonePage(page *Page) (*Page, error) {
+	var err error
+
+	// Get a reference to the old page
+	oldPage := page
+
+	/*
+	// Create a new page
+	newPage := &Page{
+		pageNumber: page.pageNumber,
+		pageType:   page.pageType,
+		data:       make([]byte, PageSize),
+		dirty:      false,
+		isWAL:      false,
+		accessTime: page.accessTime,
+		txnSequence: db.txnSequence,
+	}
+	*/
+
+	// Clone the page data
+	data := make([]byte, PageSize)
+	copy(data, page.data)
+
+	// Parse the page
+	if page.pageType == ContentTypeRadix {
+		page, err = db.parseRadixPage(data, page.pageNumber)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse radix page: %w", err)
+		}
+	} else if page.pageType == ContentTypeLeaf {
+		page, err = db.parseLeafPage(data, page.pageNumber)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse leaf page: %w", err)
+		}
+	} else {
+		return nil, fmt.Errorf("unknown page type: %d", page.pageType)
+	}
+
+	// Add to cache  -- already done by parseRadixPage or parseLeafPage
+	//db.addToCache(newPage)  // TODO: make the cache support multiple versions of the same page
+
+	// Update the access time
+	//db.accessCounter++
+	//page.accessTime = db.accessCounter
+	page.accessTime = oldPage.accessTime
+
+	return page, nil
+}
+
+// checkPageCache checks if the page cache is full and initiates a clean up or flush
+// step 1: if the amount of dirty pages is above the threshold, flush it
+//  if the page cache is below the threshold, return
+// step 2: try to remove clean pages from the cache
+// step 3: if the page cache is still above the threshold, flush it
+// This function should not return an error, it can log an error and continue
+func (db *DB) checkPageCache(isWrite bool) {
+
+	// If the amount of dirty pages is above the threshold, flush it
+	if isWrite && db.dirtyPageCount >= db.dirtyPageThreshold {
+		// Check which thread should flush the pages
+		if db.commitMode == CallerThread {
+			// Write the pages to the WAL file
+			db.flushDirtyIndexPages()
+		} else {
+			// Signal the worker thread to flush the pages
+			//db.workerChannel <- "flush"    TODO
+		}
+		return
+	}
+
+	// If the size of the page cache is above the threshold, remove old pages
+	if len(db.pageCache) >= db.cacheSizeThreshold {
+		// Check which thread should remove the old pages
+		if db.commitMode == CallerThread {
+			// Try to remove the old clean pages from the cache
+			db.removeOldPagesFromCache()
+		} else {
+			// Signal the worker thread to remove the old pages
+			//db.workerChannel <- "clean"    TODO
+		}
+	}
+
+}
+
+// discardNewerPages removes pages from the current transaction from the cache
+func (db *DB) discardNewerPages(currentSeq int64) {
+	db.cacheMutex.Lock()
+	defer db.cacheMutex.Unlock()
+
+	// Iterate through all pages in the cache
+	for pageNumber, page := range db.pageCache {
+		// Find the first page that's not from the current transaction
+		var newHead *Page = page
+		for newHead != nil && newHead.txnSequence == currentSeq {
+			newHead = newHead.next
+		}
+		// Update the cache with the new head (or delete if no valid entries remain)
+		if newHead != nil {
+			db.pageCache[pageNumber] = newHead
+		} else {
+			delete(db.pageCache, pageNumber)
+		}
+	}
+}
+
+// clearWALCache sets isWAL to false for all pages in which isWAL is true
+// then removes older versions of the pages
+func (db *DB) clearWALCache() {
+	db.cacheMutex.Lock()
+
+	// Iterate through all pages in the cache
+	for _, firstPage := range db.pageCache {
+		// Iterate through all pages in the linked list
+		for page := firstPage; page != nil; page = page.next {
+			if page.isWAL {
+				page.isWAL = false
+			}
+		}
+	}
+
+	db.cacheMutex.Unlock()
+
+	//db.discardOldPageVersions(false)
+	// not sure if this can be done by the worker thread
+	// the main thread can be allocating pages
+
+}
+
+// discardOldPageVersions removes older versions of pages after a commit
+func (db *DB) discardOldPageVersions(keepWAL bool) {
+	db.cacheMutex.Lock()
+	defer db.cacheMutex.Unlock()
+
+	// Iterate through all pages in the cache
+	for _, entry := range db.pageCache {
+		// Skip if there's no older version
+		if entry == nil || entry.next == nil {
+			continue
+		}
+
+		// First, collect all pages that need to be preserved
+		var pagesToKeep []*Page
+
+		// Iterate through older versions to find pages to keep
+		for temp := entry.next; temp != nil; temp = temp.next {
+			// Keep pages that are:
+			// 1. WAL pages (if keepWAL is true)
+			// 2. Dirty pages that need to be written to disk
+			if (keepWAL && temp.isWAL) || temp.dirty {
+				pagesToKeep = append(pagesToKeep, temp)
+			}
+		}
+
+		// If no pages need to be kept, clear the next pointer
+		if len(pagesToKeep) == 0 {
+			entry.next = nil
+			continue
+		}
+
+		// Rebuild the chain with the pages to keep
+		entry.next = pagesToKeep[0]
+
+		// Link the remaining pages
+		for i := 0; i < len(pagesToKeep)-1; i++ {
+			pagesToKeep[i].next = pagesToKeep[i+1]
+		}
+
+		// Terminate the chain
+		pagesToKeep[len(pagesToKeep)-1].next = nil
+	}
+}
+
+// removeOldPagesFromCache removes old clean pages from the cache
+// it cannot remove pages that are part of the WAL
+// as other threads can be accessing these pages, this thread can only remove pages that have not been accessed recently
+func (db *DB) removeOldPagesFromCache() {
+	// Define a struct to hold page information for sorting
+	type pageInfo struct {
+		pageNumber uint32
+		accessTime uint64
+	}
+
+	// If cache is empty or too small, nothing to do
+	if len(db.pageCache) <= db.cacheSizeThreshold/2 {
+		return
+	}
+
+	// Compute the target size (aim to reduce to 75% of threshold)
+	targetSize := db.cacheSizeThreshold * 3 / 4
+
+	// Compute the number of pages to remove
+	numPagesToRemove := len(db.pageCache) - targetSize
+
+	// Step 1: Use a read lock to collect candidates
+	var candidates []pageInfo
+
+	db.cacheMutex.RLock()
+
+	// Collect removable pages
+	for pageNumber, page := range db.pageCache {
+		// Skip dirty pages and WAL pages
+		if page.dirty || page.isWAL {
+			continue
+		}
+
+		// Add to candidates
+		candidates = append(candidates, pageInfo{
+			pageNumber: pageNumber,
+			accessTime: page.accessTime,
+		})
+	}
+	db.cacheMutex.RUnlock()
+
+	// If no candidates, nothing to do
+	if len(candidates) == 0 {
+		return
+	}
+
+	// Step 2: Sort candidates by access time (oldest first)
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].accessTime < candidates[j].accessTime
+	})
+
+	// Step 3: Acquire write lock and remove pages
+	db.cacheMutex.Lock()
+
+	// Remove the oldest pages
+	removedCount := 0
+	for i := 0; i < len(candidates) && removedCount < numPagesToRemove; i++ {
+		pageNumber := candidates[i].pageNumber
+
+		// Double-check the page still exists and is still removable
+		if page, exists := db.pageCache[pageNumber]; exists {
+			// Skip if the page is dirty or WAL
+			if page.dirty || page.isWAL {
+				continue
+			}
+
+			// Skip if the page is part of a linked list with dirty or WAL pages
+			hasNonRemovable := false
+			for p := page.next; p != nil; p = p.next {
+				if p.dirty || p.isWAL {
+					hasNonRemovable = true
+					break
+				}
+			}
+			if hasNonRemovable {
+				continue
+			}
+
+			// Remove the page from the cache
+			delete(db.pageCache, pageNumber)
+			removedCount++
+		}
+	}
+
+	db.cacheMutex.Unlock()
+
+	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, len(db.pageCache))
+}
+
 // ------------------------------------------------------------------------------------------------
 // Page access
 // ------------------------------------------------------------------------------------------------
@@ -2029,18 +2357,6 @@ func (db *DB) getPageFromCache(pageNumber uint32) (*Page, bool) {
 // getPage gets a page from the cache or from the disk
 func (db *DB) getPage(pageNumber uint32) (*Page, error) {
 	// First check the cache
-	page, exists := db.getPageFromCache(pageNumber)
-	if exists {
-		return page, nil
-	}
-
-	// If not in cache, read it from disk
-	return db.readPage(pageNumber)
-}
-
-// getRadixPage returns a radix page from the cache or from the disk
-func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
-	// First try to get the page from the cache
 	page, exists := db.getPageFromCache(pageNumber)
 
 	// If not in cache, read it from disk
@@ -2050,6 +2366,22 @@ func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Update the access time
+	db.accessCounter++
+	page.accessTime = db.accessCounter
+
+	// Return the page
+	return page, nil
+}
+
+// getRadixPage returns a radix page from the cache or from the disk
+func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
+	// Get the page from the cache or from the disk
+	page, err := db.getPage(pageNumber)
+	if err != nil {
+		return nil, err
 	}
 
 	// If the page is not a radix page, return an error
@@ -2063,16 +2395,10 @@ func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
 
 // getLeafPage returns a leaf page from the cache or from the disk
 func (db *DB) getLeafPage(pageNumber uint32) (*LeafPage, error) {
-	// First try to get the page from the cache
-	page, exists := db.getPageFromCache(pageNumber)
-
-	// If not in cache, read it from disk
-	if !exists {
-		var err error
-		page, err = db.readPage(pageNumber)
-		if err != nil {
-			return nil, err
-		}
+	// Get the page from the cache or from the disk
+	page, err := db.getPage(pageNumber)
+	if err != nil {
+		return nil, err
 	}
 
 	// If the page is not a leaf page, return an error
@@ -2263,6 +2589,13 @@ func (db *DB) allocateRadixPage() (*RadixPage, error) {
 	// Add to cache
 	db.addToCache(radixPage)
 
+	// Update the access time
+	db.accessCounter++
+	radixPage.accessTime = db.accessCounter
+
+	// Update the transaction sequence
+	radixPage.txnSequence = db.txnSequence
+
 	debugPrint("Allocated new radix page at page %d\n", pageNumber)
 
 	return radixPage, nil
@@ -2274,25 +2607,37 @@ func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
 
 	// If we have a cached free radix page with available sub-pages
 	if db.freeSubPagesHead != nil && db.freeSubPagesHead.SubPagesUsed < SubPagesPerRadixPage {
+		// Get a reference to the radix page
+		radixPage := db.freeSubPagesHead
+
+		// Get a writable version of the page
+		radixPage, err := db.getWritablePage(radixPage)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get writable page: %w", err)
+		}
+
+		// Update the free sub-pages head
+		db.freeSubPagesHead = radixPage
+
 		// Use the next available sub-page index
-		subPageIdx := db.freeSubPagesHead.SubPagesUsed
+		subPageIdx := radixPage.SubPagesUsed
 
 		// Increment the sub-page counter (will be written when the page is updated)
-		db.freeSubPagesHead.SubPagesUsed++
-		db.freeSubPagesHead.dirty = true
+		radixPage.SubPagesUsed++
+		radixPage.dirty = true
 
 		// Create a new radix sub-page
 		radixSubPage := &RadixSubPage{
-			Page:       db.freeSubPagesHead,
+			Page:       radixPage,
 			SubPageIdx: subPageIdx,
 		}
 
 		// If the page is now full, remove it from the free list
-		if db.freeSubPagesHead.SubPagesUsed >= SubPagesPerRadixPage {
+		if radixPage.SubPagesUsed >= SubPagesPerRadixPage {
 			// Save the next free page pointer
-			nextFreePage := db.freeSubPagesHead.NextFreePage
+			nextFreePage := radixPage.NextFreePage
 			// Clear the next free page pointer
-			db.freeSubPagesHead.NextFreePage = 0
+			radixPage.NextFreePage = 0
 
 			// Get the next free page and update the head of the free list
 			nextPage := (*RadixPage)(nil)
@@ -2356,6 +2701,13 @@ func (db *DB) allocateLeafPage() (*LeafPage, error) {
 	// Add to cache
 	db.addToCache(leafPage)
 
+	// Update the access time
+	db.accessCounter++
+	leafPage.accessTime = db.accessCounter
+
+	// Update the transaction sequence
+	leafPage.txnSequence = db.txnSequence
+
 	debugPrint("Allocated new leaf page at page %d\n", pageNumber)
 
 	return leafPage, nil
@@ -2400,16 +2752,24 @@ func (db *DB) parseLeafEntries(leafPage *LeafPage) ([]LeafEntry, error) {
 	return entries, nil
 }
 
-// addLeafEntry adds an entry to a leaf page
-// Returns true if the entry was added, false if the page is full
-func (db *DB) addLeafEntry(leafPage *LeafPage, suffix []byte, dataOffset int64) bool {
+// addLeafEntry tries to add the entry with the suffix to the leaf page
+// If the leaf page is full, it converts it to a radix page
+func (db *DB) addLeafEntry(leafPage *LeafPage, suffix []byte, dataOffset int64) error {
+
+	// Get a writable version of the page
+	leafPage, err := db.getWritablePage(leafPage)
+	if err != nil {
+		return err
+	}
+
 	// Calculate size needed for this entry
 	suffixLenSize := varint.Size(uint64(len(suffix)))
 	entrySize := suffixLenSize + len(suffix) + 8 // suffix length + suffix + data offset
 
 	// Check if there's enough space in the page
 	if int(leafPage.ContentSize)+entrySize > PageSize {
-		return false // Page is full
+		// Leaf page is full, convert it to a radix page
+		return db.convertLeafPageToRadixPage(leafPage, suffix, dataOffset)
 	}
 
 	// Get current content position
@@ -2441,15 +2801,21 @@ func (db *DB) addLeafEntry(leafPage *LeafPage, suffix []byte, dataOffset int64) 
 	// Mark page as dirty
 	leafPage.dirty = true
 
-	return true
+	return nil
 }
 
 // removeLeafEntryAt removes an entry from a leaf page at the given index
 // Returns true if the entry was removed
-func (db *DB) removeLeafEntryAt(leafPage *LeafPage, index int) bool {
+func (db *DB) removeLeafEntryAt(leafPage *LeafPage, index int) (bool, error) {
 	// Check if index is valid
 	if index < 0 || index >= len(leafPage.Entries) {
-		return false
+		return false, nil
+	}
+
+	// Get a writable version of the page
+	leafPage, err := db.getWritablePage(leafPage)
+	if err != nil {
+		return false, err
 	}
 
 	// Remove the entry from the entries list
@@ -2461,11 +2827,17 @@ func (db *DB) removeLeafEntryAt(leafPage *LeafPage, index int) bool {
 	// Mark page as dirty
 	leafPage.dirty = true
 
-	return true
+	return true, nil
 }
 
 // updateLeafEntryOffset updates the content offset for an existing leaf entry in the data buffer
-func (db *DB) updateLeafEntryOffset(leafPage *LeafPage, index int, dataOffset int64) {
+func (db *DB) updateLeafEntryOffset(leafPage *LeafPage, index int, dataOffset int64) error {
+
+	// Get a writable version of the page
+	leafPage, err := db.getWritablePage(leafPage)
+	if err != nil {
+		return err
+	}
 
 	// Update the entry
 	leafPage.Entries[index].DataOffset = dataOffset
@@ -2501,6 +2873,8 @@ func (db *DB) updateLeafEntryOffset(leafPage *LeafPage, index int, dataOffset in
 
 	// Mark the page as dirty
 	leafPage.dirty = true
+
+	return nil
 }
 
 // rebuildLeafPageData rebuilds the leaf page data from the entries list
@@ -2555,10 +2929,16 @@ func (db *DB) rebuildLeafPageData(leafPage *LeafPage) {
 // ------------------------------------------------------------------------------------------------
 
 // setRadixPageEntry sets an entry in a radix page
-func (db *DB) setRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValue uint8, pageNumber uint32, nextSubPageIdx uint8) {
+func (db *DB) setRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValue uint8, pageNumber uint32, nextSubPageIdx uint8) error {
 	// Check if subPage is valid
 	if subPageIdx >= SubPagesPerRadixPage {
-		return
+		return fmt.Errorf("sub-page index out of range")
+	}
+
+	// Get a writable version of the page
+	radixPage, err := db.getWritablePage(radixPage)
+	if err != nil {
+		return err
 	}
 
 	// Calculate base offset for this entry in the page data
@@ -2573,6 +2953,8 @@ func (db *DB) setRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValu
 
 	// Mark page as dirty
 	radixPage.dirty = true
+
+	return nil
 }
 
 // getRadixPageEntry gets an entry from a radix page
@@ -2607,22 +2989,33 @@ func (db *DB) getEmptySuffixOffset(subPage *RadixSubPage) int64 {
 }
 
 // setEmptySuffixOffset sets the empty suffix offset for a radix sub-page
-func (db *DB) setEmptySuffixOffset(subPage *RadixSubPage, offset int64) {
+func (db *DB) setEmptySuffixOffset(subPage *RadixSubPage, offset int64) error {
+	// Get a reference to the radix page
+	radixPage := subPage.Page
+
+	// Get a writable version of the page
+	radixPage, err := db.getWritablePage(radixPage)
+	if err != nil {
+		return err
+	}
+
 	// Calculate the offset for the empty suffix in the page data
 	// Each sub-page has 256 entries of 5 bytes each, followed by an 8-byte empty suffix offset
 	subPageOffset := RadixHeaderSize + int(subPage.SubPageIdx) * SubPageSize
 	emptySuffixOffsetPos := subPageOffset + EntriesPerSubPage * RadixEntrySize
 
 	// Write the 8-byte offset
-	binary.LittleEndian.PutUint64(subPage.Page.data[emptySuffixOffsetPos:emptySuffixOffsetPos+8], uint64(offset))
+	binary.LittleEndian.PutUint64(radixPage.data[emptySuffixOffsetPos:emptySuffixOffsetPos+8], uint64(offset))
 
 	// Mark the page as dirty
-	subPage.Page.dirty = true
+	radixPage.dirty = true
+
+	return nil
 }
 
 // setRadixEntry sets an entry in a radix sub-page
-func (db *DB) setRadixEntry(subPage *RadixSubPage, byteValue uint8, pageNumber uint32, nextSubPageIdx uint8) {
-	db.setRadixPageEntry(subPage.Page, subPage.SubPageIdx, byteValue, pageNumber, nextSubPageIdx)
+func (db *DB) setRadixEntry(subPage *RadixSubPage, byteValue uint8, pageNumber uint32, nextSubPageIdx uint8) error {
+	return db.setRadixPageEntry(subPage.Page, subPage.SubPageIdx, byteValue, pageNumber, nextSubPageIdx)
 }
 
 // getRadixEntry gets an entry from a radix sub-page
@@ -2688,16 +3081,19 @@ func (db *DB) initializeRadixLevels() error {
 		}
 
 		// Link from root page to this page/sub-page
-		db.setRadixEntry(rootSubPage, uint8(byteValue), childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
+		err = db.setRadixEntry(rootSubPage, uint8(byteValue), childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
+		if err != nil {
+			return fmt.Errorf("failed to set radix entry for byte %d: %w", byteValue, err)
+		}
 	}
 
 	return nil
 }
 
-// convertLeafToRadix converts a leaf page to a radix page when it's full
+// convertLeafPageToRadixPage converts a leaf page to a radix page when it's full
 // It creates a new radix page with the same page number as the leaf page,
 // and redistributes all entries from the leaf page to appropriate new leaf pages
-func (db *DB) convertLeafToRadix(leafPage *LeafPage, newSuffix []byte, newDataOffset int64) error {
+func (db *DB) convertLeafPageToRadixPage(leafPage *LeafPage, newSuffix []byte, newDataOffset int64) error {
 	debugPrint("Converting leaf page %d to radix page\n", leafPage.pageNumber)
 
 	// Create a new radix page with the same page number
@@ -2706,6 +3102,9 @@ func (db *DB) convertLeafToRadix(leafPage *LeafPage, newSuffix []byte, newDataOf
 		pageType:     ContentTypeRadix,
 		data:         make([]byte, PageSize),
 		dirty:        true,
+		isWAL:        false,
+		accessTime:   leafPage.accessTime,
+		txnSequence:  leafPage.txnSequence,
 		SubPagesUsed: 1, // Start with one sub-page
 	}
 
