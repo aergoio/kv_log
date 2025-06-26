@@ -646,14 +646,13 @@ func (db *DB) copyWALPagesToIndexFile() error {
 		return nil
 	}
 
+	// Get the list of page numbers to copy using just a read lock
 	db.cacheMutex.RLock()
-	defer db.cacheMutex.RUnlock()
-
-	// Get the list of page numbers to copy
 	pageNumbers := make([]uint32, 0, len(db.pageCache))
 	for pageNumber := range db.pageCache {
 		pageNumbers = append(pageNumbers, pageNumber)
 	}
+	db.cacheMutex.RUnlock()
 
 	// Sort page numbers for sequential access (faster writes)
 	sort.Slice(pageNumbers, func(i, j int) bool {
