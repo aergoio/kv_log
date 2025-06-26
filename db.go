@@ -3230,6 +3230,9 @@ func (db *DB) recoverUnindexedContent() error {
 
 	debugPrint("Recovering unindexed content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize)
 
+	// Initialize the transaction sequence
+	db.txnSequence = 1
+
 	// Get the root radix sub-page
 	rootSubPage, err := db.getRootRadixSubPage()
 	if err != nil {
