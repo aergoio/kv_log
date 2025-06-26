@@ -2152,7 +2152,7 @@ func (db *DB) checkPageCache(isWrite bool) {
 		// Check which thread should flush the pages
 		if db.commitMode == CallerThread {
 			// Write the pages to the WAL file
-			db.flushDirtyIndexPages()
+			db.flushIndexToDisk()
 		} else {
 			// Signal the worker thread to flush the pages
 			//db.workerChannel <- "flush"    TODO
