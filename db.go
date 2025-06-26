@@ -106,7 +106,6 @@ type DB struct {
 	pageCache      map[uint32]*Page // Cache for all page types
 	freeSubPagesHead *RadixPage // Head of linked list of radix pages with available sub-pages
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
-	headerDirty    bool  // Track if the header needs to be written during sync
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
 	commitMode     int    // CallerThread or WorkerThread
@@ -1416,9 +1415,6 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 
 	// Update the in-memory offset
 	db.lastIndexedOffset = lastIndexedOffset
-
-	// Header is no longer dirty
-	db.headerDirty = false
 
 	return nil
 }
@@ -3178,9 +3174,6 @@ func (db *DB) updateFreeSubPagesHead(radixPage *RadixPage) {
 
 	// Update the in-memory pointer
 	db.freeSubPagesHead = radixPage
-
-	// Mark the header as dirty so it gets written during the next sync
-	db.headerDirty = true
 }
 
 // recoverUnindexedContent reads the main file starting from the last indexed offset
