@@ -2786,10 +2786,6 @@ func (db *DB) updateFreeSubPagesHead(radixPage *RadixPage) {
 // recoverUnindexedContent reads the main file starting from the last indexed offset
 // and reindexes any content that hasn't been indexed yet
 func (db *DB) recoverUnindexedContent() error {
-	// Check if we're in read-only mode
-	if db.readOnly {
-		return fmt.Errorf("cannot recover unindexed content in read-only mode")
-	}
 
 	lastIndexedOffset := db.lastIndexedOffset
 
