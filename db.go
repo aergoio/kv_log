@@ -1798,7 +1798,9 @@ func (db *DB) writeIndexPage(page *Page) error {
 			page.isWAL = true
 		}
 		// Discard previous versions of this page
-		page.next = nil   // TODO: check if this is safe. use the cache mutex?
+		db.cacheMutex.Lock()
+		page.next = nil
+		db.cacheMutex.Unlock()
 	}
 
 	return err
