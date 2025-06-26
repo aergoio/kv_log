@@ -96,8 +96,9 @@ type DB struct {
 	filePath       string
 	mainFile       *os.File
 	indexFile      *os.File
-	mutex          sync.RWMutex
-	cacheMutex     sync.RWMutex   // Separate mutex for the page cache
+	mutex          sync.RWMutex  // Mutex for the database
+	cacheMutex     sync.RWMutex  // Mutex for the page cache
+	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
 	indexFileSize  int64 // Track index file size to avoid frequent stat calls
 	fileLocked     bool  // Track if the files are locked
@@ -112,7 +113,8 @@ type DB struct {
 	useWAL         bool   // Whether to use WAL or not
 	syncMode       int    // SyncOn or SyncOff
 	walInfo        *WalInfo // WAL file information
-	inTransaction  bool   // Track if a transaction is open
+	inTransaction  bool   // Track if inside of a transaction
+	inExplicitTransaction bool // Track if an explicit transaction is open
 	calledByTransaction bool // Track if the method was called by a transaction
 	txnSequence    int64  // Current transaction sequence number
 	flushSequence  int64  // Current flush up to this transaction sequence number
@@ -547,7 +549,7 @@ func (db *DB) Delete(key []byte) error {
 // Set sets a key-value pair in the database
 func (db *DB) Set(key, value []byte) error {
 	// Check if a transaction is open but this method wasn't called by the transaction object
-	if db.inTransaction && !db.calledByTransaction {
+	if db.inExplicitTransaction && !db.calledByTransaction {
 		return fmt.Errorf("a transaction is open, use the transaction object instead")
 	}
 	// Check if file is opened in read-only mode
@@ -568,7 +570,7 @@ func (db *DB) Set(key, value []byte) error {
 	db.mutex.Lock()
 
 	// Start a transaction if not already in one
-	if !db.inTransaction {
+	if !db.inExplicitTransaction {
 		db.beginTransaction()
 	}
 
@@ -576,7 +578,7 @@ func (db *DB) Set(key, value []byte) error {
 	err := db.set(key, value)
 
 	// Commit or rollback the transaction if not in an explicit transaction
-	if !db.inTransaction {
+	if !db.inExplicitTransaction {
 		if err == nil {
 			db.commitTransaction()
 		} else {
@@ -1903,12 +1905,12 @@ func (db *DB) Begin() (*Transaction, error) {
 	defer db.mutex.Unlock()
 
 	// Check if a transaction is already open
-	if db.inTransaction {
+	if db.inExplicitTransaction {
 		return nil, fmt.Errorf("a transaction is already open")
 	}
 
 	// Mark transaction as open
-	db.inTransaction = true
+	db.inExplicitTransaction = true
 
 	// Start a transaction
 	db.beginTransaction()
@@ -1923,7 +1925,7 @@ func (tx *Transaction) Commit() error {
 	defer tx.db.mutex.Unlock()
 
 	// Check if transaction is open
-	if !tx.db.inTransaction {
+	if !tx.db.inExplicitTransaction {
 		return fmt.Errorf("no transaction is open")
 	}
 
@@ -1931,7 +1933,7 @@ func (tx *Transaction) Commit() error {
 	tx.db.commitTransaction()
 
 	// Mark transaction as closed
-	tx.db.inTransaction = false
+	tx.db.inExplicitTransaction = false
 
 	return nil
 }
@@ -1942,7 +1944,7 @@ func (tx *Transaction) Rollback() error {
 	defer tx.db.mutex.Unlock()
 
 	// Check if transaction is open
-	if !tx.db.inTransaction {
+	if !tx.db.inExplicitTransaction {
 		return fmt.Errorf("no transaction is open")
 	}
 
@@ -1950,7 +1952,7 @@ func (tx *Transaction) Rollback() error {
 	tx.db.rollbackTransaction()
 
 	// Mark transaction as closed
-	tx.db.inTransaction = false
+	tx.db.inExplicitTransaction = false
 
 	return nil
 }
@@ -1986,13 +1988,20 @@ func (tx *Transaction) Delete(key []byte) error {
 // beginTransaction starts a new transaction
 func (db *DB) beginTransaction() {
 	// Increment transaction sequence number
+	db.seqMutex.Lock()
+	db.inTransaction = true
 	db.txnSequence++
+	db.seqMutex.Unlock()
 	debugPrint("Beginning transaction %d\n", db.txnSequence)
 }
 
 // commitTransaction commits the current transaction
 func (db *DB) commitTransaction() {
 	debugPrint("Committing transaction %d\n", db.txnSequence)
+
+	db.seqMutex.Lock()
+	db.inTransaction = false
+	db.seqMutex.Unlock()
 
 	// If using WAL and in caller thread mode, flush to disk
 	if db.useWAL && db.commitMode == CallerThread {
@@ -2003,6 +2012,10 @@ func (db *DB) commitTransaction() {
 // rollbackTransaction rolls back the current transaction
 func (db *DB) rollbackTransaction() {
 	debugPrint("Rolling back transaction %d\n", db.txnSequence)
+
+	db.seqMutex.Lock()
+	db.inTransaction = false
+	db.seqMutex.Unlock()
 
 	// It can do:
 	// 1. Discard all dirty pages from this transaction
@@ -2440,6 +2453,15 @@ func (db *DB) flushIndexToDisk() error {
 		return fmt.Errorf("cannot flush index to disk: database opened in read-only mode")
 	}
 
+	db.seqMutex.Lock()
+	// Set flush sequence number limit
+	if db.inTransaction {
+		db.flushSequence = db.txnSequence - 1
+	} else {
+		db.flushSequence = db.txnSequence
+	}
+	db.seqMutex.Unlock()
+
 	// Flush all dirty pages
 	if err := db.flushDirtyIndexPages(); err != nil {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
@@ -2498,6 +2520,10 @@ func (db *DB) flushDirtyIndexPages() error {
 	db.cacheMutex.RLock()
 	defer db.cacheMutex.RUnlock()
 
+	if db.flushSequence == 0 {
+		return fmt.Errorf("flush sequence is not set")
+	}
+
 	// Get all page numbers and sort them
 	pageNumbers := make([]uint32, 0, len(db.pageCache))
 	for pageNumber := range db.pageCache {
@@ -2512,7 +2538,14 @@ func (db *DB) flushDirtyIndexPages() error {
 	// Process pages in order
 	for _, pageNumber := range pageNumbers {
 		page := db.pageCache[pageNumber]
-		if page.dirty {
+		// Find the first version of the page that was modified up to the flush sequence
+		for ; page != nil; page = page.next {
+			if page.txnSequence <= db.flushSequence {
+				break
+			}
+		}
+		// If the page contains modifications, write it to disk
+		if page != nil && page.dirty {
 			if page.pageType == ContentTypeRadix {
 				if err := db.writeRadixPage(page); err != nil {
 					return err
