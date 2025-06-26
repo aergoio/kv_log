@@ -113,7 +113,14 @@ type DB struct {
 	useWAL         bool   // Whether to use WAL or not
 	syncMode       int    // SyncOn or SyncOff
 	walInfo        *WalInfo // WAL file information
-	txnSequence    int64  // Transaction sequence number
+	inTransaction  bool   // Track if a transaction is open
+	calledByTransaction bool // Track if the method was called by a transaction
+	txnSequence    int64  // Current transaction sequence number
+}
+
+// Transaction represents a database transaction
+type Transaction struct {
+	db *DB
 }
 
 // Content represents a piece of content in the database
@@ -525,24 +532,62 @@ func (db *DB) Close() error {
 
 // Delete removes a key from the database
 func (db *DB) Delete(key []byte) error {
-	// Check if file is opened in read-only mode
-	if db.readOnly {
-		return fmt.Errorf("cannot delete: database opened in read-only mode")
-	}
-
 	// Call Set with nil value to mark as deleted
 	return db.Set(key, nil)
 }
 
 // Set sets a key-value pair in the database
 func (db *DB) Set(key, value []byte) error {
+	// Check if a transaction is open but this method wasn't called by the transaction object
+	if db.inTransaction && !db.calledByTransaction {
+		return fmt.Errorf("a transaction is open, use the transaction object instead")
+	}
 	// Check if file is opened in read-only mode
 	if db.readOnly {
-		return fmt.Errorf("cannot set: database opened in read-only mode")
+		return fmt.Errorf("cannot write: database opened in read-only mode")
 	}
 
+	// Validate key length
+	keyLen := len(key)
+	if keyLen == 0 {
+		return fmt.Errorf("key cannot be empty")
+	}
+	if keyLen > MaxKeyLength {
+		return fmt.Errorf("key length exceeds maximum allowed size of %d bytes", MaxKeyLength)
+	}
+
+	// Lock the database
 	db.mutex.Lock()
-	defer db.mutex.Unlock()
+
+	// Start a transaction if not already in one
+	if !db.inTransaction {
+		db.beginTransaction()
+	}
+
+	// Set the key-value pair
+	err := db.set(key, value)
+
+	// Commit or rollback the transaction if not in an explicit transaction
+	if !db.inTransaction {
+		if err == nil {
+			db.commitTransaction()
+		} else {
+			db.rollbackTransaction()
+		}
+	}
+
+	// Unlock the database
+	db.mutex.Unlock()
+
+	// Check the page cache
+	db.checkPageCache(true)
+
+	// Return the error
+	return err
+}
+
+// Internal function to set a key-value pair in the database
+func (db *DB) set(key, value []byte) error {
 
 	// If not already exclusively locked
 	if db.lockType != LockExclusive {
@@ -554,15 +599,6 @@ func (db *DB) Set(key, value []byte) error {
 		}
 		// Release the lock on exit
 		defer db.releaseWriteLock(originalLockType)
-	}
-
-	// Validate key length
-	keyLen := len(key)
-	if keyLen == 0 {
-		return fmt.Errorf("key cannot be empty")
-	}
-	if keyLen > MaxKeyLength {
-		return fmt.Errorf("key length exceeds maximum allowed size of %d bytes", MaxKeyLength)
 	}
 
 	// Start with the root radix sub-page
@@ -1827,6 +1863,134 @@ func (db *DB) RefreshFileSize() error {
 	db.indexFileSize = indexFileInfo.Size()
 
 	return nil
+}
+
+// ------------------------------------------------------------------------------------------------
+// Transaction API
+// ------------------------------------------------------------------------------------------------
+
+// Begin a new transaction
+func (db *DB) Begin() (*Transaction, error) {
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
+
+	// Check if a transaction is already open
+	if db.inTransaction {
+		return nil, fmt.Errorf("a transaction is already open")
+	}
+
+	// Mark transaction as open
+	db.inTransaction = true
+
+	// Start a transaction
+	db.beginTransaction()
+
+	// Create and return transaction object
+	return &Transaction{db: db}, nil
+}
+
+// Commit a transaction
+func (tx *Transaction) Commit() error {
+	tx.db.mutex.Lock()
+	defer tx.db.mutex.Unlock()
+
+	// Check if transaction is open
+	if !tx.db.inTransaction {
+		return fmt.Errorf("no transaction is open")
+	}
+
+	// Commit the transaction
+	tx.db.commitTransaction()
+
+	// Mark transaction as closed
+	tx.db.inTransaction = false
+
+	return nil
+}
+
+// Rollback a transaction
+func (tx *Transaction) Rollback() error {
+	tx.db.mutex.Lock()
+	defer tx.db.mutex.Unlock()
+
+	// Check if transaction is open
+	if !tx.db.inTransaction {
+		return fmt.Errorf("no transaction is open")
+	}
+
+	// Rollback the transaction
+	tx.db.rollbackTransaction()
+
+	// Mark transaction as closed
+	tx.db.inTransaction = false
+
+	return nil
+}
+
+// Set a key-value pair within a transaction
+func (tx *Transaction) Set(key, value []byte) error {
+	// Call the database's set method
+	tx.db.calledByTransaction = true
+	err := tx.db.Set(key, value)
+	tx.db.calledByTransaction = false
+	return err
+}
+
+// Get a value for a key within a transaction
+func (tx *Transaction) Get(key []byte) ([]byte, error) {
+	// Call the database's get method
+	return tx.db.Get(key)
+}
+
+// Delete a key within a transaction
+func (tx *Transaction) Delete(key []byte) error {
+	// Call the database's delete method
+	tx.db.calledByTransaction = true
+	err := tx.db.Delete(key)
+	tx.db.calledByTransaction = false
+	return err
+}
+
+// ------------------------------------------------------------------------------------------------
+// Internal Transactions
+// ------------------------------------------------------------------------------------------------
+
+// beginTransaction starts a new transaction
+func (db *DB) beginTransaction() {
+	// Increment transaction sequence number
+	db.txnSequence++
+	debugPrint("Beginning transaction %d\n", db.txnSequence)
+}
+
+// commitTransaction commits the current transaction
+func (db *DB) commitTransaction() {
+	debugPrint("Committing transaction %d\n", db.txnSequence)
+
+	// If using WAL and in caller thread mode, flush to disk
+	if db.useWAL && db.commitMode == CallerThread {
+		db.flushIndexToDisk()
+	}
+}
+
+// rollbackTransaction rolls back the current transaction
+func (db *DB) rollbackTransaction() {
+	debugPrint("Rolling back transaction %d\n", db.txnSequence)
+
+	// It can do:
+	// 1. Discard all dirty pages from this transaction
+	// 2. Restore pages from WAL if needed
+
+
+	// It could use an optimistic approach:
+	// - do not clone pages for new transactions, only if there is a flush happening
+	// on rollback:
+	// - truncate the main db file to the stored size before the transaction started
+	// - discard all dirty pages
+	// - rebuild the index pages from the main db file (incremental reindexing)
+
+	// PROBLEM: on a crash, the main file can contain uncommitted changes
+	// SOLUTION: do "transactions" virtually, on memory, and only write to disk when the transaction is committed
+
 }
 
 // ------------------------------------------------------------------------------------------------
