@@ -1381,30 +1381,36 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	}
 
 	// Allocate a buffer for the entire page
-	rootPage := make([]byte, PageSize)
+	data := make([]byte, PageSize)
 
 	// Write the 6-byte magic string
-	copy(rootPage[0:6], IndexFileMagicString)
+	copy(data[0:6], IndexFileMagicString)
 
 	// Write the 2-byte version
-	copy(rootPage[6:8], VersionString)
+	copy(data[6:8], VersionString)
 
 	// Write the 8-byte database ID
-	binary.LittleEndian.PutUint64(rootPage[8:16], db.databaseID)
+	binary.LittleEndian.PutUint64(data[8:16], db.databaseID)
 
 	// Set last indexed offset (8 bytes)
-	binary.LittleEndian.PutUint64(rootPage[16:24], uint64(lastIndexedOffset))
+	binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
 
 	// Set free sub-pages head pointer (4 bytes)
-	binary.LittleEndian.PutUint32(rootPage[24:28], nextFreePageNumber)
+	binary.LittleEndian.PutUint32(data[24:28], nextFreePageNumber)
 
 	// If this is the first time we're writing the header, set the file size to PageSize
 	if isInit {
 		db.indexFileSize = PageSize
 	}
 
+	// Create a temporary Page struct for the root page
+	headerPage := &Page{
+		pageNumber: 0,
+		data:       data,
+	}
+
 	// Write the entire root page to disk
-	if err := db.writeIndexPage(rootPage, 0); err != nil {
+	if err := db.writeIndexPage(headerPage); err != nil {
 		return fmt.Errorf("failed to write index file root page: %w", err)
 	}
 
@@ -1664,19 +1670,7 @@ func (db *DB) writeRadixPage(radixPage *RadixPage) error {
 	debugPrint("Writing radix page to index file at page %d\n", radixPage.pageNumber)
 
 	// Write to disk at the specified page number
-	err := db.writeIndexPage(radixPage.data, radixPage.pageNumber)
-
-	// If the page was written successfully
-	if err == nil {
-		// Mark it as clean
-		radixPage.dirty = false
-		// If WAL is used, mark the page as part of the WAL
-		if db.useWAL {
-			radixPage.isWAL = true
-		}
-	}
-
-	return err
+	return db.writeIndexPage(radixPage)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1750,19 +1744,7 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 	}
 
 	// Write to disk at the specified page number
-	err := db.writeIndexPage(leafPage.data, leafPage.pageNumber)
-
-	// If the page was written successfully
-	if err == nil {
-		// Mark it as clean
-		leafPage.dirty = false
-		// If WAL is used, mark the page as part of the WAL
-		if db.useWAL {
-			leafPage.isWAL = true
-		}
-	}
-
-	return err
+	return db.writeIndexPage(leafPage)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1796,13 +1778,30 @@ func (db *DB) readPage(pageNumber uint32) (*Page, error) {
 }
 
 // writeIndexPage writes an index page to either the WAL file or the index file
-func (db *DB) writeIndexPage(data []byte, pageNumber uint32) error {
+func (db *DB) writeIndexPage(page *Page) error {
+	var err error
+
 	// If WAL is used, write to WAL file
 	if db.useWAL {
-		return db.writeToWAL(data, pageNumber)
+		err = db.writeToWAL(page.data, page.pageNumber)
+	// Otherwise, write directly to the index file
 	} else {
-		return db.writeToIndexFile(data, pageNumber)
+		err = db.writeToIndexFile(page.data, page.pageNumber)
 	}
+
+	// If the page was written successfully
+	if err == nil {
+		// Mark it as clean
+		page.dirty = false
+		// If using WAL, mark it as part of the WAL
+		if db.useWAL {
+			page.isWAL = true
+		}
+		// Discard previous versions of this page
+		page.next = nil   // TODO: check if this is safe. use the cache mutex?
+	}
+
+	return err
 }
 
 // readIndexPage reads an index page from the index file
