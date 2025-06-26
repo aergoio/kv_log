@@ -2482,6 +2482,7 @@ func (db *DB) flushIndexToDisk() error {
 	return nil
 }
 
+/*
 // flushAllIndexPages writes all cached pages to disk
 func (db *DB) flushAllIndexPages() error {
 	db.cacheMutex.RLock()
@@ -2514,21 +2515,22 @@ func (db *DB) flushAllIndexPages() error {
 
 	return nil
 }
+*/
 
 // flushDirtyIndexPages writes all dirty pages to disk
 func (db *DB) flushDirtyIndexPages() error {
-	db.cacheMutex.RLock()
-	defer db.cacheMutex.RUnlock()
 
 	if db.flushSequence == 0 {
 		return fmt.Errorf("flush sequence is not set")
 	}
 
-	// Get all page numbers and sort them
+	// Get all page numbers using just a read lock
+	db.cacheMutex.RLock()
 	pageNumbers := make([]uint32, 0, len(db.pageCache))
 	for pageNumber := range db.pageCache {
 		pageNumbers = append(pageNumbers, pageNumber)
 	}
+	db.cacheMutex.RUnlock()
 
 	// Sort page numbers in ascending order
 	sort.Slice(pageNumbers, func(i, j int) bool {
@@ -2537,6 +2539,7 @@ func (db *DB) flushDirtyIndexPages() error {
 
 	// Process pages in order
 	for _, pageNumber := range pageNumbers {
+		// Get the page from the cache (it can be modified by another thread)
 		page := db.pageCache[pageNumber]
 		// Find the first version of the page that was modified up to the flush sequence
 		for ; page != nil; page = page.next {
