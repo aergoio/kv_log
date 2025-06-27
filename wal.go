@@ -526,8 +526,14 @@ func (db *DB) walCommit() error {
 	// Update sequence number after successful commit
 	db.walInfo.lastCommitSequence = db.txnSequence
 
-	// maybe notify the worker thread that a commit record has been written
-	//db.workerChannel <- "checkpoint"
+	// Check if it should run a checkpoint
+	if db.shouldCheckpoint() {
+		// Checkpoint the WAL file into the index file
+		if err := db.checkpointWAL(); err != nil {
+			// Log error but don't fail the commit
+			debugPrint("Checkpoint failed: %v", err)
+		}
+	}
 
 	return nil
 }
@@ -554,6 +560,19 @@ func (db *DB) walRollback() error {
 	// This is important to maintain consistency
 
 	return nil
+}
+
+// shouldCheckpoint checks if the WAL file should be checkpointed
+func (db *DB) shouldCheckpoint() bool {
+	// Check WAL file size
+	walFileInfo, err := db.walInfo.file.Stat()
+	if err == nil {
+		// Checkpoint if WAL file exceeds size threshold
+		if walFileInfo.Size() > db.checkpointThreshold {
+			return true
+		}
+	}
+	return false
 }
 
 // checkpointWAL writes the current WAL file to the index file and clears the cache

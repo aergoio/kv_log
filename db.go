@@ -125,6 +125,7 @@ type DB struct {
 	dirtyPageCount int    // Count of dirty pages in cache
 	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
+	checkpointThreshold int64 // Maximum WAL file size in bytes before checkpoint
 	workerChannel  chan string // Channel for background worker commands
 	workerWaitGroup sync.WaitGroup // WaitGroup to coordinate with worker thread
 	pendingCommands map[string]bool // Map to track pending worker commands
@@ -213,6 +214,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
 	cacheSizeThreshold := calculateDefaultCacheSize()  // Calculate based on system memory
 	dirtyPageThreshold := cacheSizeThreshold / 2       // Default to 50% of cache size
+	checkpointThreshold := int64(1024 * 1024)          // Default to 1MB
 
 	// Parse options
 	var opts Options
@@ -251,6 +253,13 @@ func Open(path string, options ...Options) (*DB, error) {
 		if val, ok := opts["DirtyPageThreshold"]; ok {
 			if dpt, ok := val.(int); ok && dpt > 0 {
 				dirtyPageThreshold = dpt
+			}
+		}
+		if val, ok := opts["CheckpointThreshold"]; ok {
+			if cpt, ok := val.(int64); ok && cpt > 0 {
+				checkpointThreshold = cpt
+			} else if cpt, ok := val.(int); ok && cpt > 0 {
+				checkpointThreshold = int64(cpt)
 			}
 		}
 	}
@@ -314,6 +323,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		dirtyPageCount:     0,
 		dirtyPageThreshold: dirtyPageThreshold,
 		cacheSizeThreshold: cacheSizeThreshold,
+		checkpointThreshold: checkpointThreshold,
 		workerChannel:      make(chan string, 10), // Buffer size of 10 for commands
 		pendingCommands:    make(map[string]bool), // Initialize the pending commands map
 	}
@@ -433,6 +443,23 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			return fmt.Errorf("DirtyPageThreshold must be greater than 0")
 		}
 		return fmt.Errorf("DirtyPageThreshold value must be an integer")
+	case "CheckpointThreshold":
+		if cpt, ok := value.(int64); ok {
+			if cpt > 0 {
+				db.checkpointThreshold = cpt
+				return nil
+			}
+			return fmt.Errorf("CheckpointThreshold must be greater than 0")
+		}
+		// Try to convert from int if int64 conversion failed
+		if cpt, ok := value.(int); ok {
+			if cpt > 0 {
+				db.checkpointThreshold = int64(cpt)
+				return nil
+			}
+			return fmt.Errorf("CheckpointThreshold must be greater than 0")
+		}
+		return fmt.Errorf("CheckpointThreshold value must be an integer")
 	default:
 		return fmt.Errorf("unknown or immutable option: %s", name)
 	}
