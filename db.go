@@ -904,7 +904,7 @@ func (db *DB) setOnLeafPage(leafPage *LeafPage, key []byte, keyPos int, value []
 			}
 
 			// Mark the leaf page as dirty
-			leafPage.dirty = true
+			db.markPageDirty(leafPage)
 
 			return nil
 		}
@@ -1794,7 +1794,7 @@ func (db *DB) writeIndexPage(page *Page) error {
 	// If the page was written successfully
 	if err == nil {
 		// Mark it as clean
-		page.dirty = false
+		db.markPageClean(page)
 		// If using WAL, mark it as part of the WAL
 		if db.useWAL {
 			page.isWAL = true
@@ -2056,6 +2056,10 @@ func (db *DB) addToCache(page *Page) {
 	// If there is already a page with the same page number
 	existingPage, exists := db.pageCache[pageNumber]
 	if exists {
+		// Avoid linking the page to itself
+		if page == existingPage {
+			return
+		}
 		// Link the new page to the existing page
 		page.next = existingPage
 	} else {
@@ -2150,6 +2154,22 @@ func (db *DB) clonePage(page *Page) (*Page, error) {
 	page.accessTime = oldPage.accessTime
 
 	return page, nil
+}
+
+// markPageDirty marks a page as dirty and increments the dirty page counter
+func (db *DB) markPageDirty(page *Page) {
+	if !page.dirty {
+		page.dirty = true
+		db.dirtyPageCount++
+	}
+}
+
+// markPageClean marks a page as clean and decrements the dirty page counter
+func (db *DB) markPageClean(page *Page) {
+	if page.dirty {
+		page.dirty = false
+		db.dirtyPageCount--
+	}
 }
 
 // checkPageCache checks if the page cache is full and initiates a clean up or flush
@@ -2431,6 +2451,7 @@ func (db *DB) GetCacheStats() map[string]interface{} {
 
 	stats := make(map[string]interface{})
 	stats["cache_size"] = len(db.pageCache)
+	stats["dirty_pages"] = db.dirtyPageCount
 
 	// Count pages by type
 	radixPages := 0
@@ -2661,7 +2682,7 @@ func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
 
 		// Increment the sub-page counter (will be written when the page is updated)
 		radixPage.SubPagesUsed++
-		radixPage.dirty = true
+		db.markPageDirty(radixPage)
 
 		// Create a new radix sub-page
 		radixSubPage := &RadixSubPage{
@@ -2704,7 +2725,7 @@ func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
 	newRadixPage.SubPagesUsed = 1
 
 	// Mark page as dirty
-	newRadixPage.dirty = true
+	db.markPageDirty(newRadixPage)
 
 	// Add this page to the free sub-pages list
 	db.addToFreeSubPagesList(newRadixPage)
@@ -2836,7 +2857,7 @@ func (db *DB) addLeafEntry(leafPage *LeafPage, suffix []byte, dataOffset int64) 
 	})
 
 	// Mark page as dirty
-	leafPage.dirty = true
+	db.markPageDirty(leafPage)
 
 	return nil
 }
@@ -2862,7 +2883,7 @@ func (db *DB) removeLeafEntryAt(leafPage *LeafPage, index int) (bool, error) {
 	db.rebuildLeafPageData(leafPage)
 
 	// Mark page as dirty
-	leafPage.dirty = true
+	db.markPageDirty(leafPage)
 
 	return true, nil
 }
@@ -2909,7 +2930,7 @@ func (db *DB) updateLeafEntryOffset(leafPage *LeafPage, index int, dataOffset in
 	binary.LittleEndian.PutUint64(leafPage.data[pos:], uint64(dataOffset))
 
 	// Mark the page as dirty
-	leafPage.dirty = true
+	db.markPageDirty(leafPage)
 
 	return nil
 }
@@ -2989,7 +3010,7 @@ func (db *DB) setRadixPageEntry(radixPage *RadixPage, subPageIdx uint8, byteValu
 	radixPage.data[entryOffset+4] = nextSubPageIdx
 
 	// Mark page as dirty
-	radixPage.dirty = true
+	db.markPageDirty(radixPage)
 
 	return nil
 }
@@ -3045,7 +3066,7 @@ func (db *DB) setEmptySuffixOffset(subPage *RadixSubPage, offset int64) error {
 	binary.LittleEndian.PutUint64(radixPage.data[emptySuffixOffsetPos:emptySuffixOffsetPos+8], uint64(offset))
 
 	// Mark the page as dirty
-	radixPage.dirty = true
+	db.markPageDirty(radixPage)
 
 	return nil
 }
@@ -3101,7 +3122,7 @@ func (db *DB) initializeRadixLevels() error {
 
 	// First level: Mark the root page as having one sub-page used
 	rootRadixPage.SubPagesUsed = 1
-	rootRadixPage.dirty = true
+	db.markPageDirty(rootRadixPage)
 
 	// Create root sub-page
 	rootSubPage := &RadixSubPage{
@@ -3138,7 +3159,7 @@ func (db *DB) convertLeafPageToRadixPage(leafPage *LeafPage, newSuffix []byte, n
 		pageNumber:   leafPage.pageNumber,
 		pageType:     ContentTypeRadix,
 		data:         make([]byte, PageSize),
-		dirty:        true,
+		dirty:        false,
 		isWAL:        false,
 		accessTime:   leafPage.accessTime,
 		txnSequence:  leafPage.txnSequence,
@@ -3173,7 +3194,7 @@ func (db *DB) convertLeafPageToRadixPage(leafPage *LeafPage, newSuffix []byte, n
 	}
 
 	// Mark the radix page as dirty
-	radixPage.dirty = true
+	db.markPageDirty(radixPage)
 
 	return nil
 }
@@ -3198,7 +3219,7 @@ func (db *DB) addToFreeSubPagesList(radixPage *RadixPage) {
 	}
 
 	// Mark the page as dirty
-	radixPage.dirty = true
+	db.markPageDirty(radixPage)
 
 	// Make it the new head
 	db.updateFreeSubPagesHead(radixPage)
