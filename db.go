@@ -224,6 +224,7 @@ func Open(path string, options ...Options) (*DB, error) {
 				readOnly = ro
 			}
 		}
+		/*
 		if val, ok := opts["WriteMode"]; ok {
 			if jm, ok := val.(string); ok {
 				if jm == CallerThread_WAL_Sync || jm == CallerThread_WAL_NoSync || jm == WorkerThread_WAL || jm == WorkerThread_NoWAL || jm == WorkerThread_NoWAL_NoSync {
@@ -233,6 +234,7 @@ func Open(path string, options ...Options) (*DB, error) {
 				}
 			}
 		}
+		*/
 	}
 
 	// Open main file with appropriate flags
@@ -374,6 +376,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 	defer db.mutex.Unlock()
 
 	switch name {
+	/*
 	case "WriteMode":
 		if jm, ok := value.(string); ok {
 			if jm == CallerThread_WAL_Sync || jm == CallerThread_WAL_NoSync || jm == WorkerThread_WAL || jm == WorkerThread_NoWAL || jm == WorkerThread_NoWAL_NoSync {
@@ -383,6 +386,7 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			return fmt.Errorf("invalid value for WriteMode option")
 		}
 		return fmt.Errorf("WriteMode option value must be a string")
+	*/
 	default:
 		return fmt.Errorf("unknown or immutable option: %s", name)
 	}
