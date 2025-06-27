@@ -104,6 +104,7 @@ type DB struct {
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
 	indexFileSize  int64 // Track index file size to avoid frequent stat calls
+	prevFileSize   int64 // Track main file size before the current transaction started
 	fileLocked     bool  // Track if the files are locked
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
@@ -2087,11 +2088,19 @@ func (tx *Transaction) Delete(key []byte) error {
 
 // beginTransaction starts a new transaction
 func (db *DB) beginTransaction() {
-	// Increment transaction sequence number
 	db.seqMutex.Lock()
+
+	// Mark the database as in a transaction
 	db.inTransaction = true
+
+	// Increment the transaction sequence number (to track the pages used in the transaction)
 	db.txnSequence++
+
+	// Store the current main file size to enable rollback (to truncate the main file)
+	db.prevFileSize = db.mainFileSize
+
 	db.seqMutex.Unlock()
+
 	debugPrint("Beginning transaction %d\n", db.txnSequence)
 }
 
@@ -2113,7 +2122,19 @@ func (db *DB) commitTransaction() {
 func (db *DB) rollbackTransaction() {
 	debugPrint("Rolling back transaction %d\n", db.txnSequence)
 
-	// Discard pages from this transaction
+	// Truncate the main db file to the stored size before the transaction started
+	if db.mainFileSize > db.prevFileSize {
+		err := db.mainFile.Truncate(db.prevFileSize)
+		if err != nil {
+			debugPrint("Failed to truncate main file: %v\n", err)
+		} else {
+			debugPrint("Truncated main file to size %d\n", db.prevFileSize)
+		}
+		// Update the in-memory file size
+		db.mainFileSize = db.prevFileSize
+	}
+
+	// Discard pages from this transaction (they should be reloaded from the index file)
 	db.discardNewerPages(db.txnSequence)
 
 	db.seqMutex.Lock()
@@ -2134,6 +2155,7 @@ func (db *DB) rollbackTransaction() {
 
 	// PROBLEM: on a crash, the main file can contain uncommitted changes
 	// SOLUTION: do "transactions" virtually, on memory, and only write to disk when the transaction is committed
+	// or use a commit marker, like done in the WAL file
 
 }
 
