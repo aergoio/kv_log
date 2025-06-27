@@ -125,6 +125,9 @@ type DB struct {
 	dirtyPageCount int    // Count of dirty pages in cache
 	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
 	dirtyPageThreshold int // Maximum number of dirty pages before flush
+	workerChannel  chan string // Channel for background worker commands
+	workerWaitGroup sync.WaitGroup // WaitGroup to coordinate with worker thread
+	pendingCommands map[string]bool // Map to track pending worker commands
 }
 
 // Transaction represents a database transaction
@@ -311,6 +314,8 @@ func Open(path string, options ...Options) (*DB, error) {
 		dirtyPageCount:     0,
 		dirtyPageThreshold: dirtyPageThreshold,
 		cacheSizeThreshold: cacheSizeThreshold,
+		workerChannel:      make(chan string, 10), // Buffer size of 10 for commands
+		pendingCommands:    make(map[string]bool), // Initialize the pending commands map
 	}
 
 	// Ensure indexFileSize is properly aligned to page boundaries for existing files
@@ -383,6 +388,11 @@ func Open(path string, options ...Options) (*DB, error) {
 			indexFile.Close()
 			return nil, fmt.Errorf("failed to reindex database: %w", err)
 		}
+	}
+
+	// Start the background worker if not in read-only mode and using worker thread mode
+	if !db.readOnly && db.commitMode == WorkerThread {
+		db.startBackgroundWorker()
 	}
 
 	return db, nil
@@ -548,9 +558,30 @@ func (db *DB) Close() error {
 
 	var mainErr, indexErr, flushErr error
 
+	// Check if already closed
+	if db.mainFile == nil && db.indexFile == nil {
+		return nil // Already closed
+	}
+
 	if !db.readOnly {
-		// Flush the index to disk
-		flushErr = db.flushIndexToDisk()
+		// If using worker thread mode
+		if db.commitMode == WorkerThread {
+			// Signal the worker thread to flush the index to disk, even if
+			// a flush is already running (to flush the remaining pages)
+			db.workerChannel <- "flush"
+
+			// Signal the worker thread to exit
+			db.workerChannel <- "exit"
+
+			// Wait for the worker thread to finish
+			db.workerWaitGroup.Wait()
+
+			// Close the channel
+			close(db.workerChannel)
+		} else {
+			// Flush the index to disk
+			flushErr = db.flushIndexToDisk()
+		}
 	}
 
 	// Close main file if open
@@ -563,11 +594,13 @@ func (db *DB) Close() error {
 		}
 		// Close the file
 		mainErr = db.mainFile.Close()
+		db.mainFile = nil
 	}
 
 	// Close index file if open
 	if db.indexFile != nil {
 		indexErr = db.indexFile.Close()
+		db.indexFile = nil
 	}
 
 	// Return first error encountered
@@ -2226,8 +2259,13 @@ func (db *DB) checkPageCache(isWrite bool) {
 			// Write the pages to the WAL file
 			db.flushIndexToDisk()
 		} else {
-			// Signal the worker thread to flush the pages
-			//db.workerChannel <- "flush"    TODO
+			// Signal the worker thread to flush the pages, if not already signaled
+			db.seqMutex.Lock()
+			if !db.pendingCommands["flush"] {
+				db.pendingCommands["flush"] = true
+				db.workerChannel <- "flush"
+			}
+			db.seqMutex.Unlock()
 		}
 		return
 	}
@@ -2239,8 +2277,13 @@ func (db *DB) checkPageCache(isWrite bool) {
 			// Try to remove the old clean pages from the cache
 			db.removeOldPagesFromCache()
 		} else {
-			// Signal the worker thread to remove the old pages
-			//db.workerChannel <- "clean"    TODO
+			// Signal the worker thread to remove the old pages, if not already signaled
+			db.seqMutex.Lock()
+			if !db.pendingCommands["clean"] {
+				db.pendingCommands["clean"] = true
+				db.workerChannel <- "clean"
+			}
+			db.seqMutex.Unlock()
 		}
 	}
 
@@ -3435,4 +3478,47 @@ func getTotalSystemMemory() int64 {
 	}
 
 	return totalMemory
+}
+
+// startBackgroundWorker starts a background goroutine that listens for commands on the workerChannel
+func (db *DB) startBackgroundWorker() {
+	// Add 1 to the wait group before starting the goroutine
+	db.workerWaitGroup.Add(1)
+
+	go func() {
+		// Ensure the wait group is decremented when the goroutine exits
+		defer db.workerWaitGroup.Done()
+
+		for cmd := range db.workerChannel {
+			switch cmd {
+
+			case "flush":
+				db.flushIndexToDisk()
+				// Clear the pending command flag
+				db.seqMutex.Lock()
+				delete(db.pendingCommands, "flush")
+				db.seqMutex.Unlock()
+
+			case "clean":
+				db.removeOldPagesFromCache()
+				// Clear the pending command flag
+				db.seqMutex.Lock()
+				delete(db.pendingCommands, "clean")
+				db.seqMutex.Unlock()
+
+			case "checkpoint":
+				db.checkpointWAL()
+				// Clear the pending command flag
+				db.seqMutex.Lock()
+				delete(db.pendingCommands, "checkpoint")
+				db.seqMutex.Unlock()
+
+			case "exit":
+				return
+
+			default:
+				debugPrint("Unknown worker command: %s\n", cmd)
+			}
+		}
+	}()
 }
