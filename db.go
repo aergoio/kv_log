@@ -8,7 +8,10 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"os/exec"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -205,6 +208,8 @@ func Open(path string, options ...Options) (*DB, error) {
 	lockType := LockExclusive // Default to use an exclusive lock
 	readOnly := false
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
+	cacheSizeThreshold := calculateDefaultCacheSize()  // Calculate based on system memory
+	dirtyPageThreshold := cacheSizeThreshold / 2       // Default to 50% of cache size
 
 	// Parse options
 	var opts Options
@@ -235,6 +240,16 @@ func Open(path string, options ...Options) (*DB, error) {
 			}
 		}
 		*/
+		if val, ok := opts["CacheSizeThreshold"]; ok {
+			if cst, ok := val.(int); ok && cst > 0 {
+				cacheSizeThreshold = cst
+			}
+		}
+		if val, ok := opts["DirtyPageThreshold"]; ok {
+			if dpt, ok := val.(int); ok && dpt > 0 {
+				dirtyPageThreshold = dpt
+			}
+		}
 	}
 
 	// Open main file with appropriate flags
@@ -284,15 +299,18 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	db := &DB{
-		databaseID:     0, // Will be set on read or initialize
-		filePath:       path,
-		mainFile:       mainFile,
-		indexFile:      indexFile,
-		mainFileSize:   mainFileInfo.Size(),
-		indexFileSize:  indexFileInfo.Size(),
-		readOnly:       readOnly,
-		lockType:       LockNone,
-		pageCache:      make(map[uint32]*Page),
+		databaseID:         0, // Will be set on read or initialize
+		filePath:           path,
+		mainFile:           mainFile,
+		indexFile:          indexFile,
+		mainFileSize:       mainFileInfo.Size(),
+		indexFileSize:      indexFileInfo.Size(),
+		readOnly:           readOnly,
+		lockType:           LockNone,
+		pageCache:          make(map[uint32]*Page),
+		dirtyPageCount:     0,
+		dirtyPageThreshold: dirtyPageThreshold,
+		cacheSizeThreshold: cacheSizeThreshold,
 	}
 
 	// Ensure indexFileSize is properly aligned to page boundaries for existing files
@@ -387,6 +405,24 @@ func (db *DB) SetOption(name string, value interface{}) error {
 		}
 		return fmt.Errorf("WriteMode option value must be a string")
 	*/
+	case "CacheSizeThreshold":
+		if cst, ok := value.(int); ok {
+			if cst > 0 {
+				db.cacheSizeThreshold = cst
+				return nil
+			}
+			return fmt.Errorf("CacheSizeThreshold must be greater than 0")
+		}
+		return fmt.Errorf("CacheSizeThreshold value must be an integer")
+	case "DirtyPageThreshold":
+		if dpt, ok := value.(int); ok {
+			if dpt > 0 {
+				db.dirtyPageThreshold = dpt
+				return nil
+			}
+			return fmt.Errorf("DirtyPageThreshold must be greater than 0")
+		}
+		return fmt.Errorf("DirtyPageThreshold value must be an integer")
 	default:
 		return fmt.Errorf("unknown or immutable option: %s", name)
 	}
@@ -3302,4 +3338,101 @@ func (db *DB) recoverUnindexedContent() error {
 
 	debugPrint("Recovery complete, reindexed content up to offset %d\n", db.mainFileSize)
 	return nil
+}
+
+// calculateDefaultCacheSize calculates the default cache size threshold based on system memory
+// Returns the number of pages that can fit in 20% of the system memory
+func calculateDefaultCacheSize() int {
+	totalMemory := getTotalSystemMemory()
+
+	// Use 20% of total memory for cache
+	cacheMemory := int64(float64(totalMemory) * 0.2)
+
+	// Calculate how many pages fit in the cache memory
+	numPages := int(cacheMemory / PageSize)
+
+	// Ensure we have a reasonable minimum
+	if numPages < 300 {
+		numPages = 300
+	}
+
+	debugPrint("System memory: %d bytes, Cache memory: %d bytes, Cache pages: %d\n",
+		totalMemory, cacheMemory, numPages)
+
+	return numPages
+}
+
+// getTotalSystemMemory returns the total physical memory of the system in bytes
+func getTotalSystemMemory() int64 {
+	var totalMemory int64
+
+	// Try sysctl for BSD-based systems (macOS, FreeBSD, NetBSD, OpenBSD)
+	if runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" ||
+	   runtime.GOOS == "netbsd" || runtime.GOOS == "openbsd" {
+		// Use hw.memsize for macOS, hw.physmem for FreeBSD/NetBSD/OpenBSD
+		var sysctlKey string
+		if runtime.GOOS == "darwin" {
+			sysctlKey = "hw.memsize"
+		} else {
+			sysctlKey = "hw.physmem"
+		}
+
+		cmd := exec.Command("sysctl", "-n", sysctlKey)
+		output, err := cmd.Output()
+		if err == nil {
+			memStr := strings.TrimSpace(string(output))
+			mem, err := strconv.ParseInt(memStr, 10, 64)
+			if err == nil {
+				totalMemory = mem
+			}
+		}
+	} else if runtime.GOOS == "linux" {
+		// For Linux, use /proc/meminfo
+		cmd := exec.Command("grep", "MemTotal", "/proc/meminfo")
+		output, err := cmd.Output()
+		if err == nil {
+			memStr := strings.TrimSpace(string(output))
+			// Format is: "MemTotal:       16384516 kB"
+			fields := strings.Fields(memStr)
+			if len(fields) >= 2 {
+				// Convert from KB to bytes
+				mem, err := strconv.ParseInt(fields[1], 10, 64)
+				if err == nil {
+					totalMemory = mem * 1024 // Convert KB to bytes
+				}
+			}
+		}
+	} else {
+		// For other POSIX systems, try the generic 'free' command
+		cmd := exec.Command("free", "-b")
+		output, err := cmd.Output()
+		if err == nil {
+			lines := strings.Split(string(output), "\n")
+			if len(lines) > 1 {
+				// Parse the second line which contains memory info
+				fields := strings.Fields(lines[1])
+				if len(fields) > 1 {
+					mem, err := strconv.ParseInt(fields[1], 10, 64)
+					if err == nil {
+						totalMemory = mem
+					}
+				}
+			}
+		}
+	}
+
+	// Fallback if we couldn't get system memory or on unsupported platforms
+	if totalMemory <= 0 {
+		// Use runtime memory stats as fallback
+		var mem runtime.MemStats
+		runtime.ReadMemStats(&mem)
+		totalMemory = int64(mem.TotalAlloc)
+
+		// Set a reasonable minimum if we couldn't determine actual memory
+		if totalMemory < 1<<30 { // 1 GB
+			totalMemory = 1 << 30
+		}
+	}
+
+	return totalMemory
 }

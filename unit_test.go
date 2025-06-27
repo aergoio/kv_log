@@ -1,6 +1,8 @@
 package kv_log
 
 import (
+	"fmt"
+	"runtime"
 	"testing"
 )
 
@@ -125,4 +127,93 @@ func TestShouldSkipSubtree(t *testing.T) {
 			t.Errorf("shouldSkipSubtree should skip '%c' with prefix 'key' for range [nil, key4)", b)
 		}
 	}
+}
+
+// TestGetTotalSystemMemory tests the getTotalSystemMemory function
+func TestGetTotalSystemMemory(t *testing.T) {
+	// Call the function
+	totalMemory := getTotalSystemMemory()
+
+	// Verify that we got a reasonable value
+	if totalMemory <= 0 {
+		t.Errorf("getTotalSystemMemory returned non-positive value: %d", totalMemory)
+	}
+
+	// Verify that we got at least 1GB (most modern systems have at least this much)
+	// For embedded systems or very resource-constrained environments, this might need adjustment
+	minMemory := int64(1 << 30) // 1 GB
+	if totalMemory < minMemory {
+		t.Logf("Warning: System memory is less than 1GB: %d bytes (%.2f GB)",
+			totalMemory, float64(totalMemory)/(1<<30))
+
+		// Don't fail the test, but log it as a warning
+		// Some CI environments or embedded systems might have less memory
+	}
+
+	// Log the detected OS and memory size
+	t.Logf("OS: %s, Architecture: %s", runtime.GOOS, runtime.GOARCH)
+
+	// Additional check for specific platforms
+	switch runtime.GOOS {
+	case "darwin":
+		t.Log("macOS detected, using hw.memsize")
+	case "freebsd", "netbsd", "openbsd":
+		t.Log("BSD system detected, using hw.physmem")
+	case "linux":
+		t.Log("Linux detected, using /proc/meminfo")
+	default:
+		t.Logf("Other OS detected: %s, using fallback methods", runtime.GOOS)
+	}
+
+	t.Logf("System memory: %d bytes (%.2f GB)", totalMemory, float64(totalMemory)/(1<<30))
+}
+
+// TestCalculateDefaultCacheSize tests the calculateDefaultCacheSize function
+func TestCalculateDefaultCacheSize(t *testing.T) {
+	// Call the function
+	cacheSize := calculateDefaultCacheSize()
+
+	// Verify that we got a reasonable value
+	if cacheSize <= 0 {
+		t.Errorf("calculateDefaultCacheSize returned non-positive value: %d", cacheSize)
+	}
+
+	// Verify that we got at least the minimum value
+	minCacheSize := 300 // Minimum number of pages
+	if cacheSize < minCacheSize {
+		t.Errorf("calculateDefaultCacheSize returned less than minimum: %d pages", cacheSize)
+	}
+
+	// Calculate the memory size of the cache
+	cacheSizeBytes := int64(cacheSize) * PageSize
+
+	// Get the total system memory
+	totalMemory := getTotalSystemMemory()
+
+	// Verify that the cache size is not more than 30% of total memory
+	// (allowing some flexibility over the 20% target)
+	maxCacheBytes := int64(float64(totalMemory) * 0.3)
+	if cacheSizeBytes > maxCacheBytes {
+		t.Errorf("Cache size too large: %d bytes (%.2f GB), which is more than 30%% of system memory",
+			cacheSizeBytes, float64(cacheSizeBytes)/(1<<30))
+	}
+
+	// Just for informational purposes, print the cache size
+	t.Logf("Cache size: %d pages (%d bytes, %.2f GB)",
+		cacheSize, cacheSizeBytes, float64(cacheSizeBytes)/(1<<30))
+	t.Logf("Cache percentage of system memory: %.2f%%",
+		100*float64(cacheSizeBytes)/float64(totalMemory))
+}
+
+// ExampleCalculateDefaultCacheSize provides an example of using calculateDefaultCacheSize
+func ExampleCalculateDefaultCacheSize() {
+	cacheSize := calculateDefaultCacheSize()
+	cacheSizeBytes := int64(cacheSize) * PageSize
+	totalMemory := getTotalSystemMemory()
+
+	fmt.Printf("System memory: %.2f GB\n", float64(totalMemory)/(1<<30))
+	fmt.Printf("Cache size: %d pages (%.2f GB)\n", cacheSize, float64(cacheSizeBytes)/(1<<30))
+	fmt.Printf("Cache percentage: %.2f%%\n", 100*float64(cacheSizeBytes)/float64(totalMemory))
+
+	// Output varies by system, so don't check output
 }
