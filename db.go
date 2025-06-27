@@ -2017,6 +2017,9 @@ func (db *DB) commitTransaction() {
 func (db *DB) rollbackTransaction() {
 	debugPrint("Rolling back transaction %d\n", db.txnSequence)
 
+	// Discard pages from this transaction
+	db.discardNewerPages(db.txnSequence)
+
 	db.seqMutex.Lock()
 	db.inTransaction = false
 	db.seqMutex.Unlock()
@@ -2214,9 +2217,11 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 
 	// Iterate through all pages in the cache
 	for pageNumber, page := range db.pageCache {
+		// Skip pages from the current transaction
 		// Find the first page that's not from the current transaction
 		var newHead *Page = page
 		for newHead != nil && newHead.txnSequence == currentSeq {
+			db.markPageClean(newHead)  // Just to decrement the dirty page counter
 			newHead = newHead.next
 		}
 		// Update the cache with the new head (or delete if no valid entries remain)
