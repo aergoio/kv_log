@@ -30,9 +30,8 @@ type Iterator struct {
 type radixIterPos struct {
 	pageNumber  uint32 // Page number of the current page
 	pageType    byte   // Type of the current page (radix or leaf)
-	byteValue   int    // Current byte value being processed (0-255)
+	byteValue   int    // Current byte value being processed (0-255, -2 for empty suffix, -1 after empty suffix)
 	subPageIdx  uint8  // Current sub-page index in radix page
-	emptySuffix bool   // Whether we've processed the empty suffix
 	leafLoaded  bool   // Whether we've loaded and sorted the leaf entries
 }
 
@@ -57,7 +56,7 @@ func (db *DB) NewIterator(start, end []byte) *Iterator {
 		it.stack = append(it.stack, radixIterPos{
 			pageNumber: rootSubPage.Page.pageNumber,
 			pageType:   ContentTypeRadix,
-			byteValue:  -1, // Start at -1 so Next() will move to byte 0
+			byteValue:  -2, // -2 indicates we need to process the empty suffix first
 			subPageIdx: rootSubPage.SubPageIdx,
 		})
 
@@ -159,7 +158,9 @@ func (it *Iterator) processRadixPage(pos *radixIterPos) bool {
 	}
 
 	// Check if we need to process the empty suffix
-	if !pos.emptySuffix {
+	if pos.byteValue == -2 {
+		// Mark that we've processed the empty suffix
+		pos.byteValue++
 		// First, check the empty suffix
 		emptySuffixOffset := it.db.getEmptySuffixOffset(subPage)
 		if emptySuffixOffset > 0 {
@@ -171,14 +172,10 @@ func (it *Iterator) processRadixPage(pos *radixIterPos) bool {
 				it.currentValue = content.value
 				it.valid = true
 
-				// Mark that we've processed the empty suffix
-				pos.emptySuffix = true
 				return true
 			}
 		}
 
-		// Mark that we've processed the empty suffix
-		pos.emptySuffix = true
 	}
 
 	// Process next byte value
@@ -213,7 +210,7 @@ func (it *Iterator) processRadixPage(pos *radixIterPos) bool {
 			it.stack = append(it.stack, radixIterPos{
 				pageNumber: nextPageNumber,
 				pageType:   ContentTypeRadix,
-				byteValue:  -1, // Start at -1 so we'll move to byte 0
+				byteValue:  -2, // -2 indicates we need to process the empty suffix first
 				subPageIdx: nextSubPageIdx,
 			})
 			return it.processRadixPage(&it.stack[len(it.stack)-1])
@@ -221,7 +218,6 @@ func (it *Iterator) processRadixPage(pos *radixIterPos) bool {
 			it.stack = append(it.stack, radixIterPos{
 				pageNumber: nextPageNumber,
 				pageType:   ContentTypeLeaf,
-				emptySuffix: true,
 				leafLoaded: false,
 			})
 			return it.processLeafPage(&it.stack[len(it.stack)-1])
@@ -259,7 +255,7 @@ func (it *Iterator) processLeafPage(pos *radixIterPos) bool {
 	content, err := it.db.readContent(entry.dataOffset)
 	if err != nil {
 		// If we can't read the content, move to the next entry
-		it.leafIdx++
+		//it.leafIdx++
 		return it.processLeafPage(pos)
 	}
 
@@ -308,22 +304,25 @@ func (it *Iterator) loadAndSortLeafEntries(pos *radixIterPos) bool {
 // popStackAndTrimPrefix pops the top position from the stack and trims the key prefix
 func (it *Iterator) popStackAndTrimPrefix() {
 	if len(it.stack) > 0 {
+		// Get the last position in the stack
+		lastPos := len(it.stack) - 1
+
 		// If we're popping a leaf page, clear the cached entries
-		if it.stack[len(it.stack)-1].pageType == ContentTypeLeaf {
+		if it.stack[lastPos].pageType == ContentTypeLeaf {
 			it.leafEntries = it.leafEntries[:0]
 			it.leafIdx = -1
 		}
 
 		// If we're popping a radix page and we added a byte to the prefix
-		if it.stack[len(it.stack)-1].pageType == ContentTypeRadix &&
-		   it.stack[len(it.stack)-1].byteValue >= 0 &&
+		if it.stack[lastPos].pageType == ContentTypeRadix &&
+		   it.stack[lastPos].byteValue >= 0 &&
 		   len(it.keyPrefix) > 0 {
 			// Remove the last byte from the key prefix
 			it.keyPrefix = it.keyPrefix[:len(it.keyPrefix)-1]
 		}
 
 		// Pop the stack
-		it.stack = it.stack[:len(it.stack)-1]
+		it.stack = it.stack[:lastPos]
 	}
 }
 
@@ -398,21 +397,19 @@ func (it *Iterator) seekToStart() {
 
 				// Set up the position to continue from this byte
 				pos.byteValue = int(targetByte)
-				pos.emptySuffix = true // We'll check empty suffix when we process this page
 
 				// Push the new page to the stack
 				if page.pageType == ContentTypeRadix {
 					it.stack = append(it.stack, radixIterPos{
 						pageNumber: nextPageNumber,
 						pageType:   ContentTypeRadix,
-						byteValue:  -1,
+						byteValue:  -2, // -2 indicates we need to process the empty suffix first
 						subPageIdx: nextSubPageIdx,
 					})
 				} else if page.pageType == ContentTypeLeaf {
 					it.stack = append(it.stack, radixIterPos{
 						pageNumber: nextPageNumber,
 						pageType:   ContentTypeLeaf,
-						emptySuffix: true,
 						leafLoaded: false,
 					})
 					break
@@ -420,7 +417,6 @@ func (it *Iterator) seekToStart() {
 			} else {
 				// No exact match for this byte, find the next larger byte that has an entry
 				pos.byteValue = int(targetByte) - 1 // Set to one less so Next() will start from targetByte
-				pos.emptySuffix = true // Skip empty suffix since we're looking for >= start
 				break
 			}
 		} else {
