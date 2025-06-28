@@ -109,7 +109,7 @@ type DB struct {
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
 	pageCache      map[uint32]*Page // Cache for all page types
-	freeSubPagesHead *RadixPage // Head of linked list of radix pages with available sub-pages
+	freeSubPagesHead uint32 // Page number of the head of linked list of radix pages with available sub-pages
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
@@ -1314,8 +1314,8 @@ func (db *DB) initializeIndexFile() error {
 		return fmt.Errorf("unexpected root radix page number: %d", rootRadixPage.pageNumber)
 	}
 
-	// Cache this as the head of the free sub-pages list
-	db.freeSubPagesHead = rootRadixPage
+	// Save this page number as the head of the free sub-pages list
+	db.freeSubPagesHead = rootRadixPage.pageNumber
 
 	// Initialize the first two levels of the radix tree
 	if err := db.initializeRadixLevels(); err != nil {
@@ -1464,7 +1464,7 @@ func (db *DB) readIndexFileHeader() error {
 		if err != nil {
 			return fmt.Errorf("failed to get radix page: %w", err)
 		}
-		db.freeSubPagesHead = radixPage
+		db.freeSubPagesHead = radixPage.pageNumber
 	}
 
 	return nil
@@ -1485,8 +1485,8 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 
 	// The page number of the next free sub-page
 	nextFreePageNumber := uint32(0)
-	if !isInit && db.freeSubPagesHead != nil {
-		nextFreePageNumber = db.freeSubPagesHead.pageNumber
+	if !isInit && db.freeSubPagesHead > 0 {
+		nextFreePageNumber = db.freeSubPagesHead
 	}
 
 	// Allocate a buffer for the entire page
@@ -2829,18 +2829,26 @@ func (db *DB) allocateRadixPage() (*RadixPage, error) {
 func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
 
 	// If we have a cached free radix page with available sub-pages
-	if db.freeSubPagesHead != nil && db.freeSubPagesHead.SubPagesUsed < SubPagesPerRadixPage {
+	if db.freeSubPagesHead > 0 {
 		// Get a reference to the radix page
-		radixPage := db.freeSubPagesHead
-
-		// Get a writable version of the page
-		radixPage, err := db.getWritablePage(radixPage)
+		radixPage, err := db.getRadixPage(db.freeSubPagesHead)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get writable page: %w", err)
 		}
 
-		// Update the free sub-pages head
-		db.freeSubPagesHead = radixPage
+		// Check if this page has available sub-pages
+		if radixPage.SubPagesUsed >= SubPagesPerRadixPage {
+			// This page is full, update to next free page
+			db.freeSubPagesHead = radixPage.NextFreePage
+			// Try again recursively
+			return db.allocateRadixSubPage()
+		}
+
+		// Get a writable version of the page
+		radixPage, err = db.getWritablePage(radixPage)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get writable page: %w", err)
+		}
 
 		// Use the next available sub-page index
 		subPageIdx := radixPage.SubPagesUsed
@@ -2862,17 +2870,8 @@ func (db *DB) allocateRadixSubPage() (*RadixSubPage, error) {
 			// Clear the next free page pointer
 			radixPage.NextFreePage = 0
 
-			// Get the next free page and update the head of the free list
-			nextPage := (*RadixPage)(nil)
-			if nextFreePage > 0 {
-				// Load the next free page
-				var err error
-				nextPage, err = db.getRadixPage(nextFreePage)
-				if err != nil {
-					return nil, fmt.Errorf("failed to load next free page: %w", err)
-				}
-			}
-			db.updateFreeSubPagesHead(nextPage)
+			// Update the free sub-pages head to the next free page
+			db.freeSubPagesHead = nextFreePage
 		}
 
 		// Return the new radix sub-page
@@ -3429,13 +3428,13 @@ func (db *DB) addToFreeSubPagesList(radixPage *RadixPage) {
 	}
 
 	// Don't add if it's already the head of the list
-	if db.freeSubPagesHead != nil && db.freeSubPagesHead.pageNumber == radixPage.pageNumber {
+	if db.freeSubPagesHead == radixPage.pageNumber {
 		return
 	}
 
 	// Link this page to the current head
-	if db.freeSubPagesHead != nil {
-		radixPage.NextFreePage = db.freeSubPagesHead.pageNumber
+	if db.freeSubPagesHead > 0 {
+		radixPage.NextFreePage = db.freeSubPagesHead
 	} else {
 		radixPage.NextFreePage = 0
 	}
@@ -3444,19 +3443,7 @@ func (db *DB) addToFreeSubPagesList(radixPage *RadixPage) {
 	db.markPageDirty(radixPage)
 
 	// Make it the new head
-	db.updateFreeSubPagesHead(radixPage)
-}
-
-// updateFreeSubPagesHead updates the in-memory pointer to the head of the free sub-pages list
-// The change will be written to the index header during the next Sync operation
-func (db *DB) updateFreeSubPagesHead(radixPage *RadixPage) {
-	// Don't update if database is in read-only mode
-	if db.readOnly {
-		return
-	}
-
-	// Update the in-memory pointer
-	db.freeSubPagesHead = radixPage
+	db.freeSubPagesHead = radixPage.pageNumber
 }
 
 // recoverUnindexedContent reads the main file starting from the last indexed offset
