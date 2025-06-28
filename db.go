@@ -2333,7 +2333,12 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 		// Find the first page that's not from the current transaction
 		var newHead *Page = page
 		for newHead != nil && newHead.txnSequence == currentSeq {
-			db.markPageClean(newHead)  // Just to decrement the dirty page counter
+			// Only decrement the dirty page counter if the current page is dirty
+			// and the next one isn't (to avoid incorrect counter decrements)
+			if newHead.dirty && (newHead.next == nil || !newHead.next.dirty) {
+				db.dirtyPageCount--
+			}
+			// Move to the next page
 			newHead = newHead.next
 		}
 		// Update the cache with the new head (or delete if no valid entries remain)
