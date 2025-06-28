@@ -584,9 +584,12 @@ func (db *DB) checkpointWAL() error {
 	// Lock the cache during checkpoint
 	//db.walInfo.cacheMutex.Lock()
 
-	// First, sync the WAL file to ensure all changes are persisted
-	if err := db.walInfo.file.Sync(); err != nil {
-		return fmt.Errorf("failed to sync WAL file before checkpoint: %w", err)
+	// If not already synced on walCommit
+	if db.syncMode == SyncOff {
+		// Sync the WAL file to ensure all changes are persisted
+		if err := db.walInfo.file.Sync(); err != nil {
+			return fmt.Errorf("failed to sync WAL file before checkpoint: %w", err)
+		}
 	}
 
 	// Get the start sequence number for the checkpoint
