@@ -38,9 +38,9 @@ const (
 	ContentAlignment = 8
 
 	// Radix page header size
-	RadixHeaderSize = 8
+	RadixHeaderSize = 10  // ContentType(1) + SubPagesUsed(1) + NextFreePage(4) + Checksum(4)
 	// Leaf page header size
-	LeafHeaderSize = 8
+	LeafHeaderSize = 8    // ContentType(1) + Unused(1) + ContentSize(2) + Checksum(4)
 	// Number of sub-pages per radix page
 	SubPagesPerRadixPage = 3
 	// Size of each radix entry (page number + sub-page index)
@@ -1726,13 +1726,13 @@ func (db *DB) parseRadixPage(data []byte, pageNumber uint32) (*RadixPage, error)
 	}
 
 	// Verify CRC32 checksum
-	storedChecksum := binary.BigEndian.Uint32(data[4:8])
+	storedChecksum := binary.BigEndian.Uint32(data[6:10])
 	// Zero out the checksum field for calculation
-	binary.BigEndian.PutUint32(data[4:8], 0)
+	binary.BigEndian.PutUint32(data[6:10], 0)
 	// Calculate the checksum
 	calculatedChecksum := crc32.ChecksumIEEE(data)
 	// Restore the original checksum in the data
-	binary.BigEndian.PutUint32(data[4:8], storedChecksum)
+	binary.BigEndian.PutUint32(data[6:10], storedChecksum)
 	// Verify the checksum
 	if storedChecksum != calculatedChecksum {
 		return nil, fmt.Errorf("radix page checksum mismatch at page %d: stored=%d, calculated=%d", pageNumber, storedChecksum, calculatedChecksum)
@@ -1742,7 +1742,7 @@ func (db *DB) parseRadixPage(data []byte, pageNumber uint32) (*RadixPage, error)
 	subPagesUsed := data[1]
 
 	// Read the next free page number
-	nextFreePage := binary.LittleEndian.Uint32(data[8:12])
+	nextFreePage := binary.LittleEndian.Uint32(data[2:6])
 
 	// Create structured radix page
 	radixPage := &RadixPage{
@@ -1766,16 +1766,16 @@ func (db *DB) writeRadixPage(radixPage *RadixPage) error {
 	radixPage.data[0] = ContentTypeRadix  // Type identifier
 	radixPage.data[1] = radixPage.SubPagesUsed // The number of sub-pages used
 
-	// Store the NextFreePage field at bytes 8-11
-	binary.LittleEndian.PutUint32(radixPage.data[8:12], radixPage.NextFreePage)
+	// Store the NextFreePage field at bytes 2-5
+	binary.LittleEndian.PutUint32(radixPage.data[2:6], radixPage.NextFreePage)
 
 	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
 	// Zero out the checksum field before calculating
-	binary.BigEndian.PutUint32(radixPage.data[4:8], 0)
+	binary.BigEndian.PutUint32(radixPage.data[6:10], 0)
 	// Calculate checksum of the entire page
 	checksum := crc32.ChecksumIEEE(radixPage.data)
-	// Write the checksum at position 4
-	binary.BigEndian.PutUint32(radixPage.data[4:8], checksum)
+	// Write the checksum at position 6
+	binary.BigEndian.PutUint32(radixPage.data[6:10], checksum)
 
 	// Ensure the page number and offset are valid
 	if radixPage.pageNumber == 0 {
@@ -1857,6 +1857,8 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 	if leafPage.pageNumber == 0 {
 		return fmt.Errorf("cannot write leaf page with page number 0")
 	}
+
+	debugPrint("Writing leaf page to index file at page %d\n", leafPage.pageNumber)
 
 	// Write to disk at the specified page number
 	return db.writeIndexPage(leafPage)
@@ -2254,6 +2256,8 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 func (db *DB) clonePage(page *Page) (*Page, error) {
 	var err error
 	var newPage *Page
+
+	debugPrint("Cloning page %d\n", page.pageNumber)
 
 	// Clone based on page type
 	if page.pageType == ContentTypeRadix {
@@ -3386,6 +3390,10 @@ func (db *DB) initializeRadixLevels() error {
 func (db *DB) convertLeafPageToRadixPage(leafPage *LeafPage, newSuffix []byte, newDataOffset int64) error {
 	debugPrint("Converting leaf page %d to radix page\n", leafPage.pageNumber)
 
+	if leafPage.txnSequence != db.txnSequence {
+		return fmt.Errorf("leaf page %d is not in the current transaction", leafPage.pageNumber)
+	}
+
 	// Create a new radix page with the same page number
 	radixPage := &RadixPage{
 		pageNumber:   leafPage.pageNumber,
@@ -3401,6 +3409,7 @@ func (db *DB) convertLeafPageToRadixPage(leafPage *LeafPage, newSuffix []byte, n
 	// Update the cache to replace the leaf page with the radix page
 	db.addToCache(radixPage)
 
+	// Mark the radix page as dirty
 	db.markPageDirty(radixPage)
 
 	// Since we're only using one sub-page initially, add this to the free list
@@ -3427,9 +3436,6 @@ func (db *DB) convertLeafPageToRadixPage(leafPage *LeafPage, newSuffix []byte, n
 	if err := db.setContentOnIndex(radixSubPage, newSuffix, 0, newDataOffset); err != nil {
 		return fmt.Errorf("failed to add new entry to radix page: %w", err)
 	}
-
-	// Mark the radix page as dirty
-	db.markPageDirty(radixPage)
 
 	return nil
 }
