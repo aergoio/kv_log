@@ -1523,3 +1523,275 @@ func TestDatabaseReindex(t *testing.T) {
 	}
 
 }
+
+func TestTransactionRollback(t *testing.T) {
+	// Create a test database
+	dbPath := "test_transaction_rollback.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Create keys with the same prefix to ensure they share radix and leaf pages
+	keyPrefix := "aa"
+	keySuffix := "_some-long-suffix-here-to-consume-a-lot-of-space"
+
+	// Transaction 1: Insert first batch of keys
+	tx1, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction 1: %v", err)
+	}
+
+	// Insert 10 keys in transaction 1
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		value := fmt.Sprintf("value-tx1-%d", i)
+
+		if err := tx1.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set key %s in transaction 1: %v", key, err)
+		}
+	}
+
+	// Commit transaction 1
+	if err := tx1.Commit(); err != nil {
+		t.Fatalf("Failed to commit transaction 1: %v", err)
+	}
+
+	// Transaction 2: Insert second batch of keys
+	tx2, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction 2: %v", err)
+	}
+
+	// Insert 10 more keys in transaction 2
+	for i := 10; i < 20; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		value := fmt.Sprintf("value-tx2-%d", i)
+
+		if err := tx2.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set key %s in transaction 2: %v", key, err)
+		}
+	}
+
+	// Commit transaction 2
+	if err := tx2.Commit(); err != nil {
+		t.Fatalf("Failed to commit transaction 2: %v", err)
+	}
+
+	// Transaction 3: Insert third batch of keys
+	tx3, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction 3: %v", err)
+	}
+
+	// Insert 10 more keys in transaction 3
+	for i := 20; i < 30; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		value := fmt.Sprintf("value-tx3-%d", i)
+
+		if err := tx3.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set key %s in transaction 3: %v", key, err)
+		}
+	}
+
+	// Commit transaction 3
+	if err := tx3.Commit(); err != nil {
+		t.Fatalf("Failed to commit transaction 3: %v", err)
+	}
+
+	// Verify all keys from transactions 1-3 exist
+	for i := 0; i < 30; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		var expectedValue string
+
+		if i < 10 {
+			expectedValue = fmt.Sprintf("value-tx1-%d", i)
+		} else if i < 20 {
+			expectedValue = fmt.Sprintf("value-tx2-%d", i)
+		} else {
+			expectedValue = fmt.Sprintf("value-tx3-%d", i)
+		}
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key %s: %v", key, err)
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key %s: got %s, want %s", key, string(value), expectedValue)
+		}
+	}
+
+	// Transaction 4: This one will be rolled back
+	tx4, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction 4: %v", err)
+	}
+
+	// Insert new keys in transaction 4
+	for i := 30; i < 40; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		value := fmt.Sprintf("value-tx4-%d", i)
+
+		if err := tx4.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set key %s in transaction 4: %v", key, err)
+		}
+	}
+
+	// Modify some existing keys from previous transactions
+	for i := 0; i < 15; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		value := fmt.Sprintf("modified-value-tx4-%d", i)
+
+		if err := tx4.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to modify key %s in transaction 4: %v", key, err)
+		}
+	}
+
+	// Delete some existing keys
+	for i := 15; i < 20; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+
+		if err := tx4.Delete([]byte(key)); err != nil {
+			t.Fatalf("Failed to delete key %s in transaction 4: %v", key, err)
+		}
+	}
+
+	// Verify the changes are visible within the transaction
+	for i := 0; i < 40; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		var expectedValue string
+		var shouldExist bool = true
+
+		if i < 15 {
+			// Modified keys
+			expectedValue = fmt.Sprintf("modified-value-tx4-%d", i)
+		} else if i < 20 {
+			// Deleted keys
+			shouldExist = false
+		} else if i < 30 {
+			// Unmodified keys from transaction 3
+			expectedValue = fmt.Sprintf("value-tx3-%d", i)
+		} else {
+			// New keys from transaction 4
+			expectedValue = fmt.Sprintf("value-tx4-%d", i)
+		}
+
+		value, err := tx4.Get([]byte(key))
+		if !shouldExist {
+			if err == nil {
+				t.Fatalf("Expected key %s to be deleted, but it still exists", key)
+			}
+		} else {
+			if err != nil {
+				t.Fatalf("Failed to get key %s within transaction 4: %v", key, err)
+			}
+
+			if !bytes.Equal(value, []byte(expectedValue)) {
+				t.Fatalf("Value mismatch for key %s within transaction 4: got %s, want %s",
+					key, string(value), expectedValue)
+			}
+		}
+	}
+
+	// Now rollback transaction 4
+	if err := tx4.Rollback(); err != nil {
+		t.Fatalf("Failed to rollback transaction 4: %v", err)
+	}
+
+	// Verify that all changes from transaction 4 are discarded
+	// and all data from transactions 1-3 are preserved
+
+	// Keys from transactions 1-3 should have their original values
+	for i := 0; i < 30; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		var expectedValue string
+
+		if i < 10 {
+			expectedValue = fmt.Sprintf("value-tx1-%d", i)
+		} else if i < 20 {
+			expectedValue = fmt.Sprintf("value-tx2-%d", i)
+		} else {
+			expectedValue = fmt.Sprintf("value-tx3-%d", i)
+		}
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key %s after rollback: %v", key, err)
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key %s after rollback: got %s, want %s",
+				key, string(value), expectedValue)
+		}
+	}
+
+	// New keys from transaction 4 should not exist
+	for i := 30; i < 40; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		_, err := db.Get([]byte(key))
+		if err == nil {
+			t.Fatalf("Key %s from rolled back transaction still exists", key)
+		}
+	}
+
+	// Start a new transaction after rollback
+	tx5, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction 5: %v", err)
+	}
+
+	// Add some new keys in transaction 5
+	for i := 30; i < 35; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		value := fmt.Sprintf("value-tx5-%d", i)
+
+		if err := tx5.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set key %s in transaction 5: %v", key, err)
+		}
+	}
+
+	// Commit transaction 5
+	if err := tx5.Commit(); err != nil {
+		t.Fatalf("Failed to commit transaction 5: %v", err)
+	}
+
+	// Verify all keys from transactions 1-3 and 5 exist with correct values
+	for i := 0; i < 35; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		var expectedValue string
+
+		if i < 10 {
+			expectedValue = fmt.Sprintf("value-tx1-%d", i)
+		} else if i < 20 {
+			expectedValue = fmt.Sprintf("value-tx2-%d", i)
+		} else if i < 30 {
+			expectedValue = fmt.Sprintf("value-tx3-%d", i)
+		} else {
+			expectedValue = fmt.Sprintf("value-tx5-%d", i)
+		}
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key %s after transaction 5: %v", key, err)
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key %s after transaction 5: got %s, want %s",
+				key, string(value), expectedValue)
+		}
+	}
+}
