@@ -3379,7 +3379,7 @@ func (db *DB) convertLeafPageToRadixPage(leafPage *LeafPage, newSuffix []byte, n
 		pageNumber:   leafPage.pageNumber,
 		pageType:     ContentTypeRadix,
 		data:         make([]byte, PageSize),
-		dirty:        false,
+		dirty:        leafPage.dirty,
 		isWAL:        false,
 		accessTime:   leafPage.accessTime,
 		txnSequence:  leafPage.txnSequence,
@@ -3388,6 +3388,8 @@ func (db *DB) convertLeafPageToRadixPage(leafPage *LeafPage, newSuffix []byte, n
 
 	// Update the cache to replace the leaf page with the radix page
 	db.addToCache(radixPage)
+
+	db.markPageDirty(radixPage)
 
 	// Since we're only using one sub-page initially, add this to the free list
 	db.addToFreeSubPagesList(radixPage)
