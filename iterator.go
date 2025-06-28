@@ -283,10 +283,12 @@ func (it *Iterator) loadAndSortLeafEntries(pos *radixIterPos) bool {
 
 	// Load all entries from the leaf page - construct keys from prefix + suffix
 	for _, entry := range leafPage.Entries {
+		// Get the suffix from the leaf page data
+		suffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
 		// Construct the full key from key prefix + suffix
-		fullKey := make([]byte, len(it.keyPrefix)+len(entry.Suffix))
+		fullKey := make([]byte, len(it.keyPrefix)+entry.SuffixLen)
 		copy(fullKey, it.keyPrefix)
-		copy(fullKey[len(it.keyPrefix):], entry.Suffix)
+		copy(fullKey[len(it.keyPrefix):], suffix)
 
 		// Add to our list with the constructed key and data offset
 		it.leafEntries = append(it.leafEntries, leafEntry{

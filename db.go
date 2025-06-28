@@ -177,8 +177,9 @@ type RadixSubPage struct {
 
 // LeafEntry represents an entry in a leaf page
 type LeafEntry struct {
-	Suffix     []byte
-	DataOffset int64
+	SuffixOffset int    // Offset in the data buffer where the suffix starts
+	SuffixLen    int    // Length of the suffix
+	DataOffset   int64  // Offset in the main file where the data starts
 }
 
 // Options represents configuration options for the database
@@ -942,7 +943,10 @@ func (db *DB) setOnLeafPage(leafPage *LeafPage, key []byte, keyPos int, value []
 
 	// Search for the suffix in the leaf page entries
 	for i, entry := range leafPage.Entries {
-		if bytes.Equal(entry.Suffix, suffix) {
+		// Get the suffix from the entry
+		entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
+		// Compare it with the given suffix
+		if bytes.Equal(entrySuffix, suffix) {
 			// Found the entry
 			var content *Content
 
@@ -1164,7 +1168,10 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 
 			// Search for the suffix in the leaf page entries
 			for _, entry := range leafPage.Entries {
-				if bytes.Equal(entry.Suffix, suffix) {
+				// Get the suffix from the entry
+				entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
+				// Compare it with the given suffix
+				if bytes.Equal(entrySuffix, suffix) {
 					// Found the entry, read the content from the main file
 					contentOffset := entry.DataOffset
 
@@ -2230,51 +2237,24 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 // clonePage clones a page
 func (db *DB) clonePage(page *Page) (*Page, error) {
 	var err error
+	var newPage *Page
 
-	// Get a reference to the old page
-	oldPage := page
-
-	/*
-	// Create a new page
-	newPage := &Page{
-		pageNumber: page.pageNumber,
-		pageType:   page.pageType,
-		data:       make([]byte, PageSize),
-		dirty:      false,
-		isWAL:      false,
-		accessTime: page.accessTime,
-		txnSequence: db.txnSequence,
-	}
-	*/
-
-	// Clone the page data
-	data := make([]byte, PageSize)
-	copy(data, page.data)
-
-	// Parse the page
+	// Clone based on page type
 	if page.pageType == ContentTypeRadix {
-		page, err = db.parseRadixPage(data, page.pageNumber)
+		newPage, err = db.cloneRadixPage(page)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse radix page: %w", err)
+			return nil, fmt.Errorf("failed to clone radix page: %w", err)
 		}
 	} else if page.pageType == ContentTypeLeaf {
-		page, err = db.parseLeafPage(data, page.pageNumber)
+		newPage, err = db.cloneLeafPage(page)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse leaf page: %w", err)
+			return nil, fmt.Errorf("failed to clone leaf page: %w", err)
 		}
 	} else {
-		return nil, fmt.Errorf("unknown page type: %d", page.pageType)
+		return nil, fmt.Errorf("unknown page type: %c", page.pageType)
 	}
 
-	// Add to cache  -- already done by parseRadixPage or parseLeafPage
-	//db.addToCache(newPage)  // TODO: make the cache support multiple versions of the same page
-
-	// Update the access time
-	//db.accessCounter++
-	//page.accessTime = db.accessCounter
-	page.accessTime = oldPage.accessTime
-
-	return page, nil
+	return newPage, nil
 }
 
 // markPageDirty marks a page as dirty and increments the dirty page counter
@@ -2904,6 +2884,57 @@ func (db *DB) allocateLeafPage() (*LeafPage, error) {
 	return leafPage, nil
 }
 
+// cloneRadixPage clones a radix page
+func (db *DB) cloneRadixPage(page *RadixPage) (*RadixPage, error) {
+	// Create a new page
+	newPage := &RadixPage{
+		pageNumber:   page.pageNumber,
+		pageType:     page.pageType,
+		data:         make([]byte, PageSize),
+		dirty:        page.dirty,
+		isWAL:        false,
+		accessTime:   page.accessTime,
+		txnSequence:  page.txnSequence,
+		SubPagesUsed: page.SubPagesUsed,
+		NextFreePage: page.NextFreePage,
+	}
+
+	// Copy the data
+	copy(newPage.data, page.data)
+
+	// Add to cache
+	db.addToCache(newPage)
+
+	return newPage, nil
+}
+
+// cloneLeafPage clones a leaf page
+func (db *DB) cloneLeafPage(page *LeafPage) (*LeafPage, error) {
+	// Create a new page with offsets
+	newPage := &LeafPage{
+		pageNumber:   page.pageNumber,
+		pageType:     page.pageType,
+		data:         make([]byte, PageSize),
+		dirty:        page.dirty,
+		isWAL:        false,
+		accessTime:   page.accessTime,
+		txnSequence:  page.txnSequence,
+		ContentSize:  page.ContentSize,
+		Entries:      make([]LeafEntry, len(page.Entries)),
+	}
+
+	// Copy the data
+	copy(newPage.data, page.data)
+
+	// Copy the entries (since they're just offsets and lengths, we can copy them directly)
+	copy(newPage.Entries, page.Entries)
+
+	// Add to cache
+	db.addToCache(newPage)
+
+	return newPage, nil
+}
+
 // ------------------------------------------------------------------------------------------------
 // Leaf entries
 // ------------------------------------------------------------------------------------------------
@@ -2925,8 +2956,8 @@ func (db *DB) parseLeafEntries(leafPage *LeafPage) ([]LeafEntry, error) {
 		suffixLen := int(suffixLen64)
 		pos += bytesRead
 
-		// Get suffix as a slice of the page data
-		suffix := leafPage.data[pos:pos+suffixLen]
+		// Store the suffix offset and length
+		suffixOffset := pos
 		pos += suffixLen
 
 		// Read data offset
@@ -2935,8 +2966,9 @@ func (db *DB) parseLeafEntries(leafPage *LeafPage) ([]LeafEntry, error) {
 
 		// Add entry to list
 		entries = append(entries, LeafEntry{
-			Suffix:     suffix,
-			DataOffset: dataOffset,
+			SuffixOffset: suffixOffset,
+			SuffixLen:    suffixLen,
+			DataOffset:   dataOffset,
 		})
 	}
 
@@ -2985,8 +3017,9 @@ func (db *DB) addLeafEntry(leafPage *LeafPage, suffix []byte, dataOffset int64) 
 
 	// Add to entries list
 	leafPage.Entries = append(leafPage.Entries, LeafEntry{
-		Suffix:     leafPage.data[suffixPos:suffixPos+suffixLen],
-		DataOffset: dataOffset,
+		SuffixOffset: suffixPos,
+		SuffixLen:    suffixLen,
+		DataOffset:   dataOffset,
 	})
 
 	// Mark page as dirty
@@ -3084,24 +3117,27 @@ func (db *DB) rebuildLeafPageData(leafPage *LeafPage) {
 	pos := int(LeafHeaderSize)
 
 	for _, entry := range leafPage.Entries {
+		// Get the suffix from the old data buffer
+		suffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
+
 		// Write suffix length
-		suffixLen := len(entry.Suffix)
-		suffixLenWritten := varint.Write(newData[pos:], uint64(suffixLen))
+		suffixLenWritten := varint.Write(newData[pos:], uint64(entry.SuffixLen))
 		pos += suffixLenWritten
 
 		// Write suffix to new data
 		suffixPos := pos
-		copy(newData[pos:], entry.Suffix)
-		pos += suffixLen
+		copy(newData[pos:], suffix)
+		pos += entry.SuffixLen
 
 		// Write data offset
 		binary.LittleEndian.PutUint64(newData[pos:], uint64(entry.DataOffset))
 		pos += 8
 
-		// Add to new entries list with suffix as slice of new data
+		// Add to new entries list with updated offset
 		newEntries = append(newEntries, LeafEntry{
-			Suffix:     newData[suffixPos:suffixPos+suffixLen],
-			DataOffset: entry.DataOffset,
+			SuffixOffset: suffixPos,
+			SuffixLen:    entry.SuffixLen,
+			DataOffset:   entry.DataOffset,
 		})
 	}
 
@@ -3311,19 +3347,20 @@ func (db *DB) convertLeafPageToRadixPage(leafPage *LeafPage, newSuffix []byte, n
 		SubPageIdx: 0,
 	}
 
-	// Add the new entry to the collection of entries we need to redistribute
-	entries := append(leafPage.Entries, LeafEntry{
-		Suffix:     newSuffix,
-		DataOffset: newDataOffset,
-	})
-
-	// Process all entries from the leaf page plus the new entry
-	for _, entry := range entries {
+	// Process all existing entries from the leaf page
+	for _, entry := range leafPage.Entries {
+		// Get the suffix from the entry
+		suffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
 		// Add it to the newly created radix sub-page
 		// The first byte of the suffix determines which branch to take
-		if err := db.setContentOnIndex(radixSubPage, entry.Suffix, 0, entry.DataOffset); err != nil {
+		if err := db.setContentOnIndex(radixSubPage, suffix, 0, entry.DataOffset); err != nil {
 			return fmt.Errorf("failed to convert leaf page to radix page: %w", err)
 		}
+	}
+
+	// Process the new entry separately
+	if err := db.setContentOnIndex(radixSubPage, newSuffix, 0, newDataOffset); err != nil {
+		return fmt.Errorf("failed to add new entry to radix page: %w", err)
 	}
 
 	// Mark the radix page as dirty
