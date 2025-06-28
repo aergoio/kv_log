@@ -2115,6 +2115,9 @@ func (db *DB) beginTransaction() {
 func (db *DB) commitTransaction() {
 	debugPrint("Committing transaction %d\n", db.txnSequence)
 
+	// Discard previous versions of pages modified in this transaction
+	db.discardTxnPageVersions()
+
 	db.seqMutex.Lock()
 	db.inTransaction = false
 	db.seqMutex.Unlock()
@@ -2414,6 +2417,46 @@ func (db *DB) discardOldPageVersions(keepWAL bool) {
 
 		// Terminate the chain
 		pagesToKeep[len(pagesToKeep)-1].next = nil
+	}
+}
+
+// discardTxnPageVersions removes previous versions of dirty pages from the current transaction
+// It only iterates over pages from the current transaction sequence
+func (db *DB) discardTxnPageVersions() {
+	db.cacheMutex.Lock()
+	defer db.cacheMutex.Unlock()
+
+	// Get the current transaction sequence
+	currentTxnSeq := db.txnSequence
+
+	// Iterate through all pages in the cache
+	for _, entry := range db.pageCache {
+		// Skip if there's no entry or no next pointer
+		if entry == nil || entry.next == nil {
+			continue
+		}
+
+		// Only process pages from the current transaction
+		if entry.txnSequence != currentTxnSeq {
+			continue
+		}
+
+		// Start with the current page and iterate through its linked list
+		current := entry
+
+		// Process the linked list
+		for current != nil && current.next != nil {
+			next := current.next
+
+			// If the next page is not WAL and not in flushSequence, it can be removed
+			if !next.isWAL && (db.flushSequence == 0 || next.txnSequence > db.flushSequence) {
+				// Skip this page by pointing to the one after it
+				current.next = next.next
+			} else {
+				// Move to the next page
+				current = current.next
+			}
+		}
 	}
 }
 
