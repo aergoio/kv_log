@@ -900,6 +900,11 @@ func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, d
 			return fmt.Errorf("failed to set empty suffix offset: %w", err)
 		}
 
+		// If the above function cloned the page, update the subPage pointer
+		if childSubPage.Page.pageNumber == subPage.Page.pageNumber {
+			subPage.Page = childSubPage.Page
+		}
+
 		// Update the radix entry to point to the new radix page
 		err = db.setRadixEntry(subPage, byteValue, childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
 		if err != nil {
@@ -917,6 +922,10 @@ func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, d
 		if err != nil {
 			return fmt.Errorf("failed to add leaf entry: %w", err)
 		}
+
+		// Update the subPage pointer, because the above function
+		// could have cloned the same radix page used on this subPage
+		subPage.Page, _ = db.getRadixPage(subPage.Page.pageNumber)
 
 		// Update the radix entry to point to the new leaf page
 		err = db.setRadixEntry(subPage, byteValue, leafPage.pageNumber, 0)
@@ -3276,6 +3285,9 @@ func (db *DB) setEmptySuffixOffset(subPage *RadixSubPage, offset int64) error {
 	if err != nil {
 		return err
 	}
+
+	// Update the subPage pointer to point to the new page
+	subPage.Page = radixPage
 
 	// Calculate the offset for the empty suffix in the page data
 	// Each sub-page has 256 entries of 5 bytes each, followed by an 8-byte empty suffix offset
