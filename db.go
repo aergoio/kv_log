@@ -2217,6 +2217,10 @@ func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	if db.flushSequence != 0 && page.txnSequence <= db.flushSequence {
 		needsClone = true
 	}
+	// If the page is not part of the current transaction, we need to clone it
+	if page.txnSequence != db.txnSequence {
+		needsClone = true
+	}
 
 	// If the page needs to be cloned, clone it
 	if needsClone {
