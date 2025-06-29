@@ -1795,3 +1795,1096 @@ func TestTransactionRollback(t *testing.T) {
 		}
 	}
 }
+
+func TestSharedPrefixKeys(t *testing.T) {
+	// Create a test database
+	dbPath := "test_shared_prefix.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Test the specific problematic patterns mentioned in the issue:
+	// "abc"⇄"ab", "acd"⇄"ac", "ghi"⇄"gh"
+
+	// Test Case 1: Insert 3-byte key first, then its 2-byte prefix
+	err = db.Set([]byte("ab"), []byte("value-ab"))
+	if err != nil {
+		t.Fatalf("Failed to set 'ab': %v", err)
+	}
+
+	err = db.Set([]byte("abc"), []byte("value-abc"))
+	if err != nil {
+		t.Fatalf("Failed to set 'abc': %v", err)
+	}
+
+	// Verify both keys exist
+	val, err := db.Get([]byte("abc"))
+	if err != nil {
+		t.Fatalf("Failed to get 'abc': %v", err)
+	}
+	if !bytes.Equal(val, []byte("value-abc")) {
+		t.Fatalf("Value mismatch for 'abc': got %s, want %s", string(val), "value-abc")
+	}
+
+	val, err = db.Get([]byte("ab"))
+	if err != nil {
+		t.Fatalf("Failed to get 'ab': %v", err)
+	}
+	if !bytes.Equal(val, []byte("value-ab")) {
+		t.Fatalf("Value mismatch for 'ab': got %s, want %s", string(val), "value-ab")
+	}
+
+	// Test Case 2: Insert 2-byte key first, then its 3-byte extension
+	err = db.Set([]byte("acd"), []byte("value-acd"))
+	if err != nil {
+		t.Fatalf("Failed to set 'acd': %v", err)
+	}
+
+	err = db.Set([]byte("ac"), []byte("value-ac"))
+	if err != nil {
+		t.Fatalf("Failed to set 'ac': %v", err)
+	}
+
+	// Verify both keys exist
+	val, err = db.Get([]byte("acd"))
+	if err != nil {
+		t.Fatalf("Failed to get 'acd': %v", err)
+	}
+	if !bytes.Equal(val, []byte("value-acd")) {
+		t.Fatalf("Value mismatch for 'acd': got %s, want %s", string(val), "value-acd")
+	}
+
+	val, err = db.Get([]byte("ac"))
+	if err != nil {
+		t.Fatalf("Failed to get 'ac': %v", err)
+	}
+	if !bytes.Equal(val, []byte("value-ac")) {
+		t.Fatalf("Value mismatch for 'ac': got %s, want %s", string(val), "value-ac")
+	}
+
+	// Test Case 3: Insert 3-byte key first, then its 2-byte prefix (different pattern)
+	err = db.Set([]byte("gh"), []byte("value-gh"))
+	if err != nil {
+		t.Fatalf("Failed to set 'gh': %v", err)
+	}
+
+	err = db.Set([]byte("ghi"), []byte("value-ghi"))
+	if err != nil {
+		t.Fatalf("Failed to set 'ghi': %v", err)
+	}
+
+	// Verify both keys exist
+	val, err = db.Get([]byte("ghi"))
+	if err != nil {
+		t.Fatalf("Failed to get 'ghi': %v", err)
+	}
+	if !bytes.Equal(val, []byte("value-ghi")) {
+		t.Fatalf("Value mismatch for 'ghi': got %s, want %s", string(val), "value-ghi")
+	}
+
+	val, err = db.Get([]byte("gh"))
+	if err != nil {
+		t.Fatalf("Failed to get 'gh': %v", err)
+	}
+	if !bytes.Equal(val, []byte("value-gh")) {
+		t.Fatalf("Value mismatch for 'gh': got %s, want %s", string(val), "value-gh")
+	}
+
+	// Test all keys with iterator to make sure they're all present
+	it := db.NewIterator(nil, nil)
+	defer it.Close()
+
+	expectedKeys := []string{"ab", "abc", "ac", "acd", "gh", "ghi"}
+	expectedValues := []string{"value-ab", "value-abc", "value-ac", "value-acd", "value-gh", "value-ghi"}
+
+	foundKeys := make(map[string]string)
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+		foundKeys[key] = value
+		it.Next()
+	}
+
+	// Verify all expected keys were found
+	for i, expectedKey := range expectedKeys {
+		foundValue, exists := foundKeys[expectedKey]
+		if !exists {
+			t.Fatalf("Key '%s' was not found by iterator", expectedKey)
+		}
+		if foundValue != expectedValues[i] {
+			t.Fatalf("Value mismatch for key '%s': got %s, want %s", expectedKey, foundValue, expectedValues[i])
+		}
+	}
+
+	// Verify we didn't find any unexpected keys
+	if len(foundKeys) != len(expectedKeys) {
+		t.Fatalf("Iterator found %d keys, expected %d. Found keys: %v, Expected: %v", len(foundKeys), len(expectedKeys), foundKeys, expectedKeys)
+	}
+}
+
+func TestSharedPrefixKeysStress(t *testing.T) {
+	// Create a test database with limited index pages to force more page splits
+	dbPath := "test_shared_prefix_stress.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database with limited main index pages to force more reorganization
+	db, err := Open(dbPath, Options{"MainIndexPages": 1})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Create many keys with shared prefixes to stress the radix tree
+	type testCase struct {
+		longKey  string
+		shortKey string
+		order    string // "long_first" or "short_first"
+	}
+
+	testCases := []testCase{
+		// 2-byte prefix, 3-byte extension
+		{"abc", "ab", "long_first"},
+		{"abd", "ab", "short_first"},
+		{"acd", "ac", "long_first"},
+		{"ace", "ac", "short_first"},
+		{"def", "de", "long_first"},
+		{"deg", "de", "short_first"},
+		{"ghi", "gh", "long_first"},
+		{"ghj", "gh", "short_first"},
+		{"jkl", "jk", "long_first"},
+		{"jkm", "jk", "short_first"},
+		{"mno", "mn", "long_first"},
+		{"mnp", "mn", "short_first"},
+
+		// 3-byte prefix, 4-byte extension
+		{"abcd", "abc", "long_first"},
+		{"abce", "abc", "short_first"},
+		{"defg", "def", "long_first"},
+		{"defh", "def", "short_first"},
+		{"ghij", "ghi", "long_first"},
+		{"ghik", "ghi", "short_first"},
+
+		// 1-byte prefix, 2-byte extension
+		{"xy", "x", "long_first"},
+		{"xz", "x", "short_first"},
+		{"yz", "y", "long_first"},
+		{"ya", "y", "short_first"},
+		{"za", "z", "long_first"},
+		{"zb", "z", "short_first"},
+	}
+
+	// Track all keys we insert
+	insertedKeys := make(map[string]string)
+
+	// Insert keys according to their specified order
+	for i, tc := range testCases {
+		longValue := fmt.Sprintf("long-value-%d", i)
+		shortValue := fmt.Sprintf("short-value-%d", i)
+
+		if tc.order == "long_first" {
+			// Insert long key first, then short key
+			err = db.Set([]byte(tc.longKey), []byte(longValue))
+			if err != nil {
+				t.Fatalf("Failed to set long key '%s': %v", tc.longKey, err)
+			}
+			insertedKeys[tc.longKey] = longValue
+
+			err = db.Set([]byte(tc.shortKey), []byte(shortValue))
+			if err != nil {
+				t.Fatalf("Failed to set short key '%s': %v", tc.shortKey, err)
+			}
+			insertedKeys[tc.shortKey] = shortValue
+		} else {
+			// Insert short key first, then long key
+			err = db.Set([]byte(tc.shortKey), []byte(shortValue))
+			if err != nil {
+				t.Fatalf("Failed to set short key '%s': %v", tc.shortKey, err)
+			}
+			insertedKeys[tc.shortKey] = shortValue
+
+			err = db.Set([]byte(tc.longKey), []byte(longValue))
+			if err != nil {
+				t.Fatalf("Failed to set long key '%s': %v", tc.longKey, err)
+			}
+			insertedKeys[tc.longKey] = longValue
+		}
+
+		// Verify both keys exist after each insertion
+		val, err := db.Get([]byte(tc.longKey))
+		if err != nil {
+			t.Fatalf("Failed to get long key '%s' after insertion %d: %v", tc.longKey, i, err)
+		}
+		if !bytes.Equal(val, []byte(longValue)) {
+			t.Fatalf("Value mismatch for long key '%s' after insertion %d: got %s, want %s",
+				tc.longKey, i, string(val), longValue)
+		}
+
+		val, err = db.Get([]byte(tc.shortKey))
+		if err != nil {
+			t.Fatalf("Failed to get short key '%s' after insertion %d: %v", tc.shortKey, i, err)
+		}
+		if !bytes.Equal(val, []byte(shortValue)) {
+			t.Fatalf("Value mismatch for short key '%s' after insertion %d: got %s, want %s",
+				tc.shortKey, i, string(val), shortValue)
+		}
+	}
+
+	// Verify all keys are still accessible
+	for key, expectedValue := range insertedKeys {
+		val, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key '%s' in final verification: %v", key, err)
+		}
+		if !bytes.Equal(val, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key '%s' in final verification: got %s, want %s",
+				key, string(val), expectedValue)
+		}
+	}
+
+	// Use iterator to verify all keys are present
+	it := db.NewIterator(nil, nil)
+	defer it.Close()
+
+	foundKeys := make(map[string]string)
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+		foundKeys[key] = value
+		it.Next()
+	}
+
+	// Verify all inserted keys were found by iterator
+	for key, expectedValue := range insertedKeys {
+		foundValue, exists := foundKeys[key]
+		if !exists {
+			t.Fatalf("Key '%s' was not found by iterator", key)
+		}
+		if foundValue != expectedValue {
+			t.Fatalf("Iterator value mismatch for key '%s': got %s, want %s",
+				key, foundValue, expectedValue)
+		}
+	}
+
+	// Verify iterator didn't find any unexpected keys
+	if len(foundKeys) != len(insertedKeys) {
+		t.Fatalf("Iterator found %d keys, expected %d. Found: %v, Expected: %v",
+			len(foundKeys), len(insertedKeys), foundKeys, insertedKeys)
+	}
+
+	// Test persistence by closing and reopening
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	reopenedDb, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer reopenedDb.Close()
+
+	// Verify all keys still exist after reopening
+	for key, expectedValue := range insertedKeys {
+		val, err := reopenedDb.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key '%s' after reopen: %v", key, err)
+		}
+		if !bytes.Equal(val, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key '%s' after reopen: got %s, want %s",
+				key, string(val), expectedValue)
+		}
+	}
+}
+
+func TestSharedPrefixKeyOrdering(t *testing.T) {
+	// This test reproduces the exact bug found in TestShortKeys
+	// Using the insertion order that caused the failure:
+	// [gh acd def ghi a e ac ef b d ij ab abc jkl mno c cd abd]
+
+	// Create a test database
+	dbPath := "test_shared_prefix_ordering.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Use the exact insertion order that caused the failure
+	insertOrder := []struct {
+		key   string
+		value string
+	}{
+		{"gh", "two-byte-value-4"},
+		{"acd", "three-byte-value-2"},
+		{"def", "three-byte-value-3"},
+		{"ghi", "three-byte-value-4"},
+		{"a", "one-byte-value-0"},
+		{"e", "one-byte-value-4"},
+		{"ac", "two-byte-value-1"},
+		{"ef", "two-byte-value-3"},
+		{"b", "one-byte-value-1"},
+		{"d", "one-byte-value-3"},
+		{"ij", "two-byte-value-5"},
+		{"ab", "two-byte-value-0"},
+		{"abc", "three-byte-value-0"},  // This key failed to be retrieved
+		{"jkl", "three-byte-value-5"},
+		{"mno", "three-byte-value-6"},
+		{"c", "one-byte-value-2"},
+		{"cd", "two-byte-value-2"},
+		{"abd", "three-byte-value-1"},
+	}
+
+	// Track all inserted keys
+	allKeys := make(map[string]string)
+
+	// Insert keys in the exact order that caused the failure
+	for i, kv := range insertOrder {
+		err = db.Set([]byte(kv.key), []byte(kv.value))
+		if err != nil {
+			t.Fatalf("Failed to set '%s' at step %d: %v", kv.key, i, err)
+		}
+		allKeys[kv.key] = kv.value
+
+		// After each insertion, verify that previously inserted keys still exist
+		for prevKey, prevValue := range allKeys {
+			val, err := db.Get([]byte(prevKey))
+			if err != nil {
+				t.Fatalf("Key '%s' disappeared after inserting '%s' (step %d): %v",
+					prevKey, kv.key, i, err)
+			}
+			if !bytes.Equal(val, []byte(prevValue)) {
+				t.Fatalf("Value mismatch for key '%s' after inserting '%s' (step %d): got %s, want %s",
+					prevKey, kv.key, i, string(val), prevValue)
+			}
+		}
+	}
+
+	// Final verification - check all keys exist
+	for key, expectedValue := range allKeys {
+		val, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key '%s' in final verification: %v", key, err)
+		}
+		if !bytes.Equal(val, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key '%s': got %s, want %s",
+				key, string(val), expectedValue)
+		}
+	}
+
+	// Use iterator to verify all keys are present
+	it := db.NewIterator(nil, nil)
+	defer it.Close()
+
+	foundKeys := make(map[string]string)
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+		foundKeys[key] = value
+		it.Next()
+	}
+
+	// Verify all keys were found by iterator
+	for key, expectedValue := range allKeys {
+		foundValue, exists := foundKeys[key]
+		if !exists {
+			t.Fatalf("Key '%s' not found by iterator", key)
+		}
+		if foundValue != expectedValue {
+			t.Fatalf("Iterator value mismatch for key '%s': got %s, want %s",
+				key, foundValue, expectedValue)
+		}
+	}
+}
+
+// printPageTraversalInfo prints detailed information about the page traversal for a given key
+func printPageTraversalInfo(db *DB, key []byte) {
+	fmt.Printf("Traversing key: '%s' (bytes: %v)\n", string(key), key)
+
+	// Start with the root radix sub-page
+	rootSubPage, err := db.getRootRadixSubPage()
+	if err != nil {
+		fmt.Printf("ERROR: Failed to get root radix sub-page: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Root page: %d, sub-page: %d\n", rootSubPage.Page.pageNumber, rootSubPage.SubPageIdx)
+
+	// Process the key byte by byte
+	currentSubPage := rootSubPage
+	keyPos := 0
+
+	// Traverse the radix trie until we reach a leaf page or the end of the key
+	for keyPos < len(key) {
+		// Get the current byte from the key
+		byteValue := key[keyPos]
+		fmt.Printf("Processing byte %d: '%c' (0x%02x)\n", keyPos, byteValue, byteValue)
+
+		// Get the next page number and sub-page index from the current sub-page
+		nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
+		fmt.Printf("  Radix entry for byte 0x%02x: page=%d, subPage=%d\n", byteValue, nextPageNumber, nextSubPageIdx)
+
+		// If there's no entry for this byte, the key doesn't exist yet
+		if nextPageNumber == 0 {
+			fmt.Printf("  No entry found for byte 0x%02x - key path doesn't exist\n", byteValue)
+			return
+		}
+
+		// There's an entry for this byte, load the page
+		page, err := db.getPage(nextPageNumber)
+		if err != nil {
+			fmt.Printf("  ERROR: Failed to load page %d: %v\n", nextPageNumber, err)
+			return
+		}
+
+		// Check what type of page we got
+		if page.pageType == ContentTypeRadix {
+			fmt.Printf("  Found radix page %d, continuing to sub-page %d\n", nextPageNumber, nextSubPageIdx)
+			// It's a radix page, continue traversing
+			currentSubPage = &RadixSubPage{
+				Page:       page,
+				SubPageIdx: nextSubPageIdx,
+			}
+			keyPos++
+		} else if page.pageType == ContentTypeLeaf {
+			fmt.Printf("  Found leaf page %d\n", nextPageNumber)
+			// It's a leaf page, check its entries
+			leafPage := page
+			suffix := key[keyPos+1:]
+			fmt.Printf("  Looking for suffix: '%s' (bytes: %v)\n", string(suffix), suffix)
+			fmt.Printf("  Leaf page has %d entries:\n", len(leafPage.Entries))
+
+			for i, entry := range leafPage.Entries {
+				entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
+				fmt.Printf("    Entry %d: suffix='%s' (bytes: %v), dataOffset=%d\n",
+					i, string(entrySuffix), entrySuffix, entry.DataOffset)
+			}
+			return
+		} else {
+			fmt.Printf("  ERROR: Invalid page type: %c\n", page.pageType)
+			return
+		}
+	}
+
+	// We've processed all bytes of the key
+	// Check if there's an empty suffix in the current sub-page
+	emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
+	fmt.Printf("Empty suffix offset in current sub-page: %d\n", emptySuffixOffset)
+}
+
+func TestLeafPageToRadixPageConversion(t *testing.T) {
+	// Create a test database
+	dbPath := "test_leaf_to_radix_conversion.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Use the same prefix as TestTransactionRollback to ensure keys share the same path
+	keyPrefix := "aa"
+	keySuffix := "_some-long-suffix-here-to-consume-a-lot-of-space-and-fill-up-the-leaf-page-quickly"
+
+	// Helper function to get page information for a key
+	getPageInfo := func(key []byte) (uint32, byte, uint16, int, error) {
+		// Navigate to the page containing this key
+		rootSubPage, err := db.getRootRadixSubPage()
+		if err != nil {
+			return 0, 0, 0, 0, err
+		}
+
+		currentSubPage := rootSubPage
+		keyPos := 0
+
+		// Traverse the radix trie until we reach a leaf page
+		for keyPos < len(key) {
+			byteValue := key[keyPos]
+			nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
+
+			if nextPageNumber == 0 {
+				return 0, 0, 0, 0, fmt.Errorf("key path doesn't exist")
+			}
+
+			page, err := db.getPage(nextPageNumber)
+			if err != nil {
+				return 0, 0, 0, 0, err
+			}
+
+			if page.pageType == ContentTypeLeaf {
+				// Found the leaf page
+				leafPage := page
+				return leafPage.pageNumber, leafPage.pageType, leafPage.ContentSize, len(leafPage.Entries), nil
+			} else if page.pageType == ContentTypeRadix {
+				// Continue traversing
+				currentSubPage = &RadixSubPage{
+					Page:       page,
+					SubPageIdx: nextSubPageIdx,
+				}
+				keyPos++
+			} else {
+				return 0, 0, 0, 0, fmt.Errorf("invalid page type: %c", page.pageType)
+			}
+		}
+
+		// Check if there's an empty suffix in the current sub-page
+		emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
+		if emptySuffixOffset != 0 {
+			// The key exists as an empty suffix in a radix page
+			return currentSubPage.Page.pageNumber, currentSubPage.Page.pageType, 0, 0, nil
+		}
+
+		return 0, 0, 0, 0, fmt.Errorf("key not found")
+	}
+
+	// Helper function to check if a specific page is a radix page
+	checkPageType := func(pageNumber uint32) (byte, error) {
+		page, err := db.getPage(pageNumber)
+		if err != nil {
+			return 0, err
+		}
+		return page.pageType, nil
+	}
+
+	// Phase 1: Fill up a leaf page
+	var keyCount int
+	var firstPageNumber uint32
+	var conversionDetected bool
+	var conversionKeyIndex int
+
+	// Insert keys until we detect the conversion
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		value := fmt.Sprintf("value-%d", i)
+
+		err = db.Set([]byte(key), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set key %s: %v", key, err)
+		}
+
+		// Get page information for this key
+		pageNumber, _, _, _, err := getPageInfo([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get page info for key %s: %v", key, err)
+		}
+
+		// Remember the first page number
+		if i == 0 {
+			firstPageNumber = pageNumber
+		}
+
+		// Check if the page number changed (indicating conversion happened)
+		if i > 0 && pageNumber != firstPageNumber && !conversionDetected {
+			// Check if the original page is now a radix page
+			originalPageType, err := checkPageType(firstPageNumber)
+			if err != nil {
+				t.Fatalf("Failed to check original page type: %v", err)
+			}
+
+			if originalPageType == ContentTypeRadix {
+				conversionDetected = true
+				conversionKeyIndex = i
+			}
+		}
+
+		keyCount = i + 1
+
+		// Stop after we detect conversion and add a few more keys
+		if conversionDetected && i > conversionKeyIndex + 5 {
+			break
+		}
+	}
+
+	if !conversionDetected {
+		t.Fatalf("Expected leaf page to be converted to radix page, but conversion was not detected after %d keys", keyCount)
+	}
+
+	// Phase 2: Verify the conversion created the expected structure
+	// Get the radix page that was converted
+	page, err := db.getPage(firstPageNumber)
+	if err != nil {
+		t.Fatalf("Failed to get converted radix page: %v", err)
+	}
+
+	if page.pageType != ContentTypeRadix {
+		t.Fatalf("Expected radix page, got %c", page.pageType)
+	}
+
+	// Count how many leaf pages were created after the conversion
+	leafPageCount := 0
+	leafPages := make(map[uint32]bool)
+
+	// Check each key to see which leaf pages they ended up in
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		pageNumber, pageType, _, _, err := getPageInfo([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get page info for key %s after conversion: %v", key, err)
+		}
+
+		if pageType == ContentTypeLeaf {
+			if !leafPages[pageNumber] {
+				leafPages[pageNumber] = true
+				leafPageCount++
+			}
+		}
+	}
+
+	// Phase 3: Verify all keys are still accessible
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		expectedValue := fmt.Sprintf("value-%d", i)
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key %s after conversion: %v", key, err)
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key %s after conversion: got %s, want %s",
+				key, string(value), expectedValue)
+		}
+	}
+
+	// Phase 4: Test persistence
+
+	// Close and reopen the database
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	reopenedDb, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer reopenedDb.Close()
+
+	// Verify all keys still exist after reopening
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		expectedValue := fmt.Sprintf("value-%d", i)
+
+		value, err := reopenedDb.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key %s after reopen: %v", key, err)
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key %s after reopen: got %s, want %s",
+				key, string(value), expectedValue)
+		}
+	}
+
+	// Phase 5: Test iterator after conversion
+
+	it := reopenedDb.NewIterator(nil, nil)
+	defer it.Close()
+
+	foundKeys := make(map[string]string)
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+		foundKeys[key] = value
+		it.Next()
+	}
+
+	// Verify all keys were found by iterator
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
+		expectedValue := fmt.Sprintf("value-%d", i)
+
+		foundValue, exists := foundKeys[key]
+		if !exists {
+			t.Fatalf("Key %s not found by iterator after conversion", key)
+		}
+		if foundValue != expectedValue {
+			t.Fatalf("Iterator value mismatch for key %s: got %s, want %s",
+				key, foundValue, expectedValue)
+		}
+	}
+
+	// Verify iterator didn't find any unexpected keys
+	if len(foundKeys) != keyCount {
+		t.Fatalf("Iterator found %d keys, expected %d", len(foundKeys), keyCount)
+	}
+}
+
+func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
+	// Create a test database
+	dbPath := "test_leaf_to_radix_conversion_similar.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Use keys that are very similar at the beginning but differ only at the end
+	// This will test how the radix tree handles keys with long common prefixes
+	//keyPrefix := "user_profile_data_very_long_common_prefix_here_"
+	//keySuffix := "_with_some_additional_content_to_make_entries_larger"
+	keyPrefix := "prefix"
+	keySuffix := "_with_some_additional_content_to_make_entries_larger-user_profile_data_very_long_common_here_"
+
+	// Helper function to get page information for a key
+	getPageInfo := func(key []byte) (uint32, byte, uint16, int, error) {
+		// Navigate to the page containing this key
+		rootSubPage, err := db.getRootRadixSubPage()
+		if err != nil {
+			return 0, 0, 0, 0, err
+		}
+
+		currentSubPage := rootSubPage
+		keyPos := 0
+
+		// Traverse the radix trie until we reach a leaf page
+		for keyPos < len(key) {
+			byteValue := key[keyPos]
+			nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
+
+			if nextPageNumber == 0 {
+				return 0, 0, 0, 0, fmt.Errorf("key path doesn't exist")
+			}
+
+			page, err := db.getPage(nextPageNumber)
+			if err != nil {
+				return 0, 0, 0, 0, err
+			}
+
+			if page.pageType == ContentTypeLeaf {
+				// Found the leaf page
+				leafPage := page
+				return leafPage.pageNumber, leafPage.pageType, leafPage.ContentSize, len(leafPage.Entries), nil
+			} else if page.pageType == ContentTypeRadix {
+				// Continue traversing
+				currentSubPage = &RadixSubPage{
+					Page:       page,
+					SubPageIdx: nextSubPageIdx,
+				}
+				keyPos++
+			} else {
+				return 0, 0, 0, 0, fmt.Errorf("invalid page type: %c", page.pageType)
+			}
+		}
+
+		// Check if there's an empty suffix in the current sub-page
+		emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
+		if emptySuffixOffset != 0 {
+			// The key exists as an empty suffix in a radix page
+			return currentSubPage.Page.pageNumber, currentSubPage.Page.pageType, 0, 0, nil
+		}
+
+		return 0, 0, 0, 0, fmt.Errorf("key not found")
+	}
+
+	// Helper function to check if a specific page is a radix page
+	checkPageType := func(pageNumber uint32) (byte, error) {
+		page, err := db.getPage(pageNumber)
+		if err != nil {
+			return 0, err
+		}
+		return page.pageType, nil
+	}
+
+	// Phase 1: Fill up a leaf page with very similar keys
+	var keyCount int
+	var firstPageNumber uint32
+	var conversionDetected bool
+	var conversionKeyIndex int
+
+	// Insert keys that differ only at the end - this tests radix tree efficiency
+	// with long common prefixes
+	for i := 0; i < 200; i++ { // Increase limit since similar keys might pack differently
+		// Create keys that are identical except for the number at the end
+		// Format: "user_profile_data_very_long_common_prefix_here_000001_with_some_additional_content_to_make_entries_larger"
+		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
+		value := fmt.Sprintf("user_data_%d", i)
+
+		err = db.Set([]byte(key), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set key %s: %v", key, err)
+		}
+
+		// Get page information for this key
+		pageNumber, _, _, _, err := getPageInfo([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get page info for key %s: %v", key, err)
+		}
+
+		// Remember the first page number
+		if i == 0 {
+			firstPageNumber = pageNumber
+		}
+
+		// Check if the page number changed (indicating conversion happened)
+		if i > 0 && pageNumber != firstPageNumber && !conversionDetected {
+			// Check if the original page is now a radix page
+			originalPageType, err := checkPageType(firstPageNumber)
+			if err != nil {
+				t.Fatalf("Failed to check original page type: %v", err)
+			}
+
+			if originalPageType == ContentTypeRadix {
+				conversionDetected = true
+				conversionKeyIndex = i
+			}
+		}
+
+		keyCount = i + 1
+
+		// Stop after we detect conversion and add a few more keys
+		if conversionDetected && i > conversionKeyIndex + 5 {
+			break
+		}
+	}
+
+	if !conversionDetected {
+		t.Fatalf("Expected leaf page to be converted to radix page, but conversion was not detected after %d keys", keyCount)
+	}
+
+	// Phase 2: Analyze how similar keys are distributed after conversion
+	// Get the radix page that was converted
+	page, err := db.getPage(firstPageNumber)
+	if err != nil {
+		t.Fatalf("Failed to get converted radix page: %v", err)
+	}
+
+	if page.pageType != ContentTypeRadix {
+		t.Fatalf("Expected radix page, got %c", page.pageType)
+	}
+
+	// Count how many leaf pages were created and analyze key distribution
+	leafPageCount := 0
+	leafPages := make(map[uint32][]int) // page number -> list of key indices
+
+	// Check each key to see which leaf pages they ended up in
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
+		pageNumber, pageType, _, _, err := getPageInfo([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get page info for key %s after conversion: %v", key, err)
+		}
+
+		if pageType == ContentTypeLeaf {
+			if _, exists := leafPages[pageNumber]; !exists {
+				leafPages[pageNumber] = make([]int, 0)
+				leafPageCount++
+			}
+			leafPages[pageNumber] = append(leafPages[pageNumber], i)
+		}
+	}
+
+	// Phase 3: Verify all keys are still accessible
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
+		expectedValue := fmt.Sprintf("user_data_%d", i)
+
+		value, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key %s after conversion: %v", key, err)
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key %s after conversion: got %s, want %s",
+				key, string(value), expectedValue)
+		}
+	}
+
+	// Phase 4: Test range queries on similar keys
+
+	// Test range query from key 10 to key 20
+	startKey := fmt.Sprintf("%s%06d%s", keyPrefix, 10, keySuffix)
+	endKey := fmt.Sprintf("%s%06d%s", keyPrefix, 20, keySuffix)
+
+	it := db.NewIterator([]byte(startKey), []byte(endKey))
+	defer it.Close()
+
+	rangeCount := 0
+	expectedRange := make(map[string]bool)
+	for i := 10; i < 20; i++ {
+		if i < keyCount {
+			key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
+			expectedRange[key] = true
+		}
+	}
+
+	for it.Valid() {
+		key := string(it.Key())
+		if !expectedRange[key] {
+			t.Fatalf("Range iterator returned unexpected key: %s", key)
+		}
+		rangeCount++
+		it.Next()
+	}
+
+	if rangeCount != len(expectedRange) {
+		t.Fatalf("Range iterator found %d keys, expected %d", rangeCount, len(expectedRange))
+	}
+
+	// Phase 4B: Test iterator on similar keys
+
+	it2 := db.NewIterator(nil, nil)
+	defer it2.Close()
+
+	foundKeys := make(map[string]string)
+	for it2.Valid() {
+		key := string(it2.Key())
+		value := string(it2.Value())
+		foundKeys[key] = value
+		it2.Next()
+	}
+
+	// Verify all keys were found by iterator
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
+		expectedValue := fmt.Sprintf("user_data_%d", i)
+
+		foundValue, exists := foundKeys[key]
+		if !exists {
+			t.Fatalf("Key %s not found by iterator after conversion", key)
+		}
+		if foundValue != expectedValue {
+			t.Fatalf("Iterator value mismatch for key %s: got %s, want %s",
+				key, foundValue, expectedValue)
+		}
+	}
+
+	// Verify iterator didn't find any unexpected keys
+	if len(foundKeys) != keyCount {
+		t.Fatalf("Iterator found %d keys, expected %d", len(foundKeys), keyCount)
+	}
+
+	// Phase 5: Test persistence
+
+	// Close and reopen the database
+	if err := db.Close(); err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	reopenedDb, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+	defer reopenedDb.Close()
+
+	// Verify all keys still exist after reopening
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
+		expectedValue := fmt.Sprintf("user_data_%d", i)
+
+		value, err := reopenedDb.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key %s after reopen: %v", key, err)
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Value mismatch for key %s after reopen: got %s, want %s",
+				key, string(value), expectedValue)
+		}
+	}
+
+	// Phase 6: Verify all keys are accessible via Get() after reopen
+
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
+		expectedValue := fmt.Sprintf("user_data_%d", i)
+
+		value, err := reopenedDb.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get key %s via Get() after reopen: %v", key, err)
+		}
+
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Fatalf("Get() value mismatch for key %s after reopen: got %s, want %s",
+				key, string(value), expectedValue)
+		}
+	}
+
+	// Phase 7: Test iterator on similar keys after reopen
+
+	it2 = reopenedDb.NewIterator(nil, nil)
+	defer it2.Close()
+
+	foundKeys = make(map[string]string)
+	for it2.Valid() {
+		key := string(it2.Key())
+		value := string(it2.Value())
+		foundKeys[key] = value
+		it2.Next()
+	}
+
+	// Verify all keys were found by iterator
+	for i := 0; i < keyCount; i++ {
+		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
+		expectedValue := fmt.Sprintf("user_data_%d", i)
+
+		foundValue, exists := foundKeys[key]
+		if !exists {
+			t.Fatalf("Key %s not found by iterator after conversion", key)
+		}
+		if foundValue != expectedValue {
+			t.Fatalf("Iterator value mismatch for key %s: got %s, want %s",
+				key, foundValue, expectedValue)
+		}
+	}
+
+	// Verify iterator didn't find any unexpected keys
+	if len(foundKeys) != keyCount {
+		t.Fatalf("Iterator found %d keys, expected %d", len(foundKeys), keyCount)
+	}
+}
