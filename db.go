@@ -132,6 +132,8 @@ type DB struct {
 	workerChannel  chan string // Channel for background worker commands
 	workerWaitGroup sync.WaitGroup // WaitGroup to coordinate with worker thread
 	pendingCommands map[string]bool // Map to track pending worker commands
+	originalLockType int // Original lock type before transaction
+	lockAcquiredForTransaction bool // Whether lock was acquired for transaction
 }
 
 // Transaction represents a database transaction
@@ -702,18 +704,6 @@ func (db *DB) Set(key, value []byte) error {
 
 // Internal function to set a key-value pair in the database
 func (db *DB) set(key, value []byte) error {
-
-	// If not already exclusively locked
-	if db.lockType != LockExclusive {
-		// Remember the original lock type
-		originalLockType := db.lockType
-		// Acquire a write lock
-		if err := db.acquireWriteLock(); err != nil {
-			return fmt.Errorf("failed to acquire write lock: %w", err)
-		}
-		// Release the lock on exit
-		defer db.releaseWriteLock(originalLockType)
-	}
 
 	// Start with the root radix sub-page
 	rootSubPage, err := db.getRootRadixSubPage()
@@ -2153,6 +2143,19 @@ func (tx *Transaction) Delete(key []byte) error {
 
 // beginTransaction starts a new transaction
 func (db *DB) beginTransaction() {
+
+	// If not already exclusively locked, acquire write lock for transaction
+	if db.lockType != LockExclusive {
+		// Remember the original lock type
+		db.originalLockType = db.lockType
+		// Acquire a write lock
+		if err := db.acquireWriteLock(); err != nil {
+			// This is a critical error that should be handled by the caller
+			panic(fmt.Sprintf("failed to acquire write lock for transaction: %v", err))
+		}
+		db.lockAcquiredForTransaction = true
+	}
+
 	db.seqMutex.Lock()
 
 	// Mark the database as in a transaction
@@ -2187,6 +2190,14 @@ func (db *DB) commitTransaction() {
 	// Discard previous versions of pages modified in this transaction
 	db.discardTxnPageVersions()
 
+	// Release transaction lock if it was acquired for this transaction
+	if db.lockAcquiredForTransaction {
+		if err := db.releaseWriteLock(db.originalLockType); err != nil {
+			debugPrint("Failed to release transaction lock: %v\n", err)
+		}
+		db.lockAcquiredForTransaction = false
+	}
+
 	db.seqMutex.Lock()
 	db.inTransaction = false
 	db.seqMutex.Unlock()
@@ -2215,6 +2226,14 @@ func (db *DB) rollbackTransaction() {
 
 	// Discard pages from this transaction (they should be reloaded from the index file)
 	db.discardNewerPages(db.txnSequence)
+
+	// Release transaction lock if it was acquired for this transaction
+	if db.lockAcquiredForTransaction {
+		if err := db.releaseWriteLock(db.originalLockType); err != nil {
+			debugPrint("Failed to release transaction lock: %v\n", err)
+		}
+		db.lockAcquiredForTransaction = false
+	}
 
 	db.seqMutex.Lock()
 	db.inTransaction = false
