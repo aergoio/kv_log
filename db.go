@@ -2559,8 +2559,8 @@ func (db *DB) removeOldPagesFromCache() {
 
 	// Collect removable pages
 	for pageNumber, page := range db.pageCache {
-		// Skip dirty pages and WAL pages
-		if page.dirty || page.isWAL {
+		// Skip dirty pages, WAL pages, and pages from the current transaction
+		if page.dirty || page.isWAL || page.txnSequence == db.txnSequence {
 			continue
 		}
 
@@ -2592,8 +2592,8 @@ func (db *DB) removeOldPagesFromCache() {
 
 		// Double-check the page still exists and is still removable
 		if page, exists := db.pageCache[pageNumber]; exists {
-			// Skip if the page is dirty or WAL
-			if page.dirty || page.isWAL {
+			// Skip if the page is dirty, WAL, or from the current transaction
+			if page.dirty || page.isWAL || page.txnSequence == db.txnSequence {
 				continue
 			}
 
