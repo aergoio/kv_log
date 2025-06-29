@@ -684,7 +684,9 @@ func (db *DB) copyWALPagesToIndexFile() error {
 	// Copy pages to the index file in sorted order
 	for _, pageNumber := range pageNumbers {
 		// Get the head of the linked list for this page number
+		db.cacheMutex.RLock()
 		headPage := db.pageCache[pageNumber]
+		db.cacheMutex.RUnlock()
 
 		// Find the first WAL page in the linked list
 		var walPage *Page = nil

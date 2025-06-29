@@ -2811,7 +2811,10 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 	// Process pages in order
 	for _, pageNumber := range pageNumbers {
 		// Get the page from the cache (it can be modified by another thread)
+		db.cacheMutex.RLock()
 		page := db.pageCache[pageNumber]
+		db.cacheMutex.RUnlock()
+
 		// Find the first version of the page that was modified up to the flush sequence
 		for ; page != nil; page = page.next {
 			if page.txnSequence <= db.flushSequence {
