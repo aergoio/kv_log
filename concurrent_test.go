@@ -59,9 +59,12 @@ func TestConcurrentAccess(t *testing.T) {
 				key := fmt.Sprintf("init-key-%d", j)
 				value, err := db.Get([]byte(key))
 				if err != nil {
-					errMutex.Lock()
-					errors = append(errors, fmt.Sprintf("Reader %d failed to get key %s: %v", id, key, err))
-					errMutex.Unlock()
+					// "key not found" is acceptable due to concurrent deletion
+					if err.Error() != "key not found" {
+						errMutex.Lock()
+						errors = append(errors, fmt.Sprintf("Reader %d failed to get key %s: %v", id, key, err))
+						errMutex.Unlock()
+					}
 				} else {
 					expectedPrefix := "init-value-"
 					if !bytes.HasPrefix(value, []byte(expectedPrefix)) {
@@ -138,19 +141,28 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 
 	// Verify the database is still functional
-	// Try to read some keys that should still exist
+	// Try to read initial keys - some might have been deleted by concurrent deleters
+	keysFound := 0
 	for i := 0; i < 10; i++ {
-		if i % 5 == 0 {
-			// These keys might have been deleted
-			continue
-		}
-
 		key := fmt.Sprintf("init-key-%d", i)
-		_, err := db.Get([]byte(key))
+		value, err := db.Get([]byte(key))
 		if err != nil {
-			// Key might have been deleted during concurrent operations - this is expected
+			if err.Error() != "key not found" {
+				t.Errorf("Unexpected error reading initial key %s after concurrent operations: %v", key, err)
+			}
+			// "key not found" is expected for some keys due to concurrent deletion
 			continue
 		}
+		keysFound++
+		expectedValue := fmt.Sprintf("init-value-%d", i)
+		if !bytes.Equal(value, []byte(expectedValue)) {
+			t.Errorf("Value mismatch for initial key %s: got %s, want %s", key, string(value), expectedValue)
+		}
+	}
+
+	// We should find at least some initial keys (not all should be deleted)
+	if keysFound == 0 {
+		t.Errorf("All initial keys were deleted - this is unexpected")
 	}
 
 	// Try to write and read a new key
