@@ -53,9 +53,10 @@ const (
 
 // Content types
 const (
-	ContentTypeData  = 'D' // Data content type
-	ContentTypeRadix = 'R' // Radix page type
-	ContentTypeLeaf  = 'L' // Leaf page type
+	ContentTypeData   = 'D' // Data content type
+	ContentTypeCommit = 'C' // Commit marker type
+	ContentTypeRadix  = 'R' // Radix page type
+	ContentTypeLeaf   = 'L' // Leaf page type
 )
 
 // Lock types
@@ -122,6 +123,7 @@ type DB struct {
 	calledByTransaction bool // Track if the method was called by a transaction
 	txnSequence    int64  // Current transaction sequence number
 	flushSequence  int64  // Current flush up to this transaction sequence number
+	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  uint64 // Counter for page access times
 	dirtyPageCount int    // Count of dirty pages in cache
 	cacheSizeThreshold int // Maximum number of pages in cache before cleanup
@@ -1580,6 +1582,9 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 		return 0, fmt.Errorf("failed to write content: %w", err)
 	}
 
+	// Update the running transaction checksum
+	db.txnChecksum = crc32.Update(db.txnChecksum, crc32.IEEETable, content)
+
 	// Update the file size
 	newFileSize := fileSize + int64(totalSize)
 	db.mainFileSize = newFileSize
@@ -1588,6 +1593,35 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 
 	// Return the offset where the content was written
 	return fileSize, nil
+}
+
+// appendCommitMarker appends a commit marker to the end of the main file
+// The commit marker consists of:
+// - 1 byte: ContentTypeCommit ('C')
+// - 4 bytes: CRC32 checksum of all transaction data since the last commit
+func (db *DB) appendCommitMarker() error {
+	// Use the running transaction checksum
+	checksum := db.txnChecksum
+
+	// Prepare the commit marker buffer (1 byte type + 4 bytes checksum)
+	commitMarker := make([]byte, 5)
+	commitMarker[0] = ContentTypeCommit
+	binary.BigEndian.PutUint32(commitMarker[1:5], checksum)
+
+	// Write the commit marker to the end of the file
+	if _, err := db.mainFile.Write(commitMarker); err != nil {
+		return fmt.Errorf("failed to write commit marker: %w", err)
+	}
+
+	// Update the file size
+	db.mainFileSize += 5
+
+	// Reset the transaction checksum for the next transaction
+	db.txnChecksum = 0
+
+	debugPrint("Appended commit marker at offset %d with checksum %d\n", db.mainFileSize-5, checksum)
+
+	return nil
 }
 
 // readContent reads content from a specific offset in the file
@@ -1685,6 +1719,19 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 		// Set key and value as slices that reference the original buffer
 		content.key = buffer[keyOffset:keyOffset+keyLength]
 		content.value = buffer[valueOffset:valueOffset+valueLength]
+	} else if contentType == ContentTypeCommit {
+		// Read commit marker (1 byte type + 4 bytes checksum)
+		buffer := make([]byte, 5)
+		n, err := db.mainFile.ReadAt(buffer, offset)
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("failed to read commit marker: %w", err)
+		}
+		if n < 5 {
+			return nil, fmt.Errorf("incomplete commit marker")
+		}
+
+		// Store the commit marker data
+		content.data = buffer
 	} else {
 		return nil, fmt.Errorf("unknown content type on main file: %c", contentType)
 	}
@@ -2117,6 +2164,9 @@ func (db *DB) beginTransaction() {
 	// Store the current main file size to enable rollback (to truncate the main file)
 	db.prevFileSize = db.mainFileSize
 
+	// Reset the transaction checksum
+	db.txnChecksum = 0
+
 	db.seqMutex.Unlock()
 
 	debugPrint("Beginning transaction %d\n", db.txnSequence)
@@ -2125,6 +2175,14 @@ func (db *DB) beginTransaction() {
 // commitTransaction commits the current transaction
 func (db *DB) commitTransaction() {
 	debugPrint("Committing transaction %d\n", db.txnSequence)
+
+	// Write commit marker to the main file if data was written in this transaction
+	if !db.readOnly && db.mainFileSize > db.prevFileSize {
+		if err := db.appendCommitMarker(); err != nil {
+			debugPrint("Failed to write commit marker: %v\n", err)
+			// Continue with commit even if marker fails
+		}
+	}
 
 	// Discard previous versions of pages modified in this transaction
 	db.discardTxnPageVersions()
@@ -3468,6 +3526,7 @@ func (db *DB) addToFreeSubPagesList(radixPage *RadixPage) {
 
 // recoverUnindexedContent reads the main file starting from the last indexed offset
 // and reindexes any content that hasn't been indexed yet
+// It also checks for commit markers and discards any uncommitted data
 func (db *DB) recoverUnindexedContent() error {
 
 	lastIndexedOffset := db.lastIndexedOffset
@@ -3484,6 +3543,28 @@ func (db *DB) recoverUnindexedContent() error {
 
 	debugPrint("Recovering unindexed content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize)
 
+	// First pass: Find the last valid commit marker and truncate file if needed
+	validFileSize, err := db.findLastValidCommit(lastIndexedOffset)
+	if err != nil {
+		return fmt.Errorf("failed to find last valid commit: %w", err)
+	}
+
+	// If we need to truncate the file due to uncommitted data
+	if validFileSize < db.mainFileSize {
+		debugPrint("Truncating main file from %d to %d due to uncommitted data\n", db.mainFileSize, validFileSize)
+		if !db.readOnly {
+			if err := db.mainFile.Truncate(validFileSize); err != nil {
+				return fmt.Errorf("failed to truncate main file: %w", err)
+			}
+		}
+		db.mainFileSize = validFileSize
+	}
+
+	// If there's nothing to recover after truncation
+	if lastIndexedOffset >= db.mainFileSize {
+		return nil
+	}
+
 	// Initialize the transaction sequence
 	db.txnSequence = 1
 
@@ -3493,10 +3574,9 @@ func (db *DB) recoverUnindexedContent() error {
 		return fmt.Errorf("failed to get root radix sub-page: %w", err)
 	}
 
-	// Start reading from the last indexed offset
+	// Second pass: Process all committed data
 	currentOffset := lastIndexedOffset
 
-	// Process all content until we reach the end of the file
 	for currentOffset < db.mainFileSize {
 		// Read the content at the current offset
 		content, err := db.readContent(currentOffset)
@@ -3504,13 +3584,14 @@ func (db *DB) recoverUnindexedContent() error {
 			return fmt.Errorf("failed to read content at offset %d: %w", currentOffset, err)
 		}
 
-		// Only process data content
 		if content.data[0] == ContentTypeData {
 			// Set the key-value pair on the index
 			err := db.setKvOnIndex(rootSubPage, content.key, content.value, currentOffset)
 			if err != nil {
 				return fmt.Errorf("failed to set kv on index: %w", err)
 			}
+		} else if content.data[0] == ContentTypeCommit {
+			// Do nothing, we've already processed the commit marker
 		}
 
 		// Move to the next content
@@ -3526,6 +3607,65 @@ func (db *DB) recoverUnindexedContent() error {
 
 	debugPrint("Recovery complete, reindexed content up to offset %d\n", db.mainFileSize)
 	return nil
+}
+
+// findLastValidCommit scans the file from the given offset to find the last valid commit marker
+// and returns the file size that should be used (truncating any uncommitted data)
+func (db *DB) findLastValidCommit(startOffset int64) (int64, error) {
+	currentOffset := startOffset
+	lastValidOffset := startOffset
+	runningChecksum := uint32(0)
+
+	for currentOffset < db.mainFileSize {
+		// Read the content type first
+		typeBuffer := make([]byte, 1)
+		if _, err := db.mainFile.ReadAt(typeBuffer, currentOffset); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return 0, fmt.Errorf("failed to read content type at offset %d: %w", currentOffset, err)
+		}
+
+		contentType := typeBuffer[0]
+
+		if contentType == ContentTypeData {
+			// Read the full data content to get its size and update checksum
+			content, err := db.readContent(currentOffset)
+			if err != nil {
+				// If we can't read the content, it's likely corrupted or incomplete
+				debugPrint("Failed to read data content at offset %d: %v\n", currentOffset, err)
+				break
+			}
+			// Update running checksum with this data content
+			runningChecksum = crc32.Update(runningChecksum, crc32.IEEETable, content.data)
+			currentOffset += int64(len(content.data))
+		} else if contentType == ContentTypeCommit {
+			// Read the checksum from the commit marker
+			checksum := make([]byte, 4)
+			if _, err := db.mainFile.ReadAt(checksum, currentOffset + 1); err != nil {
+				debugPrint("Failed to read checksum at offset %d: %v\n", currentOffset + 1, err)
+				break
+			}
+			// Extract the stored checksum
+			storedChecksum := binary.BigEndian.Uint32(checksum)
+			// Verify checksum matches our running checksum
+			if storedChecksum != runningChecksum {
+				debugPrint("Invalid commit marker at offset %d: checksum mismatch expected %d, got %d\n", currentOffset, runningChecksum, storedChecksum)
+				break
+			}
+			// This is a valid commit, update our last valid position
+			currentOffset += 5 // Commit marker is always 5 bytes
+			lastValidOffset = currentOffset
+			// Reset running checksum for next transaction
+			runningChecksum = 0
+		} else {
+			// Unknown content type, stop processing
+			debugPrint("Unknown content type '%c' at offset %d\n", contentType, currentOffset)
+			break
+		}
+	}
+
+	return lastValidOffset, nil
 }
 
 // calculateDefaultCacheSize calculates the default cache size threshold based on system memory
