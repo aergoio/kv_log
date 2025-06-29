@@ -2724,8 +2724,14 @@ func (db *DB) flushIndexToDisk() error {
 	db.seqMutex.Unlock()
 
 	// Flush all dirty pages
-	if err := db.flushDirtyIndexPages(); err != nil {
+	pagesWritten, err := db.flushDirtyIndexPages()
+	if err != nil {
 		return fmt.Errorf("failed to flush dirty pages: %w", err)
+	}
+
+	// If no pages were written, abort the flush
+	if pagesWritten == 0 {
+		return nil
 	}
 
 	// Write index header
@@ -2779,10 +2785,11 @@ func (db *DB) flushAllIndexPages() error {
 */
 
 // flushDirtyIndexPages writes all dirty pages to disk
-func (db *DB) flushDirtyIndexPages() error {
+// Returns the number of dirty pages that were written to disk
+func (db *DB) flushDirtyIndexPages() (int, error) {
 
 	if db.flushSequence == 0 {
-		return fmt.Errorf("flush sequence is not set")
+		return 0, fmt.Errorf("flush sequence is not set")
 	}
 
 	// Get all page numbers using just a read lock
@@ -2798,6 +2805,9 @@ func (db *DB) flushDirtyIndexPages() error {
 		return pageNumbers[i] < pageNumbers[j]
 	})
 
+	// Track the number of pages written
+	pagesWritten := 0
+
 	// Process pages in order
 	for _, pageNumber := range pageNumbers {
 		// Get the page from the cache (it can be modified by another thread)
@@ -2812,17 +2822,18 @@ func (db *DB) flushDirtyIndexPages() error {
 		if page != nil && page.dirty {
 			if page.pageType == ContentTypeRadix {
 				if err := db.writeRadixPage(page); err != nil {
-					return err
+					return pagesWritten, err
 				}
 			} else if page.pageType == ContentTypeLeaf {
 				if err := db.writeLeafPage(page); err != nil {
-					return err
+					return pagesWritten, err
 				}
 			}
+			pagesWritten++
 		}
 	}
 
-	return nil
+	return pagesWritten, nil
 }
 
 // ------------------------------------------------------------------------------------------------
