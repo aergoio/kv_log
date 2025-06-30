@@ -2378,8 +2378,12 @@ func (db *DB) markPageClean(page *Page) {
 // This function should not return an error, it can log an error and continue
 func (db *DB) checkPageCache(isWrite bool) {
 
-	// If the amount of dirty pages is above the threshold, flush it
+	// If the amount of dirty pages is above the threshold, flush them to disk
 	if isWrite && db.dirtyPageCount >= db.dirtyPageThreshold {
+		// If already flushed up to the current transaction, skip
+		if db.inTransaction && db.flushSequence == db.txnSequence - 1 {
+			return
+		}
 		// Check which thread should flush the pages
 		if db.commitMode == CallerThread {
 			// Write the pages to the WAL file
