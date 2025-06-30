@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDatabaseBasicOperations(t *testing.T) {
@@ -2887,4 +2888,216 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 	if len(foundKeys) != keyCount {
 		t.Fatalf("Iterator found %d keys, expected %d", len(foundKeys), keyCount)
 	}
+}
+
+func TestBackgroundWorkerDeadlock(t *testing.T) {
+	// This test is designed to trigger a deadlock between the caller thread
+	// and the background worker thread by forcing frequent background operations
+	// while the caller thread is performing database operations
+
+	dbPath := "test_background_deadlock.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open database with extremely low thresholds to force immediate background worker activity
+	db, err := Open(dbPath, Options{
+		"CacheSizeThreshold":   2,    // Extremely low - force cache cleanup after 2 pages
+		"DirtyPageThreshold":   1,    // Force flush after every single dirty page
+		"CheckpointThreshold":  256,  // Very small checkpoint threshold (256 bytes)
+	})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Verify we're using WorkerThread mode (background worker should be active)
+	t.Logf("Database opened, background worker should be active")
+
+	// Create keys that will force page creation and background activity
+	// Each operation should trigger background worker due to low thresholds
+	keySuffix := "_deadlock_test_key_with_long_suffix_to_consume_space"
+	valuePrefix := "deadlock_test_value_with_very_long_content_to_make_pages_fill_up_quickly_and_trigger_background_worker_activity_"
+
+	// Do direct database operations that should trigger background worker
+	// Each Set() should trigger background worker due to DirtyPageThreshold=1
+	for i := 0; i < 1000; i++ {
+		key := fmt.Sprintf("%d%s", i, keySuffix)
+		value := fmt.Sprintf("%s%d", valuePrefix, i)
+
+		// Set operation - this should trigger background worker immediately
+		err = db.Set([]byte(key), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set key %d: %v", i, err)
+		}
+
+		// Immediately try to read it back while background worker might be active
+		_, err = db.Get([]byte(key))
+		if err != nil {
+			// Log detailed information about the failure
+			t.Logf("=== BUG DETECTED ===")
+			t.Logf("Failed to get key %d ('%s') immediately after setting", i, key)
+			t.Logf("Error: %v", err)
+			t.Logf("Expected value: '%s'", value)
+
+			// Get cache stats to understand the state
+			cacheStats := db.GetCacheStats()
+			t.Logf("Cache stats when bug occurred: %+v", cacheStats)
+
+			t.Fatalf("Failed to get key %d: %v", i, err)
+		}
+
+		// Small delay to let background worker process and potentially create deadlock
+		time.Sleep(1 * time.Millisecond)
+
+		// Do another operation to increase lock contention
+		if i > 0 {
+			prevKey := fmt.Sprintf("%d%s", i-1, keySuffix)
+			_, err = db.Get([]byte(prevKey))
+			if err != nil {
+				t.Fatalf("Failed to get previous key %d: %v", i-1, err)
+			}
+		}
+	}
+
+	t.Logf("Completed %d direct database operations", 1000)
+
+	// Force more background activity by creating an iterator
+	// while background worker is likely still active
+	t.Logf("Creating iterator while background worker is active")
+	it := db.NewIterator(nil, nil)
+
+	keyCount := 0
+	for it.Valid() {
+		_ = it.Key()
+		_ = it.Value()
+		keyCount++
+		it.Next()
+
+		// Add small delays to increase chance of deadlock
+		if keyCount%10 == 0 {
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+	it.Close()
+
+	t.Logf("Iterator found %d keys", keyCount)
+
+	// Do some more operations to stress test the deadlock scenario
+	for i := 1000; i < 1050; i++ {
+		key := fmt.Sprintf("%d%s", i, keySuffix)
+		value := fmt.Sprintf("%s%d", valuePrefix, i)
+
+		// Set and immediately get to maximize lock contention
+		err = db.Set([]byte(key), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set final key %d: %v", i, err)
+		}
+
+		_, err = db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("Failed to get final key %d: %v", i, err)
+		}
+
+		// No delay here to maximize pressure on locks
+	}
+
+	// Give background worker time to finish any pending operations
+	time.Sleep(100 * time.Millisecond)
+
+	// Get final cache stats
+	cacheStats := db.GetCacheStats()
+	t.Logf("Final cache stats: %+v", cacheStats)
+
+	t.Logf("Test completed successfully - no deadlock detected")
+}
+
+func TestBackgroundWorkerWithTransactions(t *testing.T) {
+	// Simpler version focusing on transaction + background worker interaction
+	dbPath := "test_background_worker.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open database with very low thresholds to force background worker activity
+	db, err := Open(dbPath, Options{
+		"CacheSizeThreshold":   3,    // Low cache size to force frequent cleanups
+		"DirtyPageThreshold":   1,    // Force flush after every dirty page
+		"CheckpointThreshold":  512,  // Small checkpoint threshold
+	})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Sequential operations that should trigger background worker
+	numTransactions := 5
+	keysPerTransaction := 10
+
+	for txId := 0; txId < numTransactions; txId++ {
+		t.Logf("Starting transaction %d", txId)
+
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction %d: %v", txId, err)
+		}
+
+		// Insert keys that should trigger background worker due to low thresholds
+		for i := 0; i < keysPerTransaction; i++ {
+			key := fmt.Sprintf("tx%d_key%d_with_long_suffix_to_consume_space", txId, i)
+			value := fmt.Sprintf("tx%d_value%d_with_very_long_content_to_make_pages_fill_up_quickly", txId, i)
+
+			err = tx.Set([]byte(key), []byte(value))
+			if err != nil {
+				tx.Rollback()
+				t.Fatalf("Transaction %d: failed to set key %d: %v", txId, i, err)
+			}
+
+			// Small delay to let background worker potentially run
+			time.Sleep(1 * time.Millisecond)
+		}
+
+		// Commit while background worker might be active
+		err = tx.Commit()
+		if err != nil {
+			t.Fatalf("Failed to commit transaction %d: %v", txId, err)
+		}
+
+		t.Logf("Transaction %d completed", txId)
+
+		// Small delay between transactions
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify all data exists
+	totalKeysExpected := numTransactions * keysPerTransaction
+
+	it := db.NewIterator(nil, nil)
+	defer it.Close()
+
+	keysFound := 0
+	for it.Valid() {
+		keysFound++
+		it.Next()
+	}
+
+	if keysFound != totalKeysExpected {
+		t.Fatalf("Expected %d keys, found %d", totalKeysExpected, keysFound)
+	}
+
+	t.Logf("Successfully completed test with %d transactions and %d total keys", numTransactions, totalKeysExpected)
 }
