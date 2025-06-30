@@ -123,6 +123,7 @@ type DB struct {
 	calledByTransaction bool // Track if the method was called by a transaction
 	txnSequence    int64  // Current transaction sequence number
 	flushSequence  int64  // Current flush up to this transaction sequence number
+	pruningSequence int64 // Last transaction sequence number when cache pruning was performed
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  uint64 // Counter for page access times
 	dirtyPageCount int    // Count of dirty pages in cache
@@ -2384,6 +2385,7 @@ func (db *DB) checkPageCache(isWrite bool) {
 		if db.inTransaction && db.flushSequence == db.txnSequence - 1 {
 			return
 		}
+
 		// Check which thread should flush the pages
 		if db.commitMode == CallerThread {
 			// Write the pages to the WAL file
@@ -2402,6 +2404,16 @@ func (db *DB) checkPageCache(isWrite bool) {
 
 	// If the size of the page cache is above the threshold, remove old pages
 	if len(db.pageCache) >= db.cacheSizeThreshold {
+		// Check if we already pruned during the current transaction
+		// When just reading, the inTransaction flag is false, so we can prune
+		if db.inTransaction && db.pruningSequence == db.txnSequence {
+			return
+		}
+		// Set the pruning sequence to the current transaction sequence
+		db.seqMutex.Lock()
+		db.pruningSequence = db.txnSequence
+		db.seqMutex.Unlock()
+
 		// Check which thread should remove the old pages
 		if db.commitMode == CallerThread {
 			// Try to remove the old clean pages from the cache
