@@ -2188,9 +2188,6 @@ func (db *DB) commitTransaction() {
 		}
 	}
 
-	// Discard previous versions of pages modified in this transaction
-	db.discardTxnPageVersions()
-
 	// Release transaction lock if it was acquired for this transaction
 	if db.lockAcquiredForTransaction {
 		if err := db.releaseWriteLock(db.originalLockType); err != nil {
