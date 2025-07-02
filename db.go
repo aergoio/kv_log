@@ -2429,6 +2429,7 @@ func (db *DB) checkPageCache(isWrite bool) {
 }
 
 // discardNewerPages removes pages from the current transaction from the cache
+// This function is called by the main thread when a transaction is rolled back
 func (db *DB) discardNewerPages(currentSeq int64) {
 	db.cacheMutex.Lock()
 	defer db.cacheMutex.Unlock()
@@ -2479,48 +2480,99 @@ func (db *DB) clearWALCache() {
 
 }
 
-// discardOldPageVersions removes older versions of pages after a commit
-func (db *DB) discardOldPageVersions(keepWAL bool) {
+// discardOldPageVersions removes older versions of pages from the cache
+// keepWAL: if true, keep the first WAL page, otherwise clear the isWAL flag
+// returns the number of pages kept
+func (db *DB) discardOldPageVersions(keepWAL bool) int {
 	db.cacheMutex.Lock()
 	defer db.cacheMutex.Unlock()
 
+	db.seqMutex.Lock()
+	var currentTxnSeq int64
+	// If the main thread is in a transaction
+	if db.inTransaction {
+		// Keep pages from the previous transaction (because the current one can be rolled back)
+		currentTxnSeq = db.txnSequence - 1
+	} else {
+		// Otherwise, keep pages from the last committed transaction
+		currentTxnSeq = db.txnSequence
+	}
+	db.seqMutex.Unlock()
+
+	totalPages := 0
+
 	// Iterate through all pages in the cache
 	for _, entry := range db.pageCache {
-		// Skip if there's no older version
-		if entry == nil || entry.next == nil {
+		if entry == nil {
 			continue
 		}
 
-		// First, collect all pages that need to be preserved
-		var pagesToKeep []*Page
+		// Count and process the chain
+		current := entry
+		var lastKept *Page = nil
+		foundFirstPage := false
 
-		// Iterate through older versions to find pages to keep
-		for temp := entry.next; temp != nil; temp = temp.next {
-			// Keep pages that are:
-			// 1. WAL pages (if keepWAL is true)
-			// 2. Dirty pages that need to be written to disk
-			if (keepWAL && temp.isWAL) || temp.dirty {
-				pagesToKeep = append(pagesToKeep, temp)
+		for current != nil {
+			totalPages++
+
+			// Skip pages from current transaction or higher - they should not be touched
+			if current.txnSequence >= currentTxnSeq {
+				// If we are not keeping WAL pages, clear the isWAL flag
+				if !keepWAL && current.isWAL {
+					current.isWAL = false
+				}
+				lastKept = current
+				current = current.next
+				continue
 			}
+
+			shouldKeep := false
+			shouldStop := false
+
+			if keepWAL && current.isWAL {
+				// Keep only the very first WAL page
+				shouldKeep = true
+				// After first WAL page, discard everything else
+				shouldStop = true
+			} else {
+				if !foundFirstPage {
+					// Keep only the first page before WAL pages
+					foundFirstPage = true
+					shouldKeep = true
+				}
+				if !keepWAL && current.isWAL {
+					// Clear the isWAL flag
+					current.isWAL = false
+				}
+				// Stop if we are not keeping WAL pages
+				if keepWAL {
+					shouldStop = false
+				} else if foundFirstPage {
+					shouldStop = true
+				}
+			}
+
+			if shouldKeep {
+				// Keep this page
+				lastKept = current
+			} else {
+				// Discard this page
+				lastKept.next = current.next
+				totalPages--
+			}
+
+			if shouldStop {
+				// Discard everything after this page
+				lastKept.next = nil
+				// Stop processing
+				break
+			}
+
+			current = current.next
 		}
-
-		// If no pages need to be kept, clear the next pointer
-		if len(pagesToKeep) == 0 {
-			entry.next = nil
-			continue
-		}
-
-		// Rebuild the chain with the pages to keep
-		entry.next = pagesToKeep[0]
-
-		// Link the remaining pages
-		for i := 0; i < len(pagesToKeep)-1; i++ {
-			pagesToKeep[i].next = pagesToKeep[i+1]
-		}
-
-		// Terminate the chain
-		pagesToKeep[len(pagesToKeep)-1].next = nil
 	}
+
+	return totalPages
 }
 
 // discardTxnPageVersions removes previous versions of dirty pages from the current transaction
@@ -3831,7 +3883,13 @@ func (db *DB) startBackgroundWorker() {
 				db.seqMutex.Unlock()
 
 			case "clean":
-				db.removeOldPagesFromCache()
+				// Discard previous versions of pages
+				numPages := db.discardOldPageVersions(true)
+				// If the number of pages is still greater than the cache size threshold
+				if numPages > db.cacheSizeThreshold {
+					// Remove old pages from cache
+					db.removeOldPagesFromCache()
+				}
 				// Clear the pending command flag
 				db.seqMutex.Lock()
 				delete(db.pendingCommands, "clean")

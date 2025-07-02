@@ -608,10 +608,9 @@ func (db *DB) checkpointWAL() error {
 	// Update the last checkpoint sequence number
 	db.walInfo.lastCheckpointSequence = db.walInfo.lastCommitSequence + 1
 
-	// Clear the cache
-	db.clearWALCache()  // set isWAL to false for all pages, then remove older versions
-				// BUT: can the main thread be writing to the WAL while this is happening?
-				// it should block the main thread.
+	// Clear the page cache
+	// Clear the isWAL flag for all pages and remove older versions
+	db.discardOldPageVersions(false)
 
 	// Reset the WAL file
 	return db.resetWAL()
