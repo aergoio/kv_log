@@ -2457,29 +2457,6 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 	}
 }
 
-// clearWALCache sets isWAL to false for all pages in which isWAL is true
-// then removes older versions of the pages
-func (db *DB) clearWALCache() {
-	db.cacheMutex.Lock()
-
-	// Iterate through all pages in the cache
-	for _, firstPage := range db.pageCache {
-		// Iterate through all pages in the linked list
-		for page := firstPage; page != nil; page = page.next {
-			if page.isWAL {
-				page.isWAL = false
-			}
-		}
-	}
-
-	db.cacheMutex.Unlock()
-
-	//db.discardOldPageVersions(false)
-	// not sure if this can be done by the worker thread
-	// the main thread can be allocating pages
-
-}
-
 // discardOldPageVersions removes older versions of pages from the cache
 // keepWAL: if true, keep the first WAL page, otherwise clear the isWAL flag
 // returns the number of pages kept
@@ -2573,46 +2550,6 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 	}
 
 	return totalPages
-}
-
-// discardTxnPageVersions removes previous versions of dirty pages from the current transaction
-// It only iterates over pages from the current transaction sequence
-func (db *DB) discardTxnPageVersions() {
-	db.cacheMutex.Lock()
-	defer db.cacheMutex.Unlock()
-
-	// Get the current transaction sequence
-	currentTxnSeq := db.txnSequence
-
-	// Iterate through all pages in the cache
-	for _, entry := range db.pageCache {
-		// Skip if there's no entry or no next pointer
-		if entry == nil || entry.next == nil {
-			continue
-		}
-
-		// Only process pages from the current transaction
-		if entry.txnSequence != currentTxnSeq {
-			continue
-		}
-
-		// Start with the current page and iterate through its linked list
-		current := entry
-
-		// Process the linked list
-		for current != nil && current.next != nil {
-			next := current.next
-
-			// If the next page is not WAL and not in flushSequence, it can be removed
-			if !next.isWAL && (db.flushSequence == 0 || next.txnSequence > db.flushSequence) {
-				// Skip this page by pointing to the one after it
-				current.next = next.next
-			} else {
-				// Move to the next page
-				current = current.next
-			}
-		}
-	}
 }
 
 // removeOldPagesFromCache removes old clean pages from the cache
