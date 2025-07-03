@@ -1742,12 +1742,12 @@ func (db *DB) parseHeaderPage(data []byte, pageNumber uint32) (*Page, error) {
 		data:       data,
 	}
 
-	// Add to cache
-	db.addToCache(headerPage)
-
 	// Update the access time
 	db.accessCounter++   // TODO: not sure if this is correct for page 0
 	headerPage.accessTime = db.accessCounter
+
+	// Add to cache
+	db.addToCache(headerPage)
 
 	return headerPage, nil
 }
@@ -1791,6 +1791,10 @@ func (db *DB) parseRadixPage(data []byte, pageNumber uint32) (*RadixPage, error)
 		SubPagesUsed: subPagesUsed,
 		NextFreePage: nextFreePage,
 	}
+
+	// Update the access time
+	db.accessCounter++
+	radixPage.accessTime = db.accessCounter
 
 	// Add to cache
 	db.addToCache(radixPage)
@@ -1868,6 +1872,10 @@ func (db *DB) parseLeafPage(data []byte, pageNumber uint32) (*LeafPage, error) {
 		return nil, fmt.Errorf("failed to parse leaf entries: %w", err)
 	}
 	leafPage.Entries = entries
+
+	// Update the access time
+	db.accessCounter++
+	leafPage.accessTime = db.accessCounter
 
 	// Add to cache
 	db.addToCache(leafPage)
@@ -2578,6 +2586,8 @@ func (db *DB) removeOldPagesFromCache() {
 
 	db.cacheMutex.RLock()
 
+	lastAccessTime := db.accessCounter
+
 	// Collect removable pages
 	for pageNumber, page := range db.pageCache {
 		// Skip dirty pages, WAL pages, and pages from the current transaction
@@ -2630,6 +2640,11 @@ func (db *DB) removeOldPagesFromCache() {
 				continue
 			}
 
+			// Skip if the page was accessed after this function was called
+			if page.accessTime >= lastAccessTime {
+				continue
+			}
+
 			// Remove the page from the cache
 			delete(db.pageCache, pageNumber)
 			removedCount++
@@ -2658,10 +2673,6 @@ func (db *DB) getPage(pageNumber uint32) (*Page, error) {
 			return nil, err
 		}
 	}
-
-	// Update the access time
-	db.accessCounter++
-	page.accessTime = db.accessCounter
 
 	// Return the page
 	return page, nil
@@ -2915,15 +2926,15 @@ func (db *DB) allocateRadixPage() (*RadixPage, error) {
 		SubPagesUsed: 0,
 	}
 
-	// Add to cache
-	db.addToCache(radixPage)
-
 	// Update the access time
 	db.accessCounter++
 	radixPage.accessTime = db.accessCounter
 
 	// Update the transaction sequence
 	radixPage.txnSequence = db.txnSequence
+
+	// Add to cache
+	db.addToCache(radixPage)
 
 	debugPrint("Allocated new radix page at page %d\n", pageNumber)
 
@@ -3026,15 +3037,15 @@ func (db *DB) allocateLeafPage() (*LeafPage, error) {
 		Entries:     make([]LeafEntry, 0),
 	}
 
-	// Add to cache
-	db.addToCache(leafPage)
-
 	// Update the access time
 	db.accessCounter++
 	leafPage.accessTime = db.accessCounter
 
 	// Update the transaction sequence
 	leafPage.txnSequence = db.txnSequence
+
+	// Add to cache
+	db.addToCache(leafPage)
 
 	debugPrint("Allocated new leaf page at page %d\n", pageNumber)
 
