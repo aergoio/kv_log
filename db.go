@@ -2675,8 +2675,12 @@ func (db *DB) getPage(pageNumber uint32) (*Page, error) {
 	// First check the cache
 	page, exists := db.getPageFromCache(pageNumber)
 
-	// If not in cache, read it from disk
-	if !exists {
+	if exists {
+		// If the page is in cache, update the access time
+		db.accessCounter++
+		page.accessTime = db.accessCounter
+	} else {
+		// If not in cache, read it from disk
 		var err error
 		page, err = db.readPage(pageNumber)
 		if err != nil {
