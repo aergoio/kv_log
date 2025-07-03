@@ -2927,11 +2927,11 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 
 	// Process pages in order
 	for _, pageNumber := range pageNumbers {
+		bucket := &db.pageCache[pageNumber & 1023]
+		bucket.mutex.Lock()
+
 		// Get the page from the cache (it can be modified by another thread)
-		page, exists := db.getFromCache(pageNumber)
-		if !exists {
-			continue
-		}
+		page, _ := bucket.pages[pageNumber]
 
 		// Find the first version of the page that was modified up to the flush sequence
 		for ; page != nil; page = page.next {
@@ -2939,16 +2939,19 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 				break
 			}
 		}
+		bucket.mutex.Unlock()
+
 		// If the page contains modifications, write it to disk
 		if page != nil && page.dirty {
+			var err error
 			if page.pageType == ContentTypeRadix {
-				if err := db.writeRadixPage(page); err != nil {
-					return pagesWritten, err
-				}
+				err = db.writeRadixPage(page)
 			} else if page.pageType == ContentTypeLeaf {
-				if err := db.writeLeafPage(page); err != nil {
-					return pagesWritten, err
-				}
+				err = db.writeLeafPage(page)
+			}
+
+			if err != nil {
+				return pagesWritten, err
 			}
 			pagesWritten++
 		}

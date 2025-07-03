@@ -689,8 +689,12 @@ func (db *DB) copyWALPagesToIndexFile() error {
 	// Copy pages to the index file in sorted order
 	for _, pageNumber := range pageNumbers {
 		// Get the head of the linked list for this page number
-		headPage, exists := db.getFromCache(pageNumber)
+		bucket := &db.pageCache[pageNumber & 1023]
+		bucket.mutex.Lock()
+
+		headPage, exists := bucket.pages[pageNumber]
 		if !exists {
+			bucket.mutex.Unlock()
 			continue
 		}
 
@@ -702,6 +706,7 @@ func (db *DB) copyWALPagesToIndexFile() error {
 				break
 			}
 		}
+		bucket.mutex.Unlock()
 
 		// Skip if no WAL page was found
 		if walPage == nil {
