@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -115,6 +116,7 @@ type DB struct {
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
 	pageCache      [1024]cacheBucket // Page cache for all page types
+	totalCachePages atomic.Int64     // Total number of pages in cache (including previous versions)
 	freeSubPagesHead uint32 // Page number of the head of linked list of radix pages with available sub-pages
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
@@ -343,6 +345,9 @@ func Open(path string, options ...Options) (*DB, error) {
 	for i := range db.pageCache {
 		db.pageCache[i].pages = make(map[uint32]*Page)
 	}
+
+	// Initialize the total cache pages counter
+	db.totalCachePages.Store(0)
 
 	// Ensure indexFileSize is properly aligned to page boundaries for existing files
 	if indexFileExists && indexFileInfo.Size() > 0 {
@@ -2305,6 +2310,9 @@ func (db *DB) addToCache(page *Page) {
 
 	// Add the new page to the cache
 	bucket.pages[pageNumber] = page
+
+	// Increment the total pages counter
+	db.totalCachePages.Add(1)
 }
 
 // Get a page from the cache
@@ -2349,7 +2357,21 @@ func (db *DB) removeFromCache(pageNumber uint32) {
 	bucket.mutex.Lock()
 	defer bucket.mutex.Unlock()
 
-	delete(bucket.pages, pageNumber)
+	// Check if the page exists before trying to delete it
+	page, exists := bucket.pages[pageNumber]
+	if exists {
+		// Count how many page versions we're removing
+		var count int64 = 0
+		for p := page; p != nil; p = p.next {
+			count++
+		}
+
+		// Delete the page
+		delete(bucket.pages, pageNumber)
+
+		// Decrement the total pages counter by the number of versions
+		db.totalCachePages.Add(-count)
+	}
 }
 
 // getWritablePage gets a writable version of a page
@@ -2455,7 +2477,7 @@ func (db *DB) checkPageCache(isWrite bool) {
 	}
 
 	// If the size of the page cache is above the threshold, remove old pages
-	if len(db.pageCache) >= db.cacheSizeThreshold {
+	if db.totalCachePages.Load() >= int64(db.cacheSizeThreshold) {
 		// Check if we already pruned during the current transaction
 		// When just reading, the inTransaction flag is false, so we can prune
 		if db.inTransaction && db.pruningSequence == db.txnSequence {
@@ -2491,6 +2513,8 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 		// Skip pages from the current transaction
 		// Find the first page that's not from the current transaction
 		var newHead *Page = page
+		var removedCount int64 = 0
+
 		for newHead != nil && newHead.txnSequence == currentSeq {
 			// Only decrement the dirty page counter if the current page is dirty
 			// and the next one isn't (to avoid incorrect counter decrements)
@@ -2499,12 +2523,18 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 			}
 			// Move to the next page
 			newHead = newHead.next
+			removedCount++
 		}
+
 		// Update the cache with the new head (or delete if no valid entries remain)
 		if newHead != nil {
 			bucket.pages[pageNumber] = newHead
 		} else {
 			delete(bucket.pages, pageNumber)
+		}
+		// Decrement the total pages counter by the number of versions removed
+		if removedCount > 0 {
+			db.totalCachePages.Add(-removedCount)
 		}
 	})
 }
@@ -2525,7 +2555,7 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 	}
 	db.seqMutex.Unlock()
 
-	totalPages := 0
+	var totalPages int64 = 0
 
 	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Count and process the chain
@@ -2593,7 +2623,10 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 		}
 	})
 
-	return totalPages
+	// Update the atomic counter with the accurate count from this function
+	db.totalCachePages.Store(totalPages)
+
+	return int(totalPages)
 }
 
 // removeOldPagesFromCache removes old clean pages from the cache
@@ -2606,14 +2639,8 @@ func (db *DB) removeOldPagesFromCache() {
 		accessTime uint64
 	}
 
-	// Count total pages in cache
-	totalPages := 0
-	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
-		bucket := &db.pageCache[bucketIdx]
-		bucket.mutex.RLock()
-		totalPages += len(bucket.pages)
-		bucket.mutex.RUnlock()
-	}
+	// Get total pages in cache from atomic counter
+	totalPages := int(db.totalCachePages.Load())
 
 	// If cache is empty or too small, nothing to do
 	if totalPages <= db.cacheSizeThreshold/2 {
@@ -2697,19 +2724,22 @@ func (db *DB) removeOldPagesFromCache() {
 
 			// If the page was not accessed after this function was called
 			if page.accessTime < lastAccessTime {
+				// Count how many page versions we're removing
+				for p := page; p != nil; p = p.next {
+					removedCount++
+				}
 				// Remove the page from the cache
 				delete(bucket.pages, pageNumber)
-				removedCount++
 			}
 		}
 
 		bucket.mutex.Unlock()
 	}
 
-	// Calculate new total by subtracting removed count
-	newTotalPages := totalPages - removedCount
+	// Update the total pages counter
+	db.totalCachePages.Add(-int64(removedCount))
 
-	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, newTotalPages)
+	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, db.totalCachePages.Load())
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2787,16 +2817,16 @@ func (db *DB) getLeafPage(pageNumber uint32) (*LeafPage, error) {
 func (db *DB) GetCacheStats() map[string]interface{} {
 	stats := make(map[string]interface{})
 
-	// Count total pages and pages by type
-	totalPages := 0
+	// Use the atomic counter for total pages
+	totalPages := db.totalCachePages.Load()
+
+	// Count pages by type
 	radixPages := 0
 	leafPages := 0
 
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
 		bucket := &db.pageCache[bucketIdx]
 		bucket.mutex.RLock()
-
-		totalPages += len(bucket.pages)
 
 		// Count pages by type
 		for _, page := range bucket.pages {
