@@ -2584,14 +2584,24 @@ func (db *DB) removeOldPagesFromCache() {
 	// Step 1: Use a read lock to collect candidates
 	var candidates []pageInfo
 
+	db.seqMutex.Lock()
+	var currentTxnSeq int64
+	// If the main thread is in a transaction
+	if db.inTransaction {
+		// Keep pages from the previous transaction (because the current one can be rolled back)
+		currentTxnSeq = db.txnSequence - 1
+	} else {
+		// Otherwise, keep pages from the last committed transaction
+		currentTxnSeq = db.txnSequence
+	}
+	db.seqMutex.Unlock()
+
 	db.cacheMutex.RLock()
-
 	lastAccessTime := db.accessCounter
-
 	// Collect removable pages
 	for pageNumber, page := range db.pageCache {
 		// Skip dirty pages, WAL pages, and pages from the current transaction
-		if page.dirty || page.isWAL || page.txnSequence == db.txnSequence {
+		if page.dirty || page.isWAL || page.txnSequence >= currentTxnSeq {
 			continue
 		}
 
@@ -2624,14 +2634,14 @@ func (db *DB) removeOldPagesFromCache() {
 		// Double-check the page still exists and is still removable
 		if page, exists := db.pageCache[pageNumber]; exists {
 			// Skip if the page is dirty, WAL, or from the current transaction
-			if page.dirty || page.isWAL || page.txnSequence == db.txnSequence {
+			if page.dirty || page.isWAL || page.txnSequence >= currentTxnSeq {
 				continue
 			}
 
-			// Skip if the page is part of a linked list with dirty or WAL pages
+			// Skip if the page is part of a linked list with WAL pages
 			hasNonRemovable := false
 			for p := page.next; p != nil; p = p.next {
-				if p.dirty || p.isWAL {
+				if p.isWAL {
 					hasNonRemovable = true
 					break
 				}
