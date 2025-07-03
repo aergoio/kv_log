@@ -221,10 +221,14 @@ func ExampleCalculateDefaultCacheSize() {
 // TestDiscardOldPageVersions tests the discardOldPageVersions function
 // with different page version scenarios
 func TestDiscardOldPageVersions(t *testing.T) {
-	// Setup a test DB
+	// Setup a test DB with sharded cache
 	db := &DB{
-		pageCache:   make(map[uint32]*Page),
 		txnSequence: 100, // Current transaction sequence
+	}
+
+	// Initialize the page cache buckets
+	for i := range db.pageCache {
+		db.pageCache[i].pages = make(map[uint32]*Page)
 	}
 
 	// Helper function to create a page with specific properties
@@ -252,7 +256,8 @@ func TestDiscardOldPageVersions(t *testing.T) {
 
 			if i == 0 {
 				firstPage = page
-				db.pageCache[pageNum] = firstPage
+				bucketIdx := pageNum & 1023
+				db.pageCache[bucketIdx].pages[pageNum] = firstPage
 			} else {
 				prevPage.next = page
 			}
@@ -267,7 +272,8 @@ func TestDiscardOldPageVersions(t *testing.T) {
 		dirty  bool
 		isWAL  bool
 	}) {
-		page := db.pageCache[pageNum]
+		bucketIdx := pageNum & 1023
+		page := db.pageCache[bucketIdx].pages[pageNum]
 
 		if page == nil && len(expectedChain) > 0 {
 			t.Errorf("Case %d: Expected page %d to exist but it was nil", testCase, pageNum)

@@ -667,13 +667,19 @@ func (db *DB) copyWALPagesToIndexFile() error {
 		return nil
 	}
 
-	// Get the list of page numbers to copy using just a read lock
-	db.cacheMutex.RLock()
-	pageNumbers := make([]uint32, 0, len(db.pageCache))
-	for pageNumber := range db.pageCache {
-		pageNumbers = append(pageNumbers, pageNumber)
+	// Get the list of page numbers to copy
+	var pageNumbers []uint32
+
+	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
+		bucket := &db.pageCache[bucketIdx]
+		bucket.mutex.RLock()
+
+		for pageNumber := range bucket.pages {
+			pageNumbers = append(pageNumbers, pageNumber)
+		}
+
+		bucket.mutex.RUnlock()
 	}
-	db.cacheMutex.RUnlock()
 
 	// Sort page numbers for sequential access (faster writes)
 	sort.Slice(pageNumbers, func(i, j int) bool {
@@ -683,9 +689,10 @@ func (db *DB) copyWALPagesToIndexFile() error {
 	// Copy pages to the index file in sorted order
 	for _, pageNumber := range pageNumbers {
 		// Get the head of the linked list for this page number
-		db.cacheMutex.RLock()
-		headPage := db.pageCache[pageNumber]
-		db.cacheMutex.RUnlock()
+		headPage, exists := db.getFromCache(pageNumber)
+		if !exists {
+			continue
+		}
 
 		// Find the first WAL page in the linked list
 		var walPage *Page = nil

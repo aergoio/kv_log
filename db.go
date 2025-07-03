@@ -94,6 +94,12 @@ func debugPrint(format string, args ...interface{}) {
 	}
 }
 
+// cacheBucket represents a bucket in the page cache with its own mutex
+type cacheBucket struct {
+    mutex sync.RWMutex
+    pages map[uint32]*Page  // Map of page numbers to pages
+}
+
 // DB represents the database instance
 type DB struct {
 	databaseID     uint64 // Unique identifier for the database
@@ -101,7 +107,6 @@ type DB struct {
 	mainFile       *os.File
 	indexFile      *os.File
 	mutex          sync.RWMutex  // Mutex for the database
-	cacheMutex     sync.RWMutex  // Mutex for the page cache
 	seqMutex       sync.Mutex    // Mutex for transaction state and sequence numbers
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
 	indexFileSize  int64 // Track index file size to avoid frequent stat calls
@@ -109,7 +114,7 @@ type DB struct {
 	fileLocked     bool  // Track if the files are locked
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
-	pageCache      map[uint32]*Page // Cache for all page types
+	pageCache      [1024]cacheBucket // Page cache for all page types
 	freeSubPagesHead uint32 // Page number of the head of linked list of radix pages with available sub-pages
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
@@ -326,13 +331,17 @@ func Open(path string, options ...Options) (*DB, error) {
 		indexFileSize:      indexFileInfo.Size(),
 		readOnly:           readOnly,
 		lockType:           LockNone,
-		pageCache:          make(map[uint32]*Page),
 		dirtyPageCount:     0,
 		dirtyPageThreshold: dirtyPageThreshold,
 		cacheSizeThreshold: cacheSizeThreshold,
 		checkpointThreshold: checkpointThreshold,
 		workerChannel:      make(chan string, 10), // Buffer size of 10 for commands
 		pendingCommands:    make(map[string]bool), // Initialize the pending commands map
+	}
+
+	// Initialize each bucket's map
+	for i := range db.pageCache {
+		db.pageCache[i].pages = make(map[uint32]*Page)
 	}
 
 	// Ensure indexFileSize is properly aligned to page boundaries for existing files
@@ -1961,9 +1970,10 @@ func (db *DB) writeIndexPage(page *Page) error {
 			page.isWAL = true
 		}
 		// Discard previous versions of this page
-		db.cacheMutex.Lock()
+		bucket := &db.pageCache[page.pageNumber & 1023]
+		bucket.mutex.Lock()
 		page.next = nil
-		db.cacheMutex.Unlock()
+		bucket.mutex.Unlock()
 	}
 
 	return err
@@ -2274,12 +2284,13 @@ func (db *DB) addToCache(page *Page) {
 	}
 
 	pageNumber := page.pageNumber
+	bucket := &db.pageCache[pageNumber & 1023]
 
-	db.cacheMutex.Lock()
-	defer db.cacheMutex.Unlock()
+	bucket.mutex.Lock()
+	defer bucket.mutex.Unlock()
 
 	// If there is already a page with the same page number
-	existingPage, exists := db.pageCache[pageNumber]
+	existingPage, exists := bucket.pages[pageNumber]
 	if exists {
 		// Avoid linking the page to itself
 		if page == existingPage {
@@ -2293,16 +2304,52 @@ func (db *DB) addToCache(page *Page) {
 	}
 
 	// Add the new page to the cache
-	db.pageCache[pageNumber] = page
+	bucket.pages[pageNumber] = page
 }
 
-// getPageFromCache gets a page from the cache by page number
-func (db *DB) getPageFromCache(pageNumber uint32) (*Page, bool) {
-	db.cacheMutex.RLock()
-	page, exists := db.pageCache[pageNumber]
-	db.cacheMutex.RUnlock()
+// Get a page from the cache
+func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
+	bucket := &db.pageCache[pageNumber & 1023]
+
+	bucket.mutex.RLock()
+	page, exists := bucket.pages[pageNumber]
+	bucket.mutex.RUnlock()
 
 	return page, exists
+}
+
+// getPageAndCall gets a page from the cache and calls a callback/lambda function with the page while the lock is held
+func (db *DB) getPageAndCall(pageNumber uint32, callback func(*cacheBucket, uint32, *Page)) {
+	bucket := &db.pageCache[pageNumber & 1023]
+	bucket.mutex.RLock()
+	page, exists := bucket.pages[pageNumber]
+	if exists {
+		callback(bucket, pageNumber, page)
+	}
+	bucket.mutex.RUnlock()
+}
+
+// iteratePages iterates through all pages in the cache and calls a callback/lambda function with the page while the lock is held
+func (db *DB) iteratePages(callback func(*cacheBucket, uint32, *Page)) {
+	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
+		bucket := &db.pageCache[bucketIdx]
+		bucket.mutex.RLock()
+		// Iterate through all pages in this bucket
+		for pageNumber, page := range bucket.pages {
+			callback(bucket, pageNumber, page)
+		}
+		bucket.mutex.RUnlock()
+	}
+}
+
+// Remove a page from the cache
+func (db *DB) removeFromCache(pageNumber uint32) {
+	bucket := &db.pageCache[pageNumber & 1023]
+
+	bucket.mutex.Lock()
+	defer bucket.mutex.Unlock()
+
+	delete(bucket.pages, pageNumber)
 }
 
 // getWritablePage gets a writable version of a page
@@ -2439,11 +2486,8 @@ func (db *DB) checkPageCache(isWrite bool) {
 // discardNewerPages removes pages from the current transaction from the cache
 // This function is called by the main thread when a transaction is rolled back
 func (db *DB) discardNewerPages(currentSeq int64) {
-	db.cacheMutex.Lock()
-	defer db.cacheMutex.Unlock()
-
 	// Iterate through all pages in the cache
-	for pageNumber, page := range db.pageCache {
+	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Skip pages from the current transaction
 		// Find the first page that's not from the current transaction
 		var newHead *Page = page
@@ -2458,20 +2502,17 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 		}
 		// Update the cache with the new head (or delete if no valid entries remain)
 		if newHead != nil {
-			db.pageCache[pageNumber] = newHead
+			bucket.pages[pageNumber] = newHead
 		} else {
-			delete(db.pageCache, pageNumber)
+			delete(bucket.pages, pageNumber)
 		}
-	}
+	})
 }
 
 // discardOldPageVersions removes older versions of pages from the cache
 // keepWAL: if true, keep the first WAL page, otherwise clear the isWAL flag
 // returns the number of pages kept
 func (db *DB) discardOldPageVersions(keepWAL bool) int {
-	db.cacheMutex.Lock()
-	defer db.cacheMutex.Unlock()
-
 	db.seqMutex.Lock()
 	var currentTxnSeq int64
 	// If the main thread is in a transaction
@@ -2486,14 +2527,9 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 
 	totalPages := 0
 
-	// Iterate through all pages in the cache
-	for _, entry := range db.pageCache {
-		if entry == nil {
-			continue
-		}
-
+	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Count and process the chain
-		current := entry
+		current := page
 		var lastKept *Page = nil
 		foundFirstPage := false
 
@@ -2555,7 +2591,7 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 
 			current = current.next
 		}
-	}
+	})
 
 	return totalPages
 }
@@ -2570,8 +2606,17 @@ func (db *DB) removeOldPagesFromCache() {
 		accessTime uint64
 	}
 
+	// Count total pages in cache
+	totalPages := 0
+	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
+		bucket := &db.pageCache[bucketIdx]
+		bucket.mutex.RLock()
+		totalPages += len(bucket.pages)
+		bucket.mutex.RUnlock()
+	}
+
 	// If cache is empty or too small, nothing to do
-	if len(db.pageCache) <= db.cacheSizeThreshold/2 {
+	if totalPages <= db.cacheSizeThreshold/2 {
 		return
 	}
 
@@ -2579,9 +2624,9 @@ func (db *DB) removeOldPagesFromCache() {
 	targetSize := db.cacheSizeThreshold * 3 / 4
 
 	// Compute the number of pages to remove
-	numPagesToRemove := len(db.pageCache) - targetSize
+	numPagesToRemove := totalPages - targetSize
 
-	// Step 1: Use a read lock to collect candidates
+	// Step 1: Use read locks to collect candidates
 	var candidates []pageInfo
 
 	db.seqMutex.Lock()
@@ -2594,15 +2639,14 @@ func (db *DB) removeOldPagesFromCache() {
 		// Otherwise, keep pages from the last committed transaction
 		currentTxnSeq = db.txnSequence
 	}
+	lastAccessTime := db.accessCounter
 	db.seqMutex.Unlock()
 
-	db.cacheMutex.RLock()
-	lastAccessTime := db.accessCounter
-	// Collect removable pages
-	for pageNumber, page := range db.pageCache {
+	// Collect removable pages from each bucket
+	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Skip dirty pages, WAL pages, and pages from the current transaction
 		if page.dirty || page.isWAL || page.txnSequence >= currentTxnSeq {
-			continue
+			return
 		}
 
 		// Add to candidates
@@ -2610,8 +2654,7 @@ func (db *DB) removeOldPagesFromCache() {
 			pageNumber: pageNumber,
 			accessTime: page.accessTime,
 		})
-	}
-	db.cacheMutex.RUnlock()
+	})
 
 	// If no candidates, nothing to do
 	if len(candidates) == 0 {
@@ -2623,18 +2666,19 @@ func (db *DB) removeOldPagesFromCache() {
 		return candidates[i].accessTime < candidates[j].accessTime
 	})
 
-	// Step 3: Acquire write lock and remove pages
-	db.cacheMutex.Lock()
-
-	// Remove the oldest pages
+	// Step 3: Remove pages one by one with appropriate locking
 	removedCount := 0
 	for i := 0; i < len(candidates) && removedCount < numPagesToRemove; i++ {
 		pageNumber := candidates[i].pageNumber
+		bucket := &db.pageCache[pageNumber & 1023]
+
+		bucket.mutex.Lock()
 
 		// Double-check the page still exists and is still removable
-		if page, exists := db.pageCache[pageNumber]; exists {
+		if page, exists := bucket.pages[pageNumber]; exists {
 			// Skip if the page is dirty, WAL, or from the current transaction
 			if page.dirty || page.isWAL || page.txnSequence >= currentTxnSeq {
+				bucket.mutex.Unlock()
 				continue
 			}
 
@@ -2647,23 +2691,25 @@ func (db *DB) removeOldPagesFromCache() {
 				}
 			}
 			if hasNonRemovable {
+				bucket.mutex.Unlock()
 				continue
 			}
 
-			// Skip if the page was accessed after this function was called
-			if page.accessTime >= lastAccessTime {
-				continue
+			// If the page was not accessed after this function was called
+			if page.accessTime < lastAccessTime {
+				// Remove the page from the cache
+				delete(bucket.pages, pageNumber)
+				removedCount++
 			}
-
-			// Remove the page from the cache
-			delete(db.pageCache, pageNumber)
-			removedCount++
 		}
+
+		bucket.mutex.Unlock()
 	}
 
-	db.cacheMutex.Unlock()
+	// Calculate new total by subtracting removed count
+	newTotalPages := totalPages - removedCount
 
-	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, len(db.pageCache))
+	debugPrint("Removed %d pages from cache, new size: %d\n", removedCount, newTotalPages)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2672,14 +2718,25 @@ func (db *DB) removeOldPagesFromCache() {
 
 // getPage gets a page from the cache or from the disk
 func (db *DB) getPage(pageNumber uint32) (*Page, error) {
-	// First check the cache
-	page, exists := db.getPageFromCache(pageNumber)
 
+	// This mutex is used to avoid race conditions when updating the access time
+	// Example: main thread gets page from cache, the worker thread checks the access time
+	// and removes the page from the cache. the main thread will then update the access time
+	// but the page will no longer be in the cache.
+	// First check the cache
+
+	bucket := &db.pageCache[pageNumber & 1023]
+
+	bucket.mutex.RLock()
+	page, exists := bucket.pages[pageNumber]
 	if exists {
 		// If the page is in cache, update the access time
 		db.accessCounter++
 		page.accessTime = db.accessCounter
-	} else {
+	}
+	bucket.mutex.RUnlock()
+
+	if !exists {
 		// If not in cache, read it from disk
 		var err error
 		page, err = db.readPage(pageNumber)
@@ -2728,25 +2785,33 @@ func (db *DB) getLeafPage(pageNumber uint32) (*LeafPage, error) {
 
 // GetCacheStats returns statistics about the page cache
 func (db *DB) GetCacheStats() map[string]interface{} {
-	db.cacheMutex.RLock()
-	defer db.cacheMutex.RUnlock()
-
 	stats := make(map[string]interface{})
-	stats["cache_size"] = len(db.pageCache)
-	stats["dirty_pages"] = db.dirtyPageCount
 
-	// Count pages by type
+	// Count total pages and pages by type
+	totalPages := 0
 	radixPages := 0
 	leafPages := 0
 
-	for _, page := range db.pageCache {
-		if page.pageType == ContentTypeRadix {
-			radixPages++
-		} else if page.pageType == ContentTypeLeaf {
-			leafPages++
+	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
+		bucket := &db.pageCache[bucketIdx]
+		bucket.mutex.RLock()
+
+		totalPages += len(bucket.pages)
+
+		// Count pages by type
+		for _, page := range bucket.pages {
+			if page.pageType == ContentTypeRadix {
+				radixPages++
+			} else if page.pageType == ContentTypeLeaf {
+				leafPages++
+			}
 		}
+
+		bucket.mutex.RUnlock()
 	}
 
+	stats["cache_size"] = totalPages
+	stats["dirty_pages"] = db.dirtyPageCount
 	stats["radix_pages"] = radixPages
 	stats["leaf_pages"] = leafPages
 
@@ -2838,13 +2903,19 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 		return 0, fmt.Errorf("flush sequence is not set")
 	}
 
-	// Get all page numbers using just a read lock
-	db.cacheMutex.RLock()
-	pageNumbers := make([]uint32, 0, len(db.pageCache))
-	for pageNumber := range db.pageCache {
-		pageNumbers = append(pageNumbers, pageNumber)
+	// Collect all page numbers
+	var pageNumbers []uint32
+
+	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
+		bucket := &db.pageCache[bucketIdx]
+		bucket.mutex.RLock()
+
+		for pageNumber := range bucket.pages {
+			pageNumbers = append(pageNumbers, pageNumber)
+		}
+
+		bucket.mutex.RUnlock()
 	}
-	db.cacheMutex.RUnlock()
 
 	// Sort page numbers in ascending order
 	sort.Slice(pageNumbers, func(i, j int) bool {
@@ -2857,9 +2928,10 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 	// Process pages in order
 	for _, pageNumber := range pageNumbers {
 		// Get the page from the cache (it can be modified by another thread)
-		db.cacheMutex.RLock()
-		page := db.pageCache[pageNumber]
-		db.cacheMutex.RUnlock()
+		page, exists := db.getFromCache(pageNumber)
+		if !exists {
+			continue
+		}
 
 		// Find the first version of the page that was modified up to the flush sequence
 		for ; page != nil; page = page.next {
