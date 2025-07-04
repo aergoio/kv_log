@@ -2260,21 +2260,12 @@ func (db *DB) rollbackTransaction() {
 	db.inTransaction = false
 	db.seqMutex.Unlock()
 
-	// It can do:
-	// 1. Discard all dirty pages from this transaction
-	// 2. Restore pages from WAL if needed
-
-
 	// It could use an optimistic approach:
 	// - do not clone pages for new transactions, only if there is a flush happening
 	// on rollback:
 	// - truncate the main db file to the stored size before the transaction started
 	// - discard all dirty pages
 	// - rebuild the index pages from the main db file (incremental reindexing)
-
-	// PROBLEM: on a crash, the main file can contain uncommitted changes
-	// SOLUTION: do "transactions" virtually, on memory, and only write to disk when the transaction is committed
-	// or use a commit marker, like done in the WAL file
 
 }
 
@@ -2490,8 +2481,13 @@ func (db *DB) checkPageCache(isWrite bool) {
 
 		// Check which thread should remove the old pages
 		if db.commitMode == CallerThread {
-			// Try to remove the old clean pages from the cache
-			db.removeOldPagesFromCache()
+			// Discard previous versions of pages
+			numPages := db.discardOldPageVersions(true)
+			// If the number of pages is still greater than the cache size threshold
+			if numPages > db.cacheSizeThreshold {
+				// Remove old pages from cache
+				db.removeOldPagesFromCache()
+			}
 		} else {
 			// Signal the worker thread to remove the old pages, if not already signaled
 			db.seqMutex.Lock()
