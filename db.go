@@ -143,6 +143,9 @@ type DB struct {
 	pendingCommands map[string]bool // Map to track pending worker commands
 	originalLockType int // Original lock type before transaction
 	lockAcquiredForTransaction bool // Whether lock was acquired for transaction
+
+	// Add a condition variable for transaction waiting
+	transactionCond *sync.Cond
 }
 
 // Transaction represents a database transaction
@@ -349,6 +352,9 @@ func Open(path string, options ...Options) (*DB, error) {
 
 	// Initialize the total cache pages counter
 	db.totalCachePages.Store(0)
+
+	// Initialize the transaction condition variable
+	db.transactionCond = sync.NewCond(&db.mutex)
 
 	// Ensure indexFileSize is properly aligned to page boundaries for existing files
 	if indexFileExists && indexFileInfo.Size() > 0 {
@@ -2112,9 +2118,9 @@ func (db *DB) Begin() (*Transaction, error) {
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
 
-	// Check if a transaction is already open
-	if db.inExplicitTransaction {
-		return nil, fmt.Errorf("a transaction is already open")
+	// Wait if a transaction is already open
+	for db.inExplicitTransaction {
+		db.transactionCond.Wait()
 	}
 
 	// Mark transaction as open
@@ -2143,6 +2149,9 @@ func (tx *Transaction) Commit() error {
 	// Mark transaction as closed
 	tx.db.inExplicitTransaction = false
 
+	// Signal waiting transactions
+	tx.db.transactionCond.Signal()
+
 	return nil
 }
 
@@ -2161,6 +2170,9 @@ func (tx *Transaction) Rollback() error {
 
 	// Mark transaction as closed
 	tx.db.inExplicitTransaction = false
+
+	// Signal waiting transactions
+	tx.db.transactionCond.Signal()
 
 	return nil
 }
