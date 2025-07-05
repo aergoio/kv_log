@@ -1365,6 +1365,11 @@ func (db *DB) readHeader() error {
 		return fmt.Errorf("failed to read main file header: %w", err)
 	}
 
+	// Read the index file header directly from the index file
+	if err := db.readIndexFileHeader(false); err != nil {
+		return fmt.Errorf("failed to read index file header: %w", err)
+	}
+
 	// Check for existing WAL file if in WAL mode
 	if db.useWAL {
 		// Open existing WAL file if it exists
@@ -1373,9 +1378,10 @@ func (db *DB) readHeader() error {
 		}
 	}
 
-	// Read index file header
-	if err := db.readIndexFileHeader(); err != nil {
-		return fmt.Errorf("failed to read index file header: %w", err)
+	// Read the index file header from WAL/cache
+	// This will update lastIndexedOffset and freePageNum with the latest values
+	if err := db.readIndexFileHeader(true); err != nil {
+		return fmt.Errorf("failed to read index file header from WAL: %w", err)
 	}
 
 	// Preload the first two levels of the radix tree
@@ -1415,11 +1421,24 @@ func (db *DB) readMainFileHeader() error {
 }
 
 // readIndexFileHeader reads the index file header
-func (db *DB) readIndexFileHeader() error {
-	// Read the entire header page
-	header, err := db.readIndexPage(0)
-	if err != nil {
-		return fmt.Errorf("failed to read index file header: %w", err)
+func (db *DB) readIndexFileHeader(finalRead bool) error {
+	var header []byte
+	var err error
+
+	if finalRead {
+		// Try to get the header page from the cache first (which includes pages from the WAL)
+		headerPage, exists := db.getFromCache(0)
+		if exists && headerPage != nil {
+			header = headerPage.data
+		}
+	}
+	// If not using WAL or if the page is not in cache
+	if header == nil {
+		// Read directly from the index file
+		header, err = db.readFromIndexFile(0)
+		if err != nil {
+			return fmt.Errorf("failed to read index file header: %w", err)
+		}
 	}
 
 	// Extract magic string (6 bytes)
@@ -1464,23 +1483,26 @@ func (db *DB) readIndexFileHeader() error {
 		return db.initializeIndexFile()
 	}
 
-	// Parse the last indexed offset from the header
-	db.lastIndexedOffset = int64(binary.LittleEndian.Uint64(header[16:24]))
-	if db.lastIndexedOffset == 0 {
-		// If the last indexed offset is 0, default to PageSize
-		db.lastIndexedOffset = PageSize
-	}
-
-	// Parse the free sub-pages head pointer
-	freePageNum := binary.LittleEndian.Uint32(header[24:28])
-
-	// If we have a valid free page pointer
-	if freePageNum > 0 {
-		radixPage, err := db.getRadixPage(freePageNum)
-		if err != nil {
-			return fmt.Errorf("failed to get radix page: %w", err)
+	// Only process lastIndexedOffset and freePageNum on the final read
+	if finalRead {
+		// Parse the last indexed offset from the header
+		db.lastIndexedOffset = int64(binary.LittleEndian.Uint64(header[16:24]))
+		if db.lastIndexedOffset == 0 {
+			// If the last indexed offset is 0, default to PageSize
+			db.lastIndexedOffset = PageSize
 		}
-		db.freeSubPagesHead = radixPage.pageNumber
+
+		// Parse the free sub-pages head pointer
+		freePageNum := binary.LittleEndian.Uint32(header[24:28])
+
+		// If we have a valid free page pointer
+		if freePageNum > 0 {
+			radixPage, err := db.getRadixPage(freePageNum)
+			if err != nil {
+				return fmt.Errorf("failed to get radix page: %w", err)
+			}
+			db.freeSubPagesHead = radixPage.pageNumber
+		}
 	}
 
 	return nil

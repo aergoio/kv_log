@@ -3101,3 +3101,184 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 
 	t.Logf("Successfully completed test with %d transactions and %d total keys", numTransactions, totalKeysExpected)
 }
+
+func TestHeaderReadingWithWAL(t *testing.T) {
+	// Create a temporary database
+	dbPath := "test_header_wal.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-index")
+	defer os.Remove(dbPath + "-wal")
+
+	// Test 1: Create database with WAL enabled
+	db, err := Open(dbPath, Options{})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Add some data to trigger index updates
+	err = db.Set([]byte("key"), []byte("value"))
+	if err != nil {
+		t.Fatalf("Failed to set key: %v", err)
+	}
+
+	// Force a flush to write pages (including header) to WAL
+	err = db.Sync()
+	if err != nil {
+		t.Fatalf("Failed to sync: %v", err)
+	}
+
+	// Add more data to create a difference between WAL and index file
+	err = db.Set([]byte("another_key"), []byte("another_value"))
+	if err != nil {
+		t.Fatalf("Failed to set second key: %v", err)
+	}
+
+	// Store the current lastIndexedOffset (this should be in WAL but not in index file)
+	originalOffset := db.mainFileSize
+	originalFreeHead := db.freeSubPagesHead
+
+	// Close the database (will commit the changes to the WAL file)
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Test 2: Reopen database and verify header is read correctly from WAL
+	db2, err := Open(dbPath, Options{})
+	if err != nil {
+		t.Fatalf("Failed to reopen database: %v", err)
+	}
+
+	// Verify that the lastIndexedOffset was read from WAL (should match original)
+	if db2.lastIndexedOffset != originalOffset {
+		t.Errorf("lastIndexedOffset mismatch: expected %d, got %d", originalOffset, db2.lastIndexedOffset)
+	}
+
+	// Verify that the freeSubPagesHead was read from WAL
+	if db2.freeSubPagesHead != originalFreeHead {
+		t.Errorf("freeSubPagesHead mismatch: expected %d, got %d", originalFreeHead, db2.freeSubPagesHead)
+	}
+
+	// Verify that we can still read both keys (showing WAL was properly loaded)
+	value1, err := db2.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("Failed to get key: %v", err)
+	}
+	if string(value1) != "value" {
+		t.Errorf("Value mismatch: expected 'value', got '%s'", string(value1))
+	}
+
+	value2, err := db2.Get([]byte("another_key"))
+	if err != nil {
+		t.Fatalf("Failed to get another_key: %v", err)
+	}
+	if string(value2) != "another_value" {
+		t.Errorf("Value mismatch: expected 'another_value', got '%s'", string(value2))
+	}
+
+	err = db2.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+}
+
+func TestHeaderReadingWithoutWAL(t *testing.T) {
+	// Create a temporary database
+	dbPath := "test_header_no_wal.db"
+	defer os.Remove(dbPath)
+	defer os.Remove(dbPath + "-index")
+	defer os.Remove(dbPath + "-wal")
+
+	// Open database using default options (WAL enabled)
+	db, err := Open(dbPath, Options{})
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Add some data
+	err = db.Set([]byte("key"), []byte("value"))
+	if err != nil {
+		t.Fatalf("Failed to set key: %v", err)
+	}
+	err = db.Set([]byte("another_key"), []byte("another_value"))
+	if err != nil {
+		t.Fatalf("Failed to set another key: %v", err)
+	}
+	err = db.Set([]byte("third_key"), []byte("third_value"))
+	if err != nil {
+		t.Fatalf("Failed to set third key: %v", err)
+	}
+
+	// Store the current mainFileSize for comparison
+	originalOffset := db.mainFileSize
+	originalFreeHead := db.freeSubPagesHead
+
+	// Close the database (will commit the changes to the WAL file)
+	err = db.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+
+	// Reopen database - this will do a checkpoint of the WAL into the index file
+	db2, err := Open(dbPath, Options{})
+	if err != nil {
+		t.Fatalf("Failed to reopen database first time: %v", err)
+	}
+
+	// Close again to ensure any WAL created during opening is cleaned up
+	err = db2.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database second time: %v", err)
+	}
+
+	// Verify that no WAL file exists before the final test
+	walPath := dbPath + "-wal"
+	if _, err := os.Stat(walPath); err == nil {
+		// WAL file exists, remove it to ensure clean test
+		os.Remove(walPath)
+	}
+
+	// Final reopen - this should read header directly from index file only
+	db3, err := Open(dbPath, Options{})
+	if err != nil {
+		t.Fatalf("Failed to reopen database final time: %v", err)
+	}
+
+	// Verify that the lastIndexedOffset was read correctly from index file
+	if db3.lastIndexedOffset != originalOffset {
+		t.Errorf("lastIndexedOffset mismatch: expected %d, got %d", originalOffset, db3.lastIndexedOffset)
+	}
+
+	// Verify that the freeSubPagesHead was read correctly from index file
+	if db3.freeSubPagesHead != originalFreeHead {
+		t.Errorf("freeSubPagesHead mismatch: expected %d, got %d", originalFreeHead, db3.freeSubPagesHead)
+	}
+
+	// Verify that we can still read the data
+	value, err := db3.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("Failed to get key: %v", err)
+	}
+	if string(value) != "value" {
+		t.Errorf("Value mismatch: expected 'value', got '%s'", string(value))
+	}
+	value, err = db3.Get([]byte("another_key"))
+	if err != nil {
+		t.Fatalf("Failed to get another_key: %v", err)
+	}
+	if string(value) != "another_value" {
+		t.Errorf("Value mismatch: expected 'another_value', got '%s'", string(value))
+	}
+	value, err = db3.Get([]byte("third_key"))
+	if err != nil {
+		t.Fatalf("Failed to get third_key: %v", err)
+	}
+	if string(value) != "third_value" {
+		t.Errorf("Value mismatch: expected 'third_value', got '%s'", string(value))
+	}
+
+	err = db3.Close()
+	if err != nil {
+		t.Fatalf("Failed to close database: %v", err)
+	}
+}
