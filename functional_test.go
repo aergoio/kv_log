@@ -3528,3 +3528,59 @@ func TestTransactionVisibility(t *testing.T) {
 		})
 	}
 }
+
+// TestTransactionVisibilityOnFreshDB covers the case when the DB was just opened and there is a single transaction run on it.
+// This is important to ensure isolation guarantees even for the very first transaction on a fresh database.
+func TestTransactionVisibilityOnFreshDB(t *testing.T) {
+	dbPath := "test_transaction_visibility_fresh.db"
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	key := "tx-key-1"
+	val := "tx-value-1"
+
+	// Start a transaction
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Set a value in the transaction
+	err = tx.Set([]byte(key), []byte(val))
+	if err != nil {
+		t.Fatalf("Failed to set value in transaction: %v", err)
+	}
+
+	// The value should NOT be visible from db.Get (should return error)
+	_, err = db.Get([]byte(key))
+	if err == nil {
+		t.Fatalf("db.Get should not see uncommitted value, but got value for key %s", key)
+	}
+
+	// Commit the transaction
+	err = tx.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
+	}
+
+	// Now the value should be visible from db.Get
+	got, err := db.Get([]byte(key))
+	if err != nil {
+		t.Fatalf("db.Get should see committed value, but got error: %v", err)
+	}
+	if !bytes.Equal(got, []byte(val)) {
+		t.Fatalf("db.Get returned wrong value after commit: got %s, want %s", string(got), val)
+	}
+}
