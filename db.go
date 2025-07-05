@@ -2132,8 +2132,18 @@ func (db *DB) Begin() (*Transaction, error) {
 	// Start a transaction
 	db.beginTransaction()
 
-	// Create and return transaction object
-	return &Transaction{db: db}, nil
+	// Create the transaction object
+	tx := &Transaction{db: db}
+
+	// Set a finalizer to rollback the transaction if it is not committed or rolled back
+	runtime.SetFinalizer(tx, func(t *Transaction) {
+		if t.db.inExplicitTransaction {
+			_ = t.Rollback()
+		}
+	})
+
+	// Return the transaction object
+	return tx, nil
 }
 
 // Commit a transaction
