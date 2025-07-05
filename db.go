@@ -130,6 +130,7 @@ type DB struct {
 	calledByTransaction bool // Track if the method was called by a transaction
 	txnSequence    int64  // Current transaction sequence number
 	flushSequence  int64  // Current flush up to this transaction sequence number
+	maxReadSequence int64 // Maximum transaction sequence number that can be read
 	pruningSequence int64 // Last transaction sequence number when cache pruning was performed
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  uint64 // Counter for page access times
@@ -1138,8 +1139,18 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		return nil, fmt.Errorf("key length exceeds maximum allowed size of %d bytes", MaxKeyLength)
 	}
 
+	// Determine the maximum transaction sequence number that can be read
+	var maxReadSequence int64
+	db.seqMutex.Lock()
+	if db.calledByTransaction || !db.inTransaction {
+		maxReadSequence = db.txnSequence
+	} else {
+		maxReadSequence = db.txnSequence - 1
+	}
+	db.seqMutex.Unlock()
+
 	// Start with the root radix sub-page
-	rootSubPage, err := db.getRootRadixSubPage()
+	rootSubPage, err := db.getRootRadixSubPage(maxReadSequence)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get root radix sub-page: %w", err)
 	}
@@ -1162,7 +1173,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		}
 
 		// Load the next page
-		page, err := db.getPage(nextPageNumber)
+		page, err := db.getPage(nextPageNumber, maxReadSequence)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load page %d: %w", nextPageNumber, err)
 		}
@@ -2165,8 +2176,11 @@ func (tx *Transaction) Set(key, value []byte) error {
 
 // Get a value for a key within a transaction
 func (tx *Transaction) Get(key []byte) ([]byte, error) {
-	// Call the database's get method
-	return tx.db.Get(key)
+	// Set the flag to indicate this is called from a transaction
+	tx.db.calledByTransaction = true
+	value, err := tx.db.Get(key)
+	tx.db.calledByTransaction = false
+	return value, err
 }
 
 // Delete a key within a transaction
@@ -2760,27 +2774,53 @@ func (db *DB) removeOldPagesFromCache() {
 // ------------------------------------------------------------------------------------------------
 
 // getPage gets a page from the cache or from the disk
-func (db *DB) getPage(pageNumber uint32) (*Page, error) {
+// If maxReadSequence > 0, only returns pages with txnSequence <= maxReadSequence
+func (db *DB) getPage(pageNumber uint32, maxReadSeq ...int64) (*Page, error) {
 
-	// This mutex is used to avoid race conditions when updating the access time
+	// Determine the maximum transaction sequence number that can be read
+	var maxReadSequence int64
+	if len(maxReadSeq) > 0 && maxReadSeq[0] > 0 {
+		maxReadSequence = maxReadSeq[0]
+	} else {
+		// Default behavior: no filtering
+		maxReadSequence = 0
+	}
+
+	// Get the page from the cache
+	bucket := &db.pageCache[pageNumber & 1023]
+	bucket.mutex.RLock()
+	page, exists := bucket.pages[pageNumber]
+
+	// Store the parent page to update the access time
+	parentPage := page
+
+	// If maxReadSequence is specified, find the latest version that's <= maxReadSequence
+	if exists && maxReadSequence > 0 {
+		for ; page != nil; page = page.next {
+			if page.txnSequence <= maxReadSequence {
+				break
+			}
+		}
+		// If we did not find a valid page version
+		if page == nil {
+			exists = false
+		}
+	}
+
+	// If the page is in cache, update the access time on the parent page
+	if exists {
+		db.accessCounter++
+		parentPage.accessTime = db.accessCounter
+	}
+
+	// The mutex is still locked to avoid race conditions when updating the access time
 	// Example: main thread gets page from cache, the worker thread checks the access time
 	// and removes the page from the cache. the main thread will then update the access time
 	// but the page will no longer be in the cache.
-	// First check the cache
-
-	bucket := &db.pageCache[pageNumber & 1023]
-
-	bucket.mutex.RLock()
-	page, exists := bucket.pages[pageNumber]
-	if exists {
-		// If the page is in cache, update the access time
-		db.accessCounter++
-		page.accessTime = db.accessCounter
-	}
 	bucket.mutex.RUnlock()
 
+	// If not in cache or no valid version found, read it from disk
 	if !exists {
-		// If not in cache, read it from disk
 		var err error
 		page, err = db.readPage(pageNumber)
 		if err != nil {
@@ -2793,9 +2833,9 @@ func (db *DB) getPage(pageNumber uint32) (*Page, error) {
 }
 
 // getRadixPage returns a radix page from the cache or from the disk
-func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
+func (db *DB) getRadixPage(pageNumber uint32, maxReadSequence ...int64) (*RadixPage, error) {
 	// Get the page from the cache or from the disk
-	page, err := db.getPage(pageNumber)
+	page, err := db.getPage(pageNumber, maxReadSequence...)
 	if err != nil {
 		return nil, err
 	}
@@ -2810,9 +2850,9 @@ func (db *DB) getRadixPage(pageNumber uint32) (*RadixPage, error) {
 }
 
 // getLeafPage returns a leaf page from the cache or from the disk
-func (db *DB) getLeafPage(pageNumber uint32) (*LeafPage, error) {
+func (db *DB) getLeafPage(pageNumber uint32, maxReadSequence ...int64) (*LeafPage, error) {
 	// Get the page from the cache or from the disk
-	page, err := db.getPage(pageNumber)
+	page, err := db.getPage(pageNumber, maxReadSequence...)
 	if err != nil {
 		return nil, err
 	}
@@ -3008,13 +3048,13 @@ func (db *DB) flushDirtyIndexPages() (int, error) {
 // ------------------------------------------------------------------------------------------------
 
 // getRootRadixPage returns the root radix page (page 1) from the cache
-func (db *DB) getRootRadixPage() (*RadixPage, error) {
-	return db.getRadixPage(1)
+func (db *DB) getRootRadixPage(maxReadSequence ...int64) (*RadixPage, error) {
+	return db.getRadixPage(1, maxReadSequence...)
 }
 
-// getRootRadixPage returns the root radix page (page 1) from the cache
-func (db *DB) getRootRadixSubPage() (*RadixSubPage, error) {
-	rootPage, err := db.getRadixPage(1)
+// getRootRadixSubPage returns the root radix sub-page (page 1) from the cache
+func (db *DB) getRootRadixSubPage(maxReadSequence ...int64) (*RadixSubPage, error) {
+	rootPage, err := db.getRadixPage(1, maxReadSequence...)
 	if err != nil {
 		return nil, err
 	}
