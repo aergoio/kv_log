@@ -1954,7 +1954,7 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 // first read 1 byte to check the page type
 // then read the page data
 func (db *DB) readPage(pageNumber uint32) (*Page, error) {
-	data, err := db.readIndexPage(pageNumber)
+	data, err := db.readFromIndexFile(pageNumber)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read page: %w", err)
 	}
@@ -2004,11 +2004,6 @@ func (db *DB) writeIndexPage(page *Page) error {
 	}
 
 	return err
-}
-
-// readIndexPage reads an index page from the index file
-func (db *DB) readIndexPage(pageNumber uint32) ([]byte, error) {
-	return db.readFromIndexFile(pageNumber)
 }
 
 // writeToIndexFile writes an index page to the index file
