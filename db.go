@@ -151,6 +151,7 @@ type DB struct {
 // Transaction represents a database transaction
 type Transaction struct {
 	db *DB
+	txnSequence int64
 }
 
 // Content represents a piece of content in the database
@@ -2138,12 +2139,14 @@ func (db *DB) Begin() (*Transaction, error) {
 	db.beginTransaction()
 
 	// Create the transaction object
-	tx := &Transaction{db: db}
+	tx := &Transaction{db: db, txnSequence: db.txnSequence}
 
 	// Set a finalizer to rollback the transaction if it is not committed or rolled back
 	runtime.SetFinalizer(tx, func(t *Transaction) {
-		if t.db.inExplicitTransaction {
-			_ = t.Rollback()
+		t.db.mutex.Lock()
+		defer t.db.mutex.Unlock()
+		if t.db.inExplicitTransaction && t.txnSequence == t.db.txnSequence {
+			_ = t.rollback()
 		}
 	})
 
@@ -2178,6 +2181,11 @@ func (tx *Transaction) Rollback() error {
 	tx.db.mutex.Lock()
 	defer tx.db.mutex.Unlock()
 
+	return tx.rollback()
+}
+
+// rollback is the internal rollback function that assumes the mutex is already held
+func (tx *Transaction) rollback() error {
 	// Check if transaction is open
 	if !tx.db.inExplicitTransaction {
 		return fmt.Errorf("no transaction is open")
