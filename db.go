@@ -436,6 +436,11 @@ func Open(path string, options ...Options) (*DB, error) {
 		db.startBackgroundWorker()
 	}
 
+	// Set a finalizer to close the database if it is not closed
+	runtime.SetFinalizer(db, func(d *DB) {
+		_ = d.Close()
+	})
+
 	return db, nil
 }
 
