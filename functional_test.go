@@ -3282,3 +3282,249 @@ func TestHeaderReadingWithoutWAL(t *testing.T) {
 		t.Fatalf("Failed to close database: %v", err)
 	}
 }
+
+func TestTransactionVisibility(t *testing.T) {
+	type txnVisibilityTestCase struct {
+		name        string
+		initialData map[string]string
+		txnChanges  map[string]string
+		deleteKey   string
+	}
+
+	testCases := []txnVisibilityTestCase{
+		{
+			name: "SamePrefixKeys",
+			initialData: map[string]string{
+				"key1": "initial-value1",
+				"key2": "initial-value2",
+				"key3": "initial-value3",
+			},
+			txnChanges: map[string]string{
+				"key1": "txn-modified-value1",
+				"key4": "txn-new-value4",
+			},
+			deleteKey: "key3",
+		},
+		{
+			name: "DifferentPrefixKeys",
+			initialData: map[string]string{
+				"first-key": "initial-value1",
+				"second-key": "initial-value2",
+				"third-key": "initial-value3",
+			},
+			txnChanges: map[string]string{
+				"first-key": "txn-modified-value1",
+				"fourth-key": "txn-new-value4",
+			},
+			deleteKey: "third-key",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create a test database
+			dbPath := "test_transaction_visibility_" + tc.name + ".db"
+
+			// Clean up any existing test database
+			os.Remove(dbPath)
+			os.Remove(dbPath + "-index")
+			os.Remove(dbPath + "-wal")
+
+			// Open a new database
+			db, err := Open(dbPath)
+			if err != nil {
+				t.Fatalf("Failed to open database: %v", err)
+			}
+			defer func() {
+				db.Close()
+				os.Remove(dbPath)
+				os.Remove(dbPath + "-index")
+				os.Remove(dbPath + "-wal")
+			}()
+
+			// Insert initial data
+			for k, v := range tc.initialData {
+				if err := db.Set([]byte(k), []byte(v)); err != nil {
+					t.Fatalf("Failed to set initial key %s: %v", k, err)
+				}
+			}
+
+			// Verify initial data exists
+			for k, expectedValue := range tc.initialData {
+				value, err := db.Get([]byte(k))
+				if err != nil {
+					t.Fatalf("Failed to get initial key %s: %v", k, err)
+				}
+				if !bytes.Equal(value, []byte(expectedValue)) {
+					t.Fatalf("Initial value mismatch for key %s: got %s, want %s", k, string(value), expectedValue)
+				}
+			}
+
+			// Begin a transaction
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatalf("Failed to begin transaction: %v", err)
+			}
+
+			// Make changes within the transaction
+			for k, v := range tc.txnChanges {
+				if err := tx.Set([]byte(k), []byte(v)); err != nil {
+					t.Fatalf("Failed to set key %s in transaction: %v", k, err)
+				}
+			}
+
+			// Delete a key within the transaction
+			if err := tx.Delete([]byte(tc.deleteKey)); err != nil {
+				t.Fatalf("Failed to delete %s in transaction: %v", tc.deleteKey, err)
+			}
+
+			// TEST 1: Verify that db.Get() doesn't see changes from the open transaction
+			t.Log("Testing db.Get() doesn't see transaction changes")
+
+			// Check modified key
+			var modifiedKey string
+			var modifiedValue string
+			for k, v := range tc.txnChanges {
+				if _, ok := tc.initialData[k]; ok {
+					modifiedKey = k
+					modifiedValue = v
+					break
+				}
+			}
+			if modifiedKey == "" {
+				t.Fatalf("No modified key found in txnChanges that exists in initialData")
+			}
+			value, err := db.Get([]byte(modifiedKey))
+			if err != nil {
+				t.Fatalf("Failed to get %s with db.Get(): %v", modifiedKey, err)
+			}
+			if !bytes.Equal(value, []byte(tc.initialData[modifiedKey])) {
+				t.Fatalf("db.Get() should not see transaction changes for %s: got %s, want %s",
+					string(modifiedKey), string(value), tc.initialData[modifiedKey])
+			}
+
+			// Check new key
+			var newKey string
+			var newValue string
+			for k, v := range tc.txnChanges {
+				if _, ok := tc.initialData[k]; !ok {
+					newKey = k
+					newValue = v
+					break
+				}
+			}
+			if newKey == "" {
+				t.Fatalf("No new key found in txnChanges that does not exist in initialData")
+			}
+			_, err = db.Get([]byte(newKey))
+			if err == nil {
+				t.Fatalf("db.Get() should not see new %s from transaction", newKey)
+			}
+
+			// Check deleted key
+			deletedKey := tc.deleteKey
+			value, err = db.Get([]byte(deletedKey))
+			if err != nil {
+				t.Fatalf("db.Get() should still see %s that was deleted in transaction: %v", deletedKey, err)
+			}
+			if !bytes.Equal(value, []byte(tc.initialData[deletedKey])) {
+				t.Fatalf("db.Get() value mismatch for %s: got %s, want %s",
+					deletedKey, string(value), tc.initialData[deletedKey])
+			}
+
+			// TEST 2: Verify that txn.Get() can see its own changes
+			t.Log("Testing txn.Get() can see transaction changes")
+
+			// Check modified key
+			txValue, err := tx.Get([]byte(modifiedKey))
+			if err != nil {
+				t.Fatalf("Failed to get %s with tx.Get(): %v", modifiedKey, err)
+			}
+			if !bytes.Equal(txValue, []byte(modifiedValue)) {
+				t.Fatalf("tx.Get() should see transaction changes for %s: got %s, want %s",
+					modifiedKey, string(txValue), modifiedValue)
+			}
+
+			// Check new key
+			txValue, err = tx.Get([]byte(newKey))
+			if err != nil {
+				t.Fatalf("Failed to get %s with tx.Get(): %v", newKey, err)
+			}
+			if !bytes.Equal(txValue, []byte(newValue)) {
+				t.Fatalf("tx.Get() should see new %s from transaction: got %s, want %s",
+					newKey, string(txValue), newValue)
+			}
+
+			// Check deleted key
+			_, err = tx.Get([]byte(deletedKey))
+			if err == nil {
+				t.Fatalf("tx.Get() should not see %s that was deleted in transaction", deletedKey)
+			}
+
+			// TEST 3: Commit the transaction and verify db.Get() now sees the changes
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("Failed to commit transaction: %v", err)
+			}
+			t.Log("Transaction committed, testing db.Get() now sees changes")
+
+			// Check modified key
+			value, err = db.Get([]byte(modifiedKey))
+			if err != nil {
+				t.Fatalf("Failed to get %s after commit: %v", modifiedKey, err)
+			}
+			if !bytes.Equal(value, []byte(modifiedValue)) {
+				t.Fatalf("After commit, value mismatch for %s: got %s, want %s",
+					modifiedKey, string(value), modifiedValue)
+			}
+
+			// Check new key
+			value, err = db.Get([]byte(newKey))
+			if err != nil {
+				t.Fatalf("Failed to get %s after commit: %v", newKey, err)
+			}
+			if !bytes.Equal(value, []byte(newValue)) {
+				t.Fatalf("After commit, value mismatch for %s: got %s, want %s",
+					newKey, string(value), newValue)
+			}
+
+			// Check deleted key
+			_, err = db.Get([]byte(deletedKey))
+			if err == nil {
+				t.Fatalf("After commit, %s should still be deleted", deletedKey)
+			}
+
+			// TEST 4: Start a new transaction and verify it sees the committed changes
+			tx2, err := db.Begin()
+			if err != nil {
+				t.Fatalf("Failed to begin second transaction: %v", err)
+			}
+			defer tx2.Rollback()
+
+			// Check modified key
+			tx2Value, err := tx2.Get([]byte(modifiedKey))
+			if err != nil {
+				t.Fatalf("Failed to get %s in second transaction: %v", modifiedKey, err)
+			}
+			if !bytes.Equal(tx2Value, []byte(modifiedValue)) {
+				t.Fatalf("Second transaction value mismatch for %s: got %s, want %s",
+					modifiedKey, string(tx2Value), modifiedValue)
+			}
+
+			// Check new key
+			tx2Value, err = tx2.Get([]byte(newKey))
+			if err != nil {
+				t.Fatalf("Failed to get %s in second transaction: %v", newKey, err)
+			}
+			if !bytes.Equal(tx2Value, []byte(newValue)) {
+				t.Fatalf("Second transaction value mismatch for %s: got %s, want %s",
+					newKey, string(tx2Value), newValue)
+			}
+
+			// Check deleted key
+			_, err = tx2.Get([]byte(deletedKey))
+			if err == nil {
+				t.Fatalf("Second transaction should not see deleted %s", deletedKey)
+			}
+		})
+	}
+}
