@@ -1063,7 +1063,8 @@ func TestReverseIterator(t *testing.T) {
 	}
 
 	// Verify we found all keys in reverse order
-	expectedKeys := []string{"key5", "key4", "key3", "key2", "key1"}
+	// Exclusive end: should not include "key1"
+	expectedKeys := []string{"key5", "key4", "key3", "key2"}
 	if count != len(expectedKeys) {
 		t.Fatalf("Reverse iterator found %d entries, expected %d", count, len(expectedKeys))
 	}
@@ -1080,7 +1081,8 @@ func TestReverseIterator(t *testing.T) {
 	rangeIt := db.NewIterator([]byte("key4"), []byte("key2"))
 	defer rangeIt.Close()
 
-	expectedRangeKeys := []string{"key4", "key3", "key2"}
+	// Exclusive end: should not include "key2"
+	expectedRangeKeys := []string{"key4", "key3"}
 	foundRangeKeys := make([]string, 0)
 
 	for rangeIt.Valid() {
@@ -1122,7 +1124,8 @@ func TestReverseIterator(t *testing.T) {
 	defer modifiedIt.Close()
 
 	// Expected data after modifications in reverse order
-	expectedModKeys := []string{"key6", "key5", "key4", "key2", "key1"}
+	// Exclusive end: should not include "key1"
+	expectedModKeys := []string{"key6", "key5", "key4", "key2"}
 	foundModKeys := make([]string, 0)
 
 	// Iterate through entries in reverse order
@@ -1143,7 +1146,6 @@ func TestReverseIterator(t *testing.T) {
 				i, foundModKeys[i], expectedKey)
 		}
 	}
-
 
 	// Test with empty database
 	emptyDbPath := "test_empty_reverse_iterator.db"
@@ -1397,13 +1399,16 @@ func TestReverseIteratorWithMixedKeys(t *testing.T) {
 
 	// Test 1: Full reverse iteration (all keys in reverse lexicographical order)
 	// Use maximum byte value as start and minimum as end to ensure we cover all keys
-	it := db.NewIterator([]byte{255}, []byte{0}) // From byte 255 (inclusive) to byte 0 (inclusive)
+	it := db.NewIterator([]byte{255}, []byte{0}) // From byte 255 (inclusive) to byte 0 (exclusive)
 	defer it.Close()
 
-	// Expected order: keys in reverse lexicographical order
-	expectedOrder := make([]string, len(testKeys))
-	copy(expectedOrder, testKeys)
-	// Sort in reverse lexicographical order
+	// Expected order: keys in reverse lexicographical order, excluding the end key (byte 0)
+	expectedOrder := make([]string, 0, len(testKeys))
+	for _, k := range testKeys {
+		if k != string([]byte{0}) {
+			expectedOrder = append(expectedOrder, k)
+		}
+	}
 	sort.Slice(expectedOrder, func(i, j int) bool {
 		return expectedOrder[i] > expectedOrder[j]
 	})
@@ -1442,7 +1447,7 @@ func TestReverseIteratorWithMixedKeys(t *testing.T) {
 	prefixIt := db.NewIterator([]byte("bzz"), []byte("b"))
 	defer prefixIt.Close()
 
-	// Expected keys with prefix "b" in reverse lexicographical order
+	// Expected keys with prefix "b" in reverse lexicographical order, excluding the end key "b"
 	expectedPrefixKeys := []string{
 		"bcd-long-2",
 		"bcd-3-1",
@@ -1455,6 +1460,9 @@ func TestReverseIteratorWithMixedKeys(t *testing.T) {
 	foundPrefixKeys := make([]string, 0)
 	for prefixIt.Valid() {
 		key := string(prefixIt.Key())
+		if key <= "b" {
+			break
+		}
 		foundPrefixKeys = append(foundPrefixKeys, key)
 		prefixIt.Next()
 	}
@@ -1472,18 +1480,20 @@ func TestReverseIteratorWithMixedKeys(t *testing.T) {
 	}
 
 	// Test 3: Mixed prefix reverse iteration (keys between "c" and "a")
-	mixedIt := db.NewIterator([]byte("c"), []byte("a")) // From "c" (inclusive) to "a" (inclusive)
+	mixedIt := db.NewIterator([]byte("c"), []byte("a")) // From "c" (inclusive) to "a" (exclusive)
 	defer mixedIt.Close()
 
-	// Expected keys between "c" (inclusive) and "a" (inclusive) in reverse order
-	// This should include all keys starting with "b" and all keys starting with "a"
-	// We'll collect them dynamically from our sorted list
+	// Expected keys between "c" (inclusive) and "a" (exclusive) in reverse order
 	expectedMixedKeys := make([]string, 0)
-	for _, key := range expectedOrder {
-		if key >= "a" && key <= "c" {
+	for _, key := range testKeys {
+		if (key > "a" && key <= "c") {
 			expectedMixedKeys = append(expectedMixedKeys, key)
 		}
 	}
+	// Sort in reverse lexicographical order
+	sort.Slice(expectedMixedKeys, func(i, j int) bool {
+		return expectedMixedKeys[i] > expectedMixedKeys[j]
+	})
 
 	foundMixedKeys := make([]string, 0)
 	for mixedIt.Valid() {

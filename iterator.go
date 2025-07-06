@@ -44,7 +44,7 @@ type radixIterPos struct {
 //   - end is exclusive (<)
 // For reverse iteration:
 //   - start is inclusive (<=)
-//   - end is inclusive (>=)
+//   - end is exclusive (>)
 func (db *DB) NewIterator(start, end []byte) *Iterator {
 	// Determine if we should iterate in reverse order (start > end)
 	reverse := false
@@ -122,7 +122,7 @@ func (it *Iterator) Next() {
 			if it.valid && !it.isKeyInRange(it.currentKey) {
 				// Key is outside our range, check if we should stop or continue
 				if it.reverse {
-					if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) < 0 {
+					if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) <= 0 {
 						// We've passed the end bound in reverse, stop iteration
 						it.valid = false
 						it.keyPrefix = it.keyPrefix[:0] // Reset keyPrefix
@@ -152,7 +152,7 @@ func (it *Iterator) Next() {
 			if it.valid && !it.isKeyInRange(it.currentKey) {
 				// Key is outside our range, check if we should stop or continue
 				if it.reverse {
-					if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) < 0 {
+					if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) <= 0 {
 						// We've passed the end bound in reverse, stop iteration
 						it.valid = false
 						it.keyPrefix = it.keyPrefix[:0] // Reset keyPrefix
@@ -538,15 +538,15 @@ func (it *Iterator) isKeyInRange(key []byte) bool {
 	if it.reverse {
 		// In reverse mode:
 		// - start is the upper bound (inclusive)
-		// - end is the lower bound (inclusive)
+		// - end is the lower bound (exclusive)
 
 		// Check upper bound (inclusive)
 		if len(it.start) > 0 && bytes.Compare(key, it.start) > 0 {
 			return false
 		}
 
-		// Check lower bound (inclusive)
-		if len(it.end) > 0 && bytes.Compare(key, it.end) < 0 {
+		// Check lower bound (exclusive)
+		if len(it.end) > 0 && bytes.Compare(key, it.end) <= 0 {
 			return false
 		}
 	} else {
@@ -588,9 +588,9 @@ func (it *Iterator) shouldSkipSubtree(nextByte uint8) bool {
 			}
 		}
 
-		// Check if prefix could lead to keys >= end (lower bound)
+		// Check if prefix could lead to keys > end (lower bound, exclusive)
 		if len(it.end) > 0 {
-			if isPrefixLessThan(potentialPrefix, it.end) {
+			if isPrefixLessThanOrEqual(potentialPrefix, it.end) {
 				return true
 			}
 		}
@@ -658,17 +658,27 @@ func isPrefixGreaterThanOrEqual(prefix, target []byte) bool {
 
 	// If prefix is shorter than target
 	if len(prefix) < len(target) {
-		cmp := bytes.Compare(prefix, target[:len(prefix)])
-		// If prefix equals the corresponding part of target, don't skip
-		if cmp == 0 {
-			return false
-		}
+		// If prefix equals the corresponding part of target, it can lead to keys < target, so don't skip
 		// Otherwise, skip if prefix > corresponding part of target
-		return cmp > 0
+		return bytes.Compare(prefix, target[:len(prefix)]) > 0
 	}
 
 	// If prefix is equal length to target
 	return bytes.Compare(prefix, target) >= 0
+}
+
+// isPrefixLessThanOrEqual returns true if the prefix is less than or equal to the target key
+// and can't lead to any keys > target
+func isPrefixLessThanOrEqual(prefix, target []byte) bool {
+	// If prefix is longer than target, compare only the common part
+	if len(prefix) > len(target) {
+		// Compare the common part
+		return bytes.Compare(prefix[:len(target)], target) < 0
+	}
+
+	// Otherwise (if prefix equals or is greater than the corresponding part of target),
+	// it can lead to keys > target, so don't skip
+	return bytes.Compare(prefix, target[:len(prefix)]) < 0
 }
 
 // getStartingByte returns the appropriate starting byte value based on iteration direction
