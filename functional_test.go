@@ -776,7 +776,7 @@ func TestIterator(t *testing.T) {
 	}
 
 	// Create an iterator (no range filtering)
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(nil, nil, false)
 	defer it.Close()
 
 	// Count the number of entries found
@@ -837,7 +837,7 @@ func TestIterator(t *testing.T) {
 	}
 
 	// Create a new iterator (no range filtering)
-	modifiedIt := db.NewIterator(nil, nil)
+	modifiedIt := db.NewIterator(nil, nil, false)
 	defer modifiedIt.Close()
 
 	// Reset tracking variables
@@ -894,7 +894,7 @@ func TestIterator(t *testing.T) {
 
 	// Test range filtering with iterator
 	// Test 1: Range from "key2" to "key5" (exclusive)
-	rangeIt := db.NewIterator([]byte("key2"), []byte("key5"))
+	rangeIt := db.NewIterator([]byte("key2"), []byte("key5"), false)
 	defer rangeIt.Close()
 
 	expectedRangeKeys := []string{"key2", "key4"} // key3 was deleted, key5 is excluded
@@ -919,7 +919,7 @@ func TestIterator(t *testing.T) {
 	}
 
 	// Test 2: Range with only start bound
-	startOnlyIt := db.NewIterator([]byte("key4"), nil)
+	startOnlyIt := db.NewIterator([]byte("key4"), nil, false)
 	defer startOnlyIt.Close()
 
 	expectedStartOnlyKeys := []string{"key4", "key5", "key6"} // keys >= "key4"
@@ -944,7 +944,7 @@ func TestIterator(t *testing.T) {
 	}
 
 	// Test 3: Range with only end bound
-	endOnlyIt := db.NewIterator(nil, []byte("key4"))
+	endOnlyIt := db.NewIterator(nil, []byte("key4"), false)
 	defer endOnlyIt.Close()
 
 	expectedEndOnlyKeys := []string{"key1", "key2"} // keys < "key4"
@@ -985,7 +985,7 @@ func TestIterator(t *testing.T) {
 		os.Remove(emptyDbPath + "-wal")
 	}()
 
-	emptyIt := emptyDb.NewIterator(nil, nil)
+	emptyIt := emptyDb.NewIterator(nil, nil, false)
 	defer emptyIt.Close()
 
 	// Verify the iterator is not valid for an empty database
@@ -1031,7 +1031,7 @@ func TestReverseIterator(t *testing.T) {
 	}
 
 	// Test 1: Create a reverse iterator (start > end)
-	it := db.NewIterator([]byte("key5"), []byte("key1"))
+	it := db.NewIterator([]byte("key5"), []byte("key1"), true)
 	defer it.Close()
 
 	// Count the number of entries found
@@ -1078,7 +1078,7 @@ func TestReverseIterator(t *testing.T) {
 	}
 
 	// Test 2: Test specific range (key4 to key2)
-	rangeIt := db.NewIterator([]byte("key4"), []byte("key2"))
+	rangeIt := db.NewIterator([]byte("key4"), []byte("key2"), true)
 	defer rangeIt.Close()
 
 	// Exclusive end: should not include "key2"
@@ -1120,7 +1120,7 @@ func TestReverseIterator(t *testing.T) {
 	}
 
 	// Create a new reverse iterator (start > end)
-	modifiedIt := db.NewIterator([]byte("key6"), []byte("key1"))
+	modifiedIt := db.NewIterator([]byte("key6"), []byte("key1"), true)
 	defer modifiedIt.Close()
 
 	// Expected data after modifications in reverse order
@@ -1164,7 +1164,7 @@ func TestReverseIterator(t *testing.T) {
 		os.Remove(emptyDbPath + "-wal")
 	}()
 
-	emptyIt := emptyDb.NewIterator([]byte("z"), []byte("a"))
+	emptyIt := emptyDb.NewIterator([]byte("z"), []byte("a"), true)
 	defer emptyIt.Close()
 
 	// Verify the iterator is not valid for an empty database
@@ -1238,7 +1238,7 @@ func TestIteratorWithMixedKeys(t *testing.T) {
 	}
 
 	// Test 1: Full forward iteration (all keys in lexicographical order)
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(nil, nil, false)
 	defer it.Close()
 
 	// Expected order: keys in lexicographical order
@@ -1273,7 +1273,7 @@ func TestIteratorWithMixedKeys(t *testing.T) {
 	}
 
 	// Test 2: Prefix-based forward iteration (only keys with prefix "b")
-	prefixIt := db.NewIterator([]byte("b"), []byte("bzz"))
+	prefixIt := db.NewIterator([]byte("b"), []byte("bzz"), false)
 	defer prefixIt.Close()
 
 	expectedPrefixKeys := []string{
@@ -1303,7 +1303,7 @@ func TestIteratorWithMixedKeys(t *testing.T) {
 	}
 
 	// Test 3: Mixed prefix forward iteration (keys between "a" and "c")
-	mixedIt := db.NewIterator([]byte("a"), []byte("c")) // From "a" (inclusive) to "c" (exclusive)
+	mixedIt := db.NewIterator([]byte("a"), []byte("c"), false) // From "a" (inclusive) to "c" (exclusive)
 	defer mixedIt.Close()
 
 	// Expected keys between "a" (inclusive) and "c" (exclusive) in order
@@ -1399,7 +1399,7 @@ func TestReverseIteratorWithMixedKeys(t *testing.T) {
 
 	// Test 1: Full reverse iteration (all keys in reverse lexicographical order)
 	// Use maximum byte value as start and minimum as end to ensure we cover all keys
-	it := db.NewIterator([]byte{255}, []byte{0}) // From byte 255 (inclusive) to byte 0 (exclusive)
+	it := db.NewIterator([]byte{255}, []byte{0}, true) // From byte 255 (inclusive) to byte 0 (exclusive)
 	defer it.Close()
 
 	// Expected order: keys in reverse lexicographical order, excluding the end key (byte 0)
@@ -1444,7 +1444,7 @@ func TestReverseIteratorWithMixedKeys(t *testing.T) {
 	}
 
 	// Test 2: Prefix-based reverse iteration (only keys with prefix "b")
-	prefixIt := db.NewIterator([]byte("bzz"), []byte("b"))
+	prefixIt := db.NewIterator([]byte("bzz"), []byte("b"), true)
 	defer prefixIt.Close()
 
 	// Expected keys with prefix "b" in reverse lexicographical order, excluding the end key "b"
@@ -1480,7 +1480,7 @@ func TestReverseIteratorWithMixedKeys(t *testing.T) {
 	}
 
 	// Test 3: Mixed prefix reverse iteration (keys between "c" and "a")
-	mixedIt := db.NewIterator([]byte("c"), []byte("a")) // From "c" (inclusive) to "a" (exclusive)
+	mixedIt := db.NewIterator([]byte("c"), []byte("a"), true) // From "c" (inclusive) to "a" (exclusive)
 	defer mixedIt.Close()
 
 	// Expected keys between "c" (inclusive) and "a" (exclusive) in reverse order
@@ -1557,7 +1557,7 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 	}
 
 	// Create an iterator (no range filtering)
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(nil, nil, false)
 	defer it.Close()
 
 	// Count the number of entries found
@@ -1603,7 +1603,7 @@ func TestIteratorWithLargeDataset(t *testing.T) {
 	// Test range from "test-key-100" to "test-key-200" (exclusive)
 	rangeStart := []byte("test-key-100")
 	rangeEnd := []byte("test-key-200")
-	rangeIt := db.NewIterator(rangeStart, rangeEnd)
+	rangeIt := db.NewIterator(rangeStart, rangeEnd, false)
 	defer rangeIt.Close()
 
 	// Count keys in the range
@@ -1771,7 +1771,7 @@ func TestIteratorWithLargeDataset2(t *testing.T) {
 	}
 
 	// Create an iterator (no range filtering)
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(nil, nil, false)
 	defer it.Close()
 
 	// Count the number of entries found
@@ -1817,7 +1817,7 @@ func TestIteratorWithLargeDataset2(t *testing.T) {
 	// Test range from "k100" to "k200" (exclusive) - this will catch keys starting with k1
 	rangeStart := []byte("k100")
 	rangeEnd := []byte("k200")
-	rangeIt := db.NewIterator(rangeStart, rangeEnd)
+	rangeIt := db.NewIterator(rangeStart, rangeEnd, false)
 	defer rangeIt.Close()
 
 	// Count keys in the range
@@ -1863,7 +1863,7 @@ func TestIteratorWithLargeDataset2(t *testing.T) {
 	// let's test a range that should include some of them
 	singleCharStart := []byte("A")
 	singleCharEnd := []byte("z") // Extend range to include lowercase
-	singleCharIt := db.NewIterator(singleCharStart, singleCharEnd)
+	singleCharIt := db.NewIterator(singleCharStart, singleCharEnd, false)
 	defer singleCharIt.Close()
 
 	singleCharCount := 0
@@ -1900,7 +1900,7 @@ func TestIteratorWithLargeDataset2(t *testing.T) {
 	// Test with prefix-based range for keys starting with "k5"
 	prefixStart := []byte("k5")
 	prefixEnd := []byte("k6")
-	prefixIt := db.NewIterator(prefixStart, prefixEnd)
+	prefixIt := db.NewIterator(prefixStart, prefixEnd, false)
 	defer prefixIt.Close()
 
 	prefixCount := 0
@@ -2428,7 +2428,7 @@ func TestSharedPrefixKeys(t *testing.T) {
 	}
 
 	// Test all keys with iterator to make sure they're all present
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(nil, nil, false)
 	defer it.Close()
 
 	expectedKeys := []string{"ab", "abc", "ac", "acd", "gh", "ghi"}
@@ -2588,7 +2588,7 @@ func TestSharedPrefixKeysStress(t *testing.T) {
 	}
 
 	// Use iterator to verify all keys are present
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(nil, nil, false)
 	defer it.Close()
 
 	foundKeys := make(map[string]string)
@@ -2729,7 +2729,7 @@ func TestSharedPrefixKeyOrdering(t *testing.T) {
 	}
 
 	// Use iterator to verify all keys are present
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(nil, nil, false)
 	defer it.Close()
 
 	foundKeys := make(map[string]string)
@@ -3044,7 +3044,7 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 
 	// Phase 5: Test iterator after conversion
 
-	it := reopenedDb.NewIterator(nil, nil)
+	it := reopenedDb.NewIterator(nil, nil, false)
 	defer it.Close()
 
 	foundKeys := make(map[string]string)
@@ -3274,7 +3274,7 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 	startKey := fmt.Sprintf("%s%06d%s", keyPrefix, 10, keySuffix)
 	endKey := fmt.Sprintf("%s%06d%s", keyPrefix, 20, keySuffix)
 
-	it := db.NewIterator([]byte(startKey), []byte(endKey))
+	it := db.NewIterator([]byte(startKey), []byte(endKey), false)
 	defer it.Close()
 
 	rangeCount := 0
@@ -3301,7 +3301,7 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 
 	// Phase 4B: Test iterator on similar keys
 
-	it2 := db.NewIterator(nil, nil)
+	it2 := db.NewIterator(nil, nil, false)
 	defer it2.Close()
 
 	foundKeys := make(map[string]string)
@@ -3380,7 +3380,7 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 
 	// Phase 7: Test iterator on similar keys after reopen
 
-	it2 = reopenedDb.NewIterator(nil, nil)
+	it2 = reopenedDb.NewIterator(nil, nil, false)
 	defer it2.Close()
 
 	foundKeys = make(map[string]string)
@@ -3494,7 +3494,7 @@ func TestBackgroundWorkerDeadlock(t *testing.T) {
 	// Force more background activity by creating an iterator
 	// while background worker is likely still active
 	t.Logf("Creating iterator while background worker is active")
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(nil, nil, false)
 
 	keyCount := 0
 	for it.Valid() {
@@ -3608,7 +3608,7 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 	// Verify all data exists
 	totalKeysExpected := numTransactions * keysPerTransaction
 
-	it := db.NewIterator(nil, nil)
+	it := db.NewIterator(nil, nil, false)
 	defer it.Close()
 
 	keysFound := 0

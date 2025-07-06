@@ -37,22 +37,14 @@ type radixIterPos struct {
 }
 
 // NewIterator returns a new iterator for the database
-// If start > end, the iterator will iterate in reverse order
-// If start <= end, the iterator will iterate in forward order
-// For forward iteration:
+// The iterator can iterate in forward or reverse order based on the reverse parameter
+// For forward iteration (reverse=false):
 //   - start is inclusive (>=)
 //   - end is exclusive (<)
-// For reverse iteration:
+// For reverse iteration (reverse=true):
 //   - start is inclusive (<=)
 //   - end is exclusive (>)
-func (db *DB) NewIterator(start, end []byte) *Iterator {
-	// Determine if we should iterate in reverse order (start > end)
-	reverse := false
-	if len(start) > 0 && len(end) > 0 && bytes.Compare(start, end) > 0 {
-		// In reverse mode, we don't swap start and end
-		// We just mark the iterator as reverse
-		reverse = true
-	}
+func (db *DB) NewIterator(start, end []byte, reverse bool) *Iterator {
 
 	// Create a new iterator
 	it := &Iterator{
