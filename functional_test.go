@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -990,6 +991,517 @@ func TestIterator(t *testing.T) {
 	// Verify the iterator is not valid for an empty database
 	if emptyIt.Valid() {
 		t.Fatalf("Iterator for empty database should not be valid")
+	}
+}
+
+func TestReverseIterator(t *testing.T) {
+	// Create a test database
+	dbPath := "test_reverse_iterator.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Insert test data
+	testData := map[string]string{
+		"key1": "value1",
+		"key2": "value2",
+		"key3": "value3",
+		"key4": "value4",
+		"key5": "value5",
+	}
+
+	for k, v := range testData {
+		if err := db.Set([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("Failed to set '%s': %v", k, err)
+		}
+	}
+
+	// Test 1: Create a reverse iterator (start > end)
+	it := db.NewIterator([]byte("key5"), []byte("key1"))
+	defer it.Close()
+
+	// Count the number of entries found
+	count := 0
+	foundKeys := make([]string, 0)
+	foundValues := make([]string, 0)
+
+	// Iterate through all entries in reverse order
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+
+		// Verify the key-value pair
+		expectedValue, exists := testData[key]
+		if !exists {
+			t.Fatalf("Iterator returned unexpected key: %s", key)
+		}
+		if value != expectedValue {
+			t.Fatalf("Value mismatch for key '%s': got %s, want %s", key, value, expectedValue)
+		}
+
+		// Track found keys and values
+		foundKeys = append(foundKeys, key)
+		foundValues = append(foundValues, value)
+		count++
+
+		// Move to next entry
+		it.Next()
+	}
+
+	// Verify we found all keys in reverse order
+	expectedKeys := []string{"key5", "key4", "key3", "key2", "key1"}
+	if count != len(expectedKeys) {
+		t.Fatalf("Reverse iterator found %d entries, expected %d", count, len(expectedKeys))
+	}
+
+	// Verify keys are in reverse order
+	for i, expectedKey := range expectedKeys {
+		if i >= len(foundKeys) || foundKeys[i] != expectedKey {
+			t.Fatalf("Reverse iterator key mismatch at position %d: got %s, want %s",
+				i, foundKeys[i], expectedKey)
+		}
+	}
+
+	// Test 2: Test specific range (key4 to key2)
+	rangeIt := db.NewIterator([]byte("key4"), []byte("key2"))
+	defer rangeIt.Close()
+
+	expectedRangeKeys := []string{"key4", "key3", "key2"}
+	foundRangeKeys := make([]string, 0)
+
+	for rangeIt.Valid() {
+		key := string(rangeIt.Key())
+		foundRangeKeys = append(foundRangeKeys, key)
+		rangeIt.Next()
+	}
+
+	if len(foundRangeKeys) != len(expectedRangeKeys) {
+		t.Fatalf("Range iterator found %d keys, expected %d. Found: %v, Expected: %v",
+			len(foundRangeKeys), len(expectedRangeKeys), foundRangeKeys, expectedRangeKeys)
+	}
+
+	for i, expectedKey := range expectedRangeKeys {
+		if i >= len(foundRangeKeys) || foundRangeKeys[i] != expectedKey {
+			t.Fatalf("Range iterator key mismatch at position %d: got %s, want %s",
+				i, foundRangeKeys[i], expectedKey)
+		}
+	}
+
+	// Test 3: Test after modifications
+	// Delete a key
+	if err := db.Delete([]byte("key3")); err != nil {
+		t.Fatalf("Failed to delete 'key3': %v", err)
+	}
+
+	// Add a new key
+	if err := db.Set([]byte("key6"), []byte("value6")); err != nil {
+		t.Fatalf("Failed to set 'key6': %v", err)
+	}
+
+	// Modify an existing key
+	if err := db.Set([]byte("key1"), []byte("modified1")); err != nil {
+		t.Fatalf("Failed to update 'key1': %v", err)
+	}
+
+	// Create a new reverse iterator (start > end)
+	modifiedIt := db.NewIterator([]byte("key6"), []byte("key1"))
+	defer modifiedIt.Close()
+
+	// Expected data after modifications in reverse order
+	expectedModKeys := []string{"key6", "key5", "key4", "key2", "key1"}
+	foundModKeys := make([]string, 0)
+
+	// Iterate through entries in reverse order
+	for modifiedIt.Valid() {
+		key := string(modifiedIt.Key())
+		foundModKeys = append(foundModKeys, key)
+		modifiedIt.Next()
+	}
+
+	if len(foundModKeys) != len(expectedModKeys) {
+		t.Fatalf("Modified reverse iterator found %d keys, expected %d. Found: %v, Expected: %v",
+			len(foundModKeys), len(expectedModKeys), foundModKeys, expectedModKeys)
+	}
+
+	for i, expectedKey := range expectedModKeys {
+		if i >= len(foundModKeys) || foundModKeys[i] != expectedKey {
+			t.Fatalf("Modified reverse iterator key mismatch at position %d: got %s, want %s",
+				i, foundModKeys[i], expectedKey)
+		}
+	}
+
+
+	// Test with empty database
+	emptyDbPath := "test_empty_reverse_iterator.db"
+	os.Remove(emptyDbPath)
+	os.Remove(emptyDbPath + "-index")
+	os.Remove(emptyDbPath + "-wal")
+
+	emptyDb, err := Open(emptyDbPath, Options{"MainIndexPages": 1})
+	if err != nil {
+		t.Fatalf("Failed to open empty database: %v", err)
+	}
+	defer func() {
+		emptyDb.Close()
+		os.Remove(emptyDbPath)
+		os.Remove(emptyDbPath + "-index")
+		os.Remove(emptyDbPath + "-wal")
+	}()
+
+	emptyIt := emptyDb.NewIterator([]byte("z"), []byte("a"))
+	defer emptyIt.Close()
+
+	// Verify the iterator is not valid for an empty database
+	if emptyIt.Valid() {
+		t.Fatalf("Reverse iterator for empty database should not be valid")
+	}
+}
+
+func TestIteratorWithMixedKeys(t *testing.T) {
+	// Create a test database
+	dbPath := "test_iterator_mixed_keys.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Insert keys with different lengths and different prefixes
+	testKeys := []string{
+		string([]byte{0}),  // NUL character (byte 0)
+		"a",
+		"aa",
+		"a1",
+		"az5",
+		"a-long-2",
+		"ab",
+		"ab2",
+		"ab2-1",
+		"ab2-long-2",
+		"abc",
+		"abc3",
+		"abc3-1",
+		"ab-long-2",
+		"abc-3-1",
+		"abc-long-2",
+		"b-1-1",
+		"b-long-2",
+		"bc-2-1",
+		"bc-long-2",
+		"bcd-3-1",
+		"bcd-long-2",
+		"c",
+		"ca",
+		"cab",
+		"cablong",
+		"d-very-long-key-with-many-characters-to-test-different-length",
+		"z",
+		string([]byte{255}),  // Character with byte value 255
+	}
+
+	// Insert all keys with their values
+	testData := make(map[string]string)
+	for i, key := range testKeys {
+		value := fmt.Sprintf("value-%d", i)
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set '%s': %v", key, err)
+		}
+		testData[key] = value
+	}
+
+	// Test 1: Full forward iteration (all keys in lexicographical order)
+	it := db.NewIterator(nil, nil)
+	defer it.Close()
+
+	// Expected order: keys in lexicographical order
+	expectedOrder := make([]string, len(testKeys))
+	copy(expectedOrder, testKeys)
+	sort.Strings(expectedOrder)
+
+	foundKeys := make([]string, 0, len(testKeys))
+	foundValues := make([]string, 0, len(testKeys))
+
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+		foundKeys = append(foundKeys, key)
+		foundValues = append(foundValues, value)
+		it.Next()
+	}
+
+	// Verify we found all keys in the expected order
+	if len(foundKeys) != len(expectedOrder) {
+		t.Fatalf("Full iterator found %d keys, expected %d. Found: %v", len(foundKeys), len(expectedOrder), foundKeys)
+	}
+
+	for i, expectedKey := range expectedOrder {
+		if i >= len(foundKeys) || foundKeys[i] != expectedKey {
+			t.Fatalf("Full iterator key mismatch at position %d: got %s, want %s", i, foundKeys[i], expectedKey)
+		}
+		expectedValue := testData[expectedKey]
+		if foundValues[i] != expectedValue {
+			t.Fatalf("Full iterator value mismatch for key %s: got %s, want %s", expectedKey, foundValues[i], expectedValue)
+		}
+	}
+
+	// Test 2: Prefix-based forward iteration (only keys with prefix "b")
+	prefixIt := db.NewIterator([]byte("b"), []byte("bzz"))
+	defer prefixIt.Close()
+
+	expectedPrefixKeys := []string{
+		"b-1-1",
+		"b-long-2",
+		"bc-2-1",
+		"bc-long-2",
+		"bcd-3-1",
+		"bcd-long-2",
+	}
+
+	foundPrefixKeys := make([]string, 0)
+	for prefixIt.Valid() {
+		key := string(prefixIt.Key())
+		foundPrefixKeys = append(foundPrefixKeys, key)
+		prefixIt.Next()
+	}
+
+	if len(foundPrefixKeys) != len(expectedPrefixKeys) {
+		t.Fatalf("Prefix iterator found %d keys, expected %d. Found: %v, Expected: %v", len(foundPrefixKeys), len(expectedPrefixKeys), foundPrefixKeys, expectedPrefixKeys)
+	}
+
+	for i, expectedKey := range expectedPrefixKeys {
+		if i >= len(foundPrefixKeys) || foundPrefixKeys[i] != expectedKey {
+			t.Fatalf("Prefix iterator key mismatch at position %d: got %s, want %s", i, foundPrefixKeys[i], expectedKey)
+		}
+	}
+
+	// Test 3: Mixed prefix forward iteration (keys between "a" and "c")
+	mixedIt := db.NewIterator([]byte("a"), []byte("c")) // From "a" (inclusive) to "c" (exclusive)
+	defer mixedIt.Close()
+
+	// Expected keys between "a" (inclusive) and "c" (exclusive) in order
+	expectedMixedKeys := make([]string, 0)
+	for _, key := range expectedOrder {
+		if key >= "a" && key < "c" {
+			expectedMixedKeys = append(expectedMixedKeys, key)
+		}
+	}
+
+	foundMixedKeys := make([]string, 0)
+	for mixedIt.Valid() {
+		key := string(mixedIt.Key())
+		foundMixedKeys = append(foundMixedKeys, key)
+		mixedIt.Next()
+	}
+
+	if len(foundMixedKeys) != len(expectedMixedKeys) {
+		t.Fatalf("Mixed iterator found %d keys, expected %d. Found: %v, Expected: %v", len(foundMixedKeys), len(expectedMixedKeys), foundMixedKeys, expectedMixedKeys)
+	}
+
+	for i, expectedKey := range expectedMixedKeys {
+		if i >= len(foundMixedKeys) || foundMixedKeys[i] != expectedKey {
+			t.Fatalf("Mixed iterator key mismatch at position %d: got %s, want %s", i, foundMixedKeys[i], expectedKey)
+		}
+	}
+}
+
+func TestReverseIteratorWithMixedKeys(t *testing.T) {
+	// Create a test database
+	dbPath := "test_reverse_iterator_mixed_keys.db"
+
+	// Clean up any existing test database
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open a new database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Insert keys with different lengths and different prefixes
+	// Format: prefix-length-index
+	testKeys := []string{
+		string([]byte{0}),  // NUL character (byte 0)
+		"a",
+		"aa",
+		"a1",
+		"az5",
+		"a-long-2",
+		"ab",
+		"ab2",
+		"ab2-1",
+		"ab2-long-2",
+		"abc",
+		"abc3",
+		"abc3-1",
+		"ab-long-2",
+		"abc-3-1",
+		"abc-long-2",
+		"b-1-1",
+		"b-long-2",
+		"bc-2-1",
+		"bc-long-2",
+		"bcd-3-1",
+		"bcd-long-2",
+		"c",
+		"ca",
+		"cab",
+		"cablong",
+		"d-very-long-key-with-many-characters-to-test-different-length",
+		"z",
+		string([]byte{255}),  // Character with byte value 255
+	}
+
+	// Insert all keys with their values
+	testData := make(map[string]string)
+	for i, key := range testKeys {
+		value := fmt.Sprintf("value-%d", i)
+		if err := db.Set([]byte(key), []byte(value)); err != nil {
+			t.Fatalf("Failed to set '%s': %v", key, err)
+		}
+		testData[key] = value
+	}
+
+	// Test 1: Full reverse iteration (all keys in reverse lexicographical order)
+	// Use maximum byte value as start and minimum as end to ensure we cover all keys
+	it := db.NewIterator([]byte{255}, []byte{0}) // From byte 255 (inclusive) to byte 0 (inclusive)
+	defer it.Close()
+
+	// Expected order: keys in reverse lexicographical order
+	expectedOrder := make([]string, len(testKeys))
+	copy(expectedOrder, testKeys)
+	// Sort in reverse lexicographical order
+	sort.Slice(expectedOrder, func(i, j int) bool {
+		return expectedOrder[i] > expectedOrder[j]
+	})
+
+	foundKeys := make([]string, 0, len(testKeys))
+	foundValues := make([]string, 0, len(testKeys))
+
+	for it.Valid() {
+		key := string(it.Key())
+		value := string(it.Value())
+		foundKeys = append(foundKeys, key)
+		foundValues = append(foundValues, value)
+		it.Next()
+	}
+
+	// Verify we found all keys in the expected order
+	if len(foundKeys) != len(expectedOrder) {
+		t.Fatalf("Full reverse iterator found %d keys, expected %d. Found: %v",
+			len(foundKeys), len(expectedOrder), foundKeys)
+	}
+
+	for i, expectedKey := range expectedOrder {
+		if i >= len(foundKeys) || foundKeys[i] != expectedKey {
+			t.Fatalf("Full reverse iterator key mismatch at position %d: got %s, want %s",
+				i, foundKeys[i], expectedKey)
+		}
+
+		expectedValue := testData[expectedKey]
+		if foundValues[i] != expectedValue {
+			t.Fatalf("Full reverse iterator value mismatch for key %s: got %s, want %s",
+				expectedKey, foundValues[i], expectedValue)
+		}
+	}
+
+	// Test 2: Prefix-based reverse iteration (only keys with prefix "b")
+	prefixIt := db.NewIterator([]byte("bzz"), []byte("b"))
+	defer prefixIt.Close()
+
+	// Expected keys with prefix "b" in reverse lexicographical order
+	expectedPrefixKeys := []string{
+		"bcd-long-2",
+		"bcd-3-1",
+		"bc-long-2",
+		"bc-2-1",
+		"b-long-2",
+		"b-1-1",
+	}
+
+	foundPrefixKeys := make([]string, 0)
+	for prefixIt.Valid() {
+		key := string(prefixIt.Key())
+		foundPrefixKeys = append(foundPrefixKeys, key)
+		prefixIt.Next()
+	}
+
+	if len(foundPrefixKeys) != len(expectedPrefixKeys) {
+		t.Fatalf("Prefix reverse iterator found %d keys, expected %d. Found: %v, Expected: %v",
+			len(foundPrefixKeys), len(expectedPrefixKeys), foundPrefixKeys, expectedPrefixKeys)
+	}
+
+	for i, expectedKey := range expectedPrefixKeys {
+		if i >= len(foundPrefixKeys) || foundPrefixKeys[i] != expectedKey {
+			t.Fatalf("Prefix reverse iterator key mismatch at position %d: got %s, want %s",
+				i, foundPrefixKeys[i], expectedKey)
+		}
+	}
+
+	// Test 3: Mixed prefix reverse iteration (keys between "c" and "a")
+	mixedIt := db.NewIterator([]byte("c"), []byte("a")) // From "c" (inclusive) to "a" (inclusive)
+	defer mixedIt.Close()
+
+	// Expected keys between "c" (inclusive) and "a" (inclusive) in reverse order
+	// This should include all keys starting with "b" and all keys starting with "a"
+	// We'll collect them dynamically from our sorted list
+	expectedMixedKeys := make([]string, 0)
+	for _, key := range expectedOrder {
+		if key >= "a" && key <= "c" {
+			expectedMixedKeys = append(expectedMixedKeys, key)
+		}
+	}
+
+	foundMixedKeys := make([]string, 0)
+	for mixedIt.Valid() {
+		key := string(mixedIt.Key())
+		foundMixedKeys = append(foundMixedKeys, key)
+		mixedIt.Next()
+	}
+
+	if len(foundMixedKeys) != len(expectedMixedKeys) {
+		t.Fatalf("Mixed reverse iterator found %d keys, expected %d. Found: %v, Expected: %v",
+			len(foundMixedKeys), len(expectedMixedKeys), foundMixedKeys, expectedMixedKeys)
+	}
+
+	for i, expectedKey := range expectedMixedKeys {
+		if i >= len(foundMixedKeys) || foundMixedKeys[i] != expectedKey {
+			t.Fatalf("Mixed reverse iterator key mismatch at position %d: got %s, want %s",
+				i, foundMixedKeys[i], expectedKey)
+		}
 	}
 }
 

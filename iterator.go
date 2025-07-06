@@ -24,6 +24,7 @@ type Iterator struct {
 	end          []byte    // End key for range filtering (exclusive)
 	leafEntries  []leafEntry // Sorted entries from current leaf page
 	leafIdx      int      // Current index in leafEntries
+	reverse      bool     // Whether to iterate in reverse order
 }
 
 // radixIterPos represents a position in the radix tree traversal
@@ -36,7 +37,23 @@ type radixIterPos struct {
 }
 
 // NewIterator returns a new iterator for the database
+// If start > end, the iterator will iterate in reverse order
+// If start <= end, the iterator will iterate in forward order
+// For forward iteration:
+//   - start is inclusive (>=)
+//   - end is exclusive (<)
+// For reverse iteration:
+//   - start is inclusive (<=)
+//   - end is inclusive (>=)
 func (db *DB) NewIterator(start, end []byte) *Iterator {
+	// Determine if we should iterate in reverse order (start > end)
+	reverse := false
+	if len(start) > 0 && len(end) > 0 && bytes.Compare(start, end) > 0 {
+		// In reverse mode, we don't swap start and end
+		// We just mark the iterator as reverse
+		reverse = true
+	}
+
 	// Create a new iterator
 	it := &Iterator{
 		db:          db,
@@ -47,6 +64,7 @@ func (db *DB) NewIterator(start, end []byte) *Iterator {
 		end:         end,
 		leafEntries: make([]leafEntry, 0),
 		leafIdx:     -1,
+		reverse:     reverse,
 	}
 
 	// Start with the root radix page (page 1)
@@ -56,7 +74,7 @@ func (db *DB) NewIterator(start, end []byte) *Iterator {
 		it.stack = append(it.stack, radixIterPos{
 			pageNumber: rootSubPage.Page.pageNumber,
 			pageType:   ContentTypeRadix,
-			byteValue:  -2, // -2 indicates we need to process the empty suffix first
+			byteValue:  it.getStartingByte(),
 			subPageIdx: rootSubPage.SubPageIdx,
 		})
 
@@ -103,12 +121,22 @@ func (it *Iterator) Next() {
 			// Check if the found key is within our range
 			if it.valid && !it.isKeyInRange(it.currentKey) {
 				// Key is outside our range, check if we should stop or continue
-				if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) >= 0 {
-					// We've passed the end bound, stop iteration
-					it.valid = false
-					return
+				if it.reverse {
+					if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) < 0 {
+						// We've passed the end bound in reverse, stop iteration
+						it.valid = false
+						it.keyPrefix = it.keyPrefix[:0] // Reset keyPrefix
+						return
+					}
+				} else {
+					if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) >= 0 {
+						// We've passed the end bound, stop iteration
+						it.valid = false
+						it.keyPrefix = it.keyPrefix[:0] // Reset keyPrefix
+						return
+					}
 				}
-				// Key is before start bound, continue searching
+				// Key is outside our range, continue searching
 				continue
 			}
 			return
@@ -123,10 +151,20 @@ func (it *Iterator) Next() {
 			// Check if the found key is within our range
 			if it.valid && !it.isKeyInRange(it.currentKey) {
 				// Key is outside our range, check if we should stop or continue
-				if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) >= 0 {
-					// We've passed the end bound, stop iteration
-					it.valid = false
-					return
+				if it.reverse {
+					if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) < 0 {
+						// We've passed the end bound in reverse, stop iteration
+						it.valid = false
+						it.keyPrefix = it.keyPrefix[:0] // Reset keyPrefix
+						return
+					}
+				} else {
+					if len(it.end) > 0 && bytes.Compare(it.currentKey, it.end) >= 0 {
+						// We've passed the end bound, stop iteration
+						it.valid = false
+						it.keyPrefix = it.keyPrefix[:0] // Reset keyPrefix
+						return
+					}
 				}
 				// Key is outside our range, continue searching
 				continue
@@ -140,6 +178,74 @@ func (it *Iterator) Next() {
 
 	// If we get here, we've exhausted all pages
 	it.valid = false
+	it.keyPrefix = it.keyPrefix[:0] // Reset keyPrefix when iteration is done
+}
+
+// processRadixByte processes a single byte value in a radix page
+// Returns (foundEntry, shouldContinue):
+// - foundEntry: true if a valid entry was found and we should return true from the calling function
+// - shouldContinue: true if we should continue to the next byte in the loop, false if we should return
+func (it *Iterator) processRadixByte(pos *radixIterPos, subPage *RadixSubPage, byteValue uint8) (bool, bool) {
+	// Check if we should skip this subtree based on range constraints
+	if it.shouldSkipSubtree(byteValue) {
+		return false, true // No entry found, continue to next byte
+	}
+
+	// Get the next page number and sub-page index
+	nextPageNumber, nextSubPageIdx := it.db.getRadixEntry(subPage, byteValue)
+	if nextPageNumber == 0 {
+		// No entry for this byte, continue
+		return false, true // No entry found, continue to next byte
+	}
+
+	// Found an entry, load the page
+	page, err := it.db.getPage(nextPageNumber)
+	if err != nil {
+		// If we can't load the page, continue
+		return false, true // No entry found, continue to next byte
+	}
+
+	// Add this byte to the key prefix
+	it.keyPrefix = append(it.keyPrefix, byteValue)
+
+	// Push the new page to the stack
+	if page.pageType == ContentTypeRadix {
+		it.stack = append(it.stack, radixIterPos{
+			pageNumber: nextPageNumber,
+			pageType:   ContentTypeRadix,
+			byteValue:  it.getStartingByte(), // Get starting byte based on iteration direction
+			subPageIdx: nextSubPageIdx,
+		})
+		return it.processRadixPage(&it.stack[len(it.stack)-1]), false // Return result of processRadixPage, don't continue
+	} else if page.pageType == ContentTypeLeaf {
+		it.stack = append(it.stack, radixIterPos{
+			pageNumber: nextPageNumber,
+			pageType:   ContentTypeLeaf,
+			leafLoaded: false,
+		})
+		return it.processLeafPage(&it.stack[len(it.stack)-1]), false // Return result of processLeafPage, don't continue
+	}
+
+	return false, true // No entry found, continue to next byte
+}
+
+// processEmptySuffix processes the empty suffix of a radix page
+func (it *Iterator) processEmptySuffix(subPage *RadixSubPage) bool {
+	// Process the empty suffix
+	emptySuffixOffset := it.db.getEmptySuffixOffset(subPage)
+	if emptySuffixOffset > 0 {
+		// Read the content at the offset
+		content, err := it.db.readContent(emptySuffixOffset)
+		if err == nil {
+			// Found a valid entry
+			it.currentKey = content.key
+			it.currentValue = content.value
+			it.valid = true
+
+			return true
+		}
+	}
+	return false
 }
 
 // processRadixPage processes the current radix page position
@@ -157,70 +263,51 @@ func (it *Iterator) processRadixPage(pos *radixIterPos) bool {
 		SubPageIdx: pos.subPageIdx,
 	}
 
-	// Check if we need to process the empty suffix
-	if pos.byteValue == -2 {
-		// Mark that we've processed the empty suffix
-		pos.byteValue++
-		// First, check the empty suffix
-		emptySuffixOffset := it.db.getEmptySuffixOffset(subPage)
-		if emptySuffixOffset > 0 {
-			// Read the content at the offset
-			content, err := it.db.readContent(emptySuffixOffset)
-			if err == nil {
-				// Found a valid entry
-				it.currentKey = content.key
-				it.currentValue = content.value
-				it.valid = true
-
+	// Process next byte value
+	if !it.reverse {
+		// Check if we need to process the empty suffix now
+		if pos.byteValue == -2 {
+			// Mark that we've processed the empty suffix
+			pos.byteValue++
+			// Process the empty suffix
+			if it.processEmptySuffix(subPage) {
 				return true
 			}
 		}
+		// Forward iteration (ascending order)
+		for pos.byteValue < 255 {
+			// Move to the next byte value
+			pos.byteValue++
+			byteValue := uint8(pos.byteValue)
 
-	}
-
-	// Process next byte value
-	for pos.byteValue < 255 {
-		pos.byteValue++
-		byteValue := uint8(pos.byteValue)
-
-		// Check if we should skip this subtree based on range constraints
-		if it.shouldSkipSubtree(byteValue) {
-			continue
+			foundEntry, shouldContinue := it.processRadixByte(pos, subPage, byteValue)
+			if !shouldContinue {
+				return foundEntry
+			}
+			// If shouldContinue is true, we continue the loop
 		}
+	} else {
+		// Reverse iteration (descending order)
+		for pos.byteValue > 0 {
+			// Move to the previous byte value
+			pos.byteValue--
+			byteValue := uint8(pos.byteValue)
 
-		// Get the next page number and sub-page index
-		nextPageNumber, nextSubPageIdx := it.db.getRadixEntry(subPage, byteValue)
-		if nextPageNumber == 0 {
-			// No entry for this byte, continue
-			continue
+			foundEntry, shouldContinue := it.processRadixByte(pos, subPage, byteValue)
+			if !shouldContinue {
+				return foundEntry
+			}
+			// If shouldContinue is true, we continue the loop
 		}
-
-		// Found an entry, load the page
-		page, err := it.db.getPage(nextPageNumber)
-		if err != nil {
-			// If we can't load the page, continue
-			continue
-		}
-
-		// Add this byte to the key prefix
-		it.keyPrefix = append(it.keyPrefix, byteValue)
-
-		// Push the new page to the stack
-		if page.pageType == ContentTypeRadix {
-			it.stack = append(it.stack, radixIterPos{
-				pageNumber: nextPageNumber,
-				pageType:   ContentTypeRadix,
-				byteValue:  -2, // -2 indicates we need to process the empty suffix first
-				subPageIdx: nextSubPageIdx,
-			})
-			return it.processRadixPage(&it.stack[len(it.stack)-1])
-		} else if page.pageType == ContentTypeLeaf {
-			it.stack = append(it.stack, radixIterPos{
-				pageNumber: nextPageNumber,
-				pageType:   ContentTypeLeaf,
-				leafLoaded: false,
-			})
-			return it.processLeafPage(&it.stack[len(it.stack)-1])
+		// Process the empty suffix for this radix node in reverse order
+		if pos.byteValue == 0 {
+			// Mark that we've processed the empty suffix
+			pos.byteValue--
+			// Process the empty suffix for this radix node in reverse order
+			if it.processEmptySuffix(subPage) {
+				// We've found a valid entry, so return true
+				return true
+			}
 		}
 	}
 
@@ -293,9 +380,13 @@ func (it *Iterator) loadAndSortLeafEntries(pos *radixIterPos) bool {
 		})
 	}
 
-	// Sort entries by key
+	// Sort entries by key (ascending or descending based on reverse flag)
 	sort.Slice(it.leafEntries, func(i, j int) bool {
-		return bytes.Compare(it.leafEntries[i].key, it.leafEntries[j].key) < 0
+		cmp := bytes.Compare(it.leafEntries[i].key, it.leafEntries[j].key)
+		if it.reverse {
+			return cmp > 0 // Descending order for reverse iteration
+		}
+		return cmp < 0 // Ascending order for forward iteration
 	})
 
 	return len(it.leafEntries) > 0
@@ -311,6 +402,14 @@ func (it *Iterator) popStackAndTrimPrefix() {
 		if it.stack[lastPos].pageType == ContentTypeLeaf {
 			it.leafEntries = it.leafEntries[:0]
 			it.leafIdx = -1
+
+			// Also remove the last byte from the key prefix because we added one when we
+			// descended from the parent radix node into this leaf. Failing to remove it
+			// causes the iterator to incorrectly believe that we are still inside that
+			// branch, which breaks sibling traversal (especially in reverse iteration).
+			if len(it.keyPrefix) > 0 {
+				it.keyPrefix = it.keyPrefix[:len(it.keyPrefix)-1]
+			}
 		}
 
 		// If we're popping a radix page and we added a byte to the prefix
@@ -359,7 +458,7 @@ func (it *Iterator) seekToStart() {
 	it.stack = it.stack[:1] // Keep only the root
 	it.keyPrefix = it.keyPrefix[:0] // Clear the key prefix
 
-	// Navigate through the radix tree following the start key path
+	// Forward iteration - navigate through the radix tree following the start key path
 	startKey := it.start
 	currentDepth := 0
 
@@ -403,7 +502,7 @@ func (it *Iterator) seekToStart() {
 					it.stack = append(it.stack, radixIterPos{
 						pageNumber: nextPageNumber,
 						pageType:   ContentTypeRadix,
-						byteValue:  -2, // -2 indicates we need to process the empty suffix first
+						byteValue:  it.getStartingByte(), // Get starting byte based on iteration direction
 						subPageIdx: nextSubPageIdx,
 					})
 				} else if page.pageType == ContentTypeLeaf {
@@ -416,7 +515,11 @@ func (it *Iterator) seekToStart() {
 				}
 			} else {
 				// No exact match for this byte, find the next larger byte that has an entry
-				pos.byteValue = int(targetByte) - 1 // Set to one less so Next() will start from targetByte
+				if it.reverse {
+					pos.byteValue = int(targetByte) + 1 // For reverse, set to one more so we'll start from targetByte
+				} else {
+					pos.byteValue = int(targetByte) - 1 // For forward, set to one less so we'll start from targetByte
+				}
 				break
 			}
 		} else {
@@ -431,18 +534,40 @@ func (it *Iterator) seekToStart() {
 
 // isKeyInRange checks if a key is within the iterator's range
 func (it *Iterator) isKeyInRange(key []byte) bool {
-	// Check start bound (inclusive)
-	if len(it.start) > 0 && bytes.Compare(key, it.start) < 0 {
-		return false
-	}
+	// For reverse iteration, the bounds are flipped
+	if it.reverse {
+		// In reverse mode:
+		// - start is the upper bound (inclusive)
+		// - end is the lower bound (inclusive)
 
-	// Check end bound (exclusive)
-	if len(it.end) > 0 && bytes.Compare(key, it.end) >= 0 {
-		return false
+		// Check upper bound (inclusive)
+		if len(it.start) > 0 && bytes.Compare(key, it.start) > 0 {
+			return false
+		}
+
+		// Check lower bound (inclusive)
+		if len(it.end) > 0 && bytes.Compare(key, it.end) < 0 {
+			return false
+		}
+	} else {
+		// In forward mode:
+		// - start is the lower bound (inclusive)
+		// - end is the upper bound (exclusive)
+
+		// Check lower bound (inclusive)
+		if len(it.start) > 0 && bytes.Compare(key, it.start) < 0 {
+			return false
+		}
+
+		// Check upper bound (exclusive)
+		if len(it.end) > 0 && bytes.Compare(key, it.end) >= 0 {
+			return false
+		}
 	}
 
 	return true
 }
+
 // shouldSkipSubtree checks if we should skip a subtree based on the current key prefix and next byte
 func (it *Iterator) shouldSkipSubtree(nextByte uint8) bool {
 	// If we have no range constraints, don't skip anything
@@ -455,38 +580,105 @@ func (it *Iterator) shouldSkipSubtree(nextByte uint8) bool {
 	copy(potentialPrefix, it.keyPrefix)
 	potentialPrefix[len(it.keyPrefix)] = nextByte
 
-	// Check if this prefix could contain keys in our range
-
-	// If we have a start bound, check if this prefix could lead to keys >= start
-	if len(it.start) > 0 {
-		// If the potential prefix is longer than or equal to start key length
-		if len(potentialPrefix) <= len(it.start) {
-			// Compare the prefix with the corresponding part of start key
-			startPrefix := it.start[:len(potentialPrefix)]
-			if bytes.Compare(potentialPrefix, startPrefix) < 0 {
-				// This prefix is before the start key prefix, skip it
+	if it.reverse {
+		// Check if prefix could lead to keys <= start (upper bound)
+		if len(it.start) > 0 {
+			if isPrefixGreaterThan(potentialPrefix, it.start) {
 				return true
 			}
 		}
-	}
 
-	// If we have an end bound, check if this prefix could lead to keys < end
-	if len(it.end) > 0 {
-		// If the potential prefix is already >= end key, skip it
-		if bytes.Compare(potentialPrefix, it.end) >= 0 {
-			return true
+		// Check if prefix could lead to keys >= end (lower bound)
+		if len(it.end) > 0 {
+			if isPrefixLessThan(potentialPrefix, it.end) {
+				return true
+			}
+		}
+	} else {
+		// Forward iteration
+
+		// Check if prefix could lead to keys >= start (lower bound)
+		if len(it.start) > 0 {
+			if isPrefixLessThan(potentialPrefix, it.start) {
+				return true
+			}
 		}
 
-		// If the potential prefix is longer than or equal to end key length
-		if len(potentialPrefix) <= len(it.end) {
-			// Compare the prefix with the corresponding part of end key
-			endPrefix := it.end[:len(potentialPrefix)]
-			if bytes.Compare(potentialPrefix, endPrefix) > 0 {
-				// This prefix is after the end key prefix, skip it
+		// Check if prefix could lead to keys < end (upper bound)
+		if len(it.end) > 0 {
+			if isPrefixGreaterThanOrEqual(potentialPrefix, it.end) {
 				return true
 			}
 		}
 	}
 
 	return false
+}
+
+// isPrefixLessThan returns true if the prefix is strictly less than the target key
+// and can't lead to any keys >= target
+func isPrefixLessThan(prefix, target []byte) bool {
+	// If prefix is longer than target, compare only the common part
+	if len(prefix) > len(target) {
+		// If common parts are equal, prefix can lead to keys >= target
+		// If common parts are greater, prefix can lead to keys >= target
+		return bytes.Compare(prefix[:len(target)], target) < 0
+	}
+
+	// If prefix is shorter or equal to target
+	cmp := bytes.Compare(prefix, target[:len(prefix)])
+	// If prefix is less than the corresponding part of target,
+	// AND the prefix is not a prefix of the target, then skip
+	return cmp < 0 && (len(prefix) == len(target) || prefix[len(prefix)-1] != target[len(prefix)-1])
+}
+
+// isPrefixGreaterThan returns true if the prefix is strictly greater than the target key
+// and can't lead to any keys <= target
+func isPrefixGreaterThan(prefix, target []byte) bool {
+	// If prefix is longer than target, compare only the common part
+	if len(prefix) > len(target) {
+		// If common parts are equal, prefix can't lead to keys <= target
+		// If common parts are less, prefix can lead to keys <= target
+		return bytes.Compare(prefix[:len(target)], target) > 0
+	}
+
+	// If prefix is shorter or equal to target
+	return bytes.Compare(prefix, target) > 0
+}
+
+// isPrefixGreaterThanOrEqual returns true if the prefix is greater than or equal to the target key
+// and can't lead to any keys < target
+func isPrefixGreaterThanOrEqual(prefix, target []byte) bool {
+	// If prefix is longer than target, compare only the common part
+	if len(prefix) > len(target) {
+		// If common parts are equal, prefix can't lead to keys < target
+		// If common parts are less, prefix can lead to keys < target
+		return bytes.Compare(prefix[:len(target)], target) > 0
+	}
+
+	// If prefix is shorter than target
+	if len(prefix) < len(target) {
+		cmp := bytes.Compare(prefix, target[:len(prefix)])
+		// If prefix equals the corresponding part of target, don't skip
+		if cmp == 0 {
+			return false
+		}
+		// Otherwise, skip if prefix > corresponding part of target
+		return cmp > 0
+	}
+
+	// If prefix is equal length to target
+	return bytes.Compare(prefix, target) >= 0
+}
+
+// getStartingByte returns the appropriate starting byte value based on iteration direction
+func (it *Iterator) getStartingByte() int {
+	if it.reverse {
+		// For reverse iteration, start from after the highest byte value
+		// This is 256 because in processRadixPage, we decrement before using the value
+		return 256
+	} else {
+		// For forward iteration, start from before the empty suffix
+		return -2
+	}
 }
