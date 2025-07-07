@@ -10,6 +10,7 @@ import (
 	"github.com/aergoio/kv_log/varint"
 	"hash/crc32"
 	"os"
+	"strings"
 )
 
 // createTempFile creates a temporary database file for testing
@@ -5099,6 +5100,681 @@ func TestRecoverUnindexedContent(t *testing.T) {
 		}
 		if !bytes.Equal(value1, []byte("value1")) {
 			t.Errorf("Expected value1, got %v", value1)
+		}
+	})
+}
+
+// TestWriteRadixPage tests the writeRadixPage function
+func TestWriteRadixPage(t *testing.T) {
+	t.Run("WriteValidRadixPage", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create a radix page
+		radixPage := &RadixPage{
+			pageNumber:   1,
+			pageType:     ContentTypeRadix,
+			data:         make([]byte, PageSize),
+			dirty:        true,
+			SubPagesUsed: 2,
+			NextFreePage: 5,
+		}
+
+		// Write the radix page
+		err = db.writeRadixPage(radixPage)
+		if err != nil {
+			t.Fatalf("Failed to write radix page: %v", err)
+		}
+
+		// Verify the page data was set correctly
+		if radixPage.data[0] != ContentTypeRadix {
+			t.Errorf("Expected content type %c, got %c", ContentTypeRadix, radixPage.data[0])
+		}
+
+		if radixPage.data[1] != 2 {
+			t.Errorf("Expected SubPagesUsed 2, got %d", radixPage.data[1])
+		}
+
+		nextFreePage := binary.LittleEndian.Uint32(radixPage.data[2:6])
+		if nextFreePage != 5 {
+			t.Errorf("Expected NextFreePage 5, got %d", nextFreePage)
+		}
+
+		// Verify checksum was calculated and stored
+		storedChecksum := binary.BigEndian.Uint32(radixPage.data[6:10])
+		if storedChecksum == 0 {
+			t.Error("Expected non-zero checksum")
+		}
+
+		// Verify the page is no longer dirty after writing
+		if radixPage.dirty {
+			t.Error("Expected page to be clean after writing")
+		}
+	})
+
+	t.Run("WriteRadixPageWithZeroPageNumber", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create a radix page with page number 0
+		radixPage := &RadixPage{
+			pageNumber:   0,
+			pageType:     ContentTypeRadix,
+			data:         make([]byte, PageSize),
+			dirty:        true,
+			SubPagesUsed: 1,
+			NextFreePage: 0,
+		}
+
+		// Write should fail for page number 0
+		err = db.writeRadixPage(radixPage)
+		if err == nil {
+			t.Error("Expected error for page number 0, got nil")
+		}
+		if !strings.Contains(err.Error(), "cannot write radix page with page number 0") {
+			t.Errorf("Expected specific error message, got: %v", err)
+		}
+	})
+}
+
+// TestWriteLeafPage tests the writeLeafPage function
+func TestWriteLeafPage(t *testing.T) {
+	t.Run("WriteValidLeafPage", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create a leaf page with some test data
+		leafPage := &LeafPage{
+			pageNumber:  2,
+			pageType:    ContentTypeLeaf,
+			data:        make([]byte, PageSize),
+			dirty:       true,
+			ContentSize: 20,
+			Entries: []LeafEntry{
+				{SuffixOffset: 8, SuffixLen: 4, DataOffset: 1000},
+			},
+		}
+
+		// Write the leaf page
+		err = db.writeLeafPage(leafPage)
+		if err != nil {
+			t.Fatalf("Failed to write leaf page: %v", err)
+		}
+
+		// Verify the page data was set correctly
+		if leafPage.data[0] != ContentTypeLeaf {
+			t.Errorf("Expected content type %c, got %c", ContentTypeLeaf, leafPage.data[0])
+		}
+
+		contentSize := binary.LittleEndian.Uint16(leafPage.data[2:4])
+		if contentSize != 20 {
+			t.Errorf("Expected ContentSize 20, got %d", contentSize)
+		}
+
+		// Verify checksum was calculated and stored
+		storedChecksum := binary.BigEndian.Uint32(leafPage.data[4:8])
+		if storedChecksum == 0 {
+			t.Error("Expected non-zero checksum")
+		}
+
+		// Verify the page is no longer dirty after writing
+		if leafPage.dirty {
+			t.Error("Expected page to be clean after writing")
+		}
+	})
+
+	t.Run("WriteLeafPageWithZeroPageNumber", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create a leaf page with page number 0
+		leafPage := &LeafPage{
+			pageNumber:  0,
+			pageType:    ContentTypeLeaf,
+			data:        make([]byte, PageSize),
+			dirty:       true,
+			ContentSize: 8,
+			Entries:     []LeafEntry{},
+		}
+
+		// Write should fail for page number 0
+		err = db.writeLeafPage(leafPage)
+		if err == nil {
+			t.Error("Expected error for page number 0, got nil")
+		}
+		if !strings.Contains(err.Error(), "cannot write leaf page with page number 0") {
+			t.Errorf("Expected specific error message, got: %v", err)
+		}
+	})
+
+	t.Run("WriteLeafPageWithLargeContentSize", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create a leaf page with maximum content size
+		leafPage := &LeafPage{
+			pageNumber:  3,
+			pageType:    ContentTypeLeaf,
+			data:        make([]byte, PageSize),
+			dirty:       true,
+			ContentSize: uint16(PageSize - 1), // Near maximum
+			Entries:     []LeafEntry{},
+		}
+
+		// Write should succeed
+		err = db.writeLeafPage(leafPage)
+		if err != nil {
+			t.Fatalf("Failed to write leaf page with large content size: %v", err)
+		}
+
+		// Verify content size was written correctly
+		contentSize := binary.LittleEndian.Uint16(leafPage.data[2:4])
+		if contentSize != uint16(PageSize-1) {
+			t.Errorf("Expected ContentSize %d, got %d", PageSize-1, contentSize)
+		}
+	})
+}
+
+// TestParseRadixPage tests the parseRadixPage function
+func TestParseRadixPage(t *testing.T) {
+	t.Run("ParseValidRadixPage", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create test data for a radix page
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeRadix    // Content type
+		data[1] = 3                   // SubPagesUsed
+		binary.LittleEndian.PutUint32(data[2:6], 10) // NextFreePage
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[6:10], 0) // Zero out checksum field
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[6:10], checksum)
+
+		// Parse the radix page
+		radixPage, err := db.parseRadixPage(data, 5)
+		if err != nil {
+			t.Fatalf("Failed to parse radix page: %v", err)
+		}
+
+		// Verify parsed fields
+		if radixPage.pageNumber != 5 {
+			t.Errorf("Expected page number 5, got %d", radixPage.pageNumber)
+		}
+
+		if radixPage.pageType != ContentTypeRadix {
+			t.Errorf("Expected page type %c, got %c", ContentTypeRadix, radixPage.pageType)
+		}
+
+		if radixPage.SubPagesUsed != 3 {
+			t.Errorf("Expected SubPagesUsed 3, got %d", radixPage.SubPagesUsed)
+		}
+
+		if radixPage.NextFreePage != 10 {
+			t.Errorf("Expected NextFreePage 10, got %d", radixPage.NextFreePage)
+		}
+
+		if radixPage.dirty {
+			t.Error("Expected parsed page to not be dirty")
+		}
+
+		if radixPage.accessTime == 0 {
+			t.Error("Expected access time to be set")
+		}
+	})
+
+	t.Run("ParseRadixPageWrongType", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create test data with wrong content type
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeLeaf     // Wrong type for radix page
+		data[1] = 1
+		binary.LittleEndian.PutUint32(data[2:6], 0)
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[6:10], 0)
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[6:10], checksum)
+
+		// Parse should fail
+		_, err = db.parseRadixPage(data, 1)
+		if err == nil {
+			t.Error("Expected error for wrong content type, got nil")
+		}
+		if !strings.Contains(err.Error(), "not a radix page") {
+			t.Errorf("Expected 'not a radix page' error, got: %v", err)
+		}
+	})
+
+	t.Run("ParseRadixPageBadChecksum", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create test data with bad checksum
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeRadix
+		data[1] = 1
+		binary.LittleEndian.PutUint32(data[2:6], 0)
+		binary.BigEndian.PutUint32(data[6:10], 0xDEADBEEF) // Wrong checksum
+
+		// Parse should fail
+		_, err = db.parseRadixPage(data, 1)
+		if err == nil {
+			t.Error("Expected error for bad checksum, got nil")
+		}
+		if !strings.Contains(err.Error(), "checksum mismatch") {
+			t.Errorf("Expected 'checksum mismatch' error, got: %v", err)
+		}
+	})
+
+	t.Run("ParseRadixPageAddsToCache", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Clear cache to start fresh
+		initialCacheCount := db.totalCachePages.Load()
+
+		// Create valid test data
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeRadix
+		data[1] = 2
+		binary.LittleEndian.PutUint32(data[2:6], 0)
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[6:10], 0)
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[6:10], checksum)
+
+		// Parse the page
+		_, err = db.parseRadixPage(data, 15)
+		if err != nil {
+			t.Fatalf("Failed to parse radix page: %v", err)
+		}
+
+		// Verify page was added to cache
+		newCacheCount := db.totalCachePages.Load()
+		if newCacheCount <= initialCacheCount {
+			t.Error("Expected cache count to increase after parsing page")
+		}
+
+		// Verify we can get the page from cache
+		cachedPage, exists := db.getFromCache(15)
+		if !exists {
+			t.Error("Expected page to be in cache")
+		}
+		if cachedPage.pageType != ContentTypeRadix {
+			t.Error("Expected cached page to be radix type")
+		}
+	})
+}
+
+// TestParseLeafPage tests the parseLeafPage function
+func TestParseLeafPage(t *testing.T) {
+	t.Run("ParseValidLeafPage", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create test data for a leaf page
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeLeaf     // Content type
+		data[1] = 0                   // Unused byte
+		binary.LittleEndian.PutUint16(data[2:4], 16) // ContentSize = header size (8) + one minimal entry (8)
+
+		// Add a simple entry after the header (starting at position 8)
+		pos := 8
+		// Add suffix length (varint: 1 byte for value 3)
+		data[pos] = 3 // suffix length = 3
+		pos++
+		// Add suffix
+		copy(data[pos:pos+3], []byte("key"))
+		pos += 3
+		// Add data offset (8 bytes)
+		binary.LittleEndian.PutUint64(data[pos:pos+8], 1000)
+		pos += 8
+
+		// Calculate and set checksum (checksum field is at position 4-8)
+		binary.BigEndian.PutUint32(data[4:8], 0) // Zero out checksum field
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[4:8], checksum)
+
+		// Parse the leaf page
+		leafPage, err := db.parseLeafPage(data, 7)
+		if err != nil {
+			t.Fatalf("Failed to parse leaf page: %v", err)
+		}
+
+		// Verify parsed fields
+		if leafPage.pageNumber != 7 {
+			t.Errorf("Expected page number 7, got %d", leafPage.pageNumber)
+		}
+
+		if leafPage.pageType != ContentTypeLeaf {
+			t.Errorf("Expected page type %c, got %c", ContentTypeLeaf, leafPage.pageType)
+		}
+
+		if leafPage.ContentSize != 16 {
+			t.Errorf("Expected ContentSize 16, got %d", leafPage.ContentSize)
+		}
+
+		if len(leafPage.Entries) != 1 {
+			t.Errorf("Expected 1 entry, got %d", len(leafPage.Entries))
+		}
+
+		// Verify the parsed entry
+		entry := leafPage.Entries[0]
+		if entry.SuffixLen != 3 {
+			t.Errorf("Expected suffix length 3, got %d", entry.SuffixLen)
+		}
+
+		if entry.DataOffset != 1000 {
+			t.Errorf("Expected data offset 1000, got %d", entry.DataOffset)
+		}
+
+		// Verify suffix content
+		suffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
+		if !bytes.Equal(suffix, []byte("key")) {
+			t.Errorf("Expected suffix 'key', got %s", suffix)
+		}
+
+		if leafPage.dirty {
+			t.Error("Expected parsed page to not be dirty")
+		}
+
+		if leafPage.accessTime == 0 {
+			t.Error("Expected access time to be set")
+		}
+	})
+
+	t.Run("ParseLeafPageWrongType", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create test data with wrong content type
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeRadix    // Wrong type for leaf page
+		binary.LittleEndian.PutUint16(data[2:4], 8) // ContentSize
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[4:8], 0)
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[4:8], checksum)
+
+		// Parse should fail
+		_, err = db.parseLeafPage(data, 1)
+		if err == nil {
+			t.Error("Expected error for wrong content type, got nil")
+		}
+		if !strings.Contains(err.Error(), "not a leaf page") {
+			t.Errorf("Expected 'not a leaf page' error, got: %v", err)
+		}
+	})
+
+	t.Run("ParseLeafPageBadChecksum", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create test data with bad checksum
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeLeaf
+		binary.LittleEndian.PutUint16(data[2:4], 8) // ContentSize
+		binary.BigEndian.PutUint32(data[4:8], 0xCAFEBABE) // Wrong checksum
+
+		// Parse should fail
+		_, err = db.parseLeafPage(data, 1)
+		if err == nil {
+			t.Error("Expected error for bad checksum, got nil")
+		}
+		if !strings.Contains(err.Error(), "checksum mismatch") {
+			t.Errorf("Expected 'checksum mismatch' error, got: %v", err)
+		}
+	})
+
+	t.Run("ParseLeafPageEmptyContent", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create test data for empty leaf page (only header)
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeLeaf
+		binary.LittleEndian.PutUint16(data[2:4], LeafHeaderSize) // Only header content
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[4:8], 0)
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[4:8], checksum)
+
+		// Parse should succeed
+		leafPage, err := db.parseLeafPage(data, 1)
+		if err != nil {
+			t.Fatalf("Failed to parse empty leaf page: %v", err)
+		}
+
+		// Verify empty page properties
+		if leafPage.ContentSize != LeafHeaderSize {
+			t.Errorf("Expected ContentSize %d, got %d", LeafHeaderSize, leafPage.ContentSize)
+		}
+
+		if len(leafPage.Entries) != 0 {
+			t.Errorf("Expected 0 entries in empty page, got %d", len(leafPage.Entries))
+		}
+	})
+
+	t.Run("ParseLeafPageMultipleEntries", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Create test data for a leaf page with multiple entries
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeLeaf
+
+		pos := LeafHeaderSize
+
+		// Add first entry
+		data[pos] = 4 // suffix length
+		pos++
+		copy(data[pos:pos+4], []byte("key1"))
+		pos += 4
+		binary.LittleEndian.PutUint64(data[pos:pos+8], 2000)
+		pos += 8
+
+		// Add second entry
+		data[pos] = 4 // suffix length
+		pos++
+		copy(data[pos:pos+4], []byte("key2"))
+		pos += 4
+		binary.LittleEndian.PutUint64(data[pos:pos+8], 3000)
+		pos += 8
+
+		// Set content size
+		binary.LittleEndian.PutUint16(data[2:4], uint16(pos))
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[4:8], 0)
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[4:8], checksum)
+
+		// Parse the leaf page
+		leafPage, err := db.parseLeafPage(data, 1)
+		if err != nil {
+			t.Fatalf("Failed to parse leaf page with multiple entries: %v", err)
+		}
+
+		// Verify parsed entries
+		if len(leafPage.Entries) != 2 {
+			t.Errorf("Expected 2 entries, got %d", len(leafPage.Entries))
+		}
+
+		// Verify first entry
+		entry1 := leafPage.Entries[0]
+		if entry1.SuffixLen != 4 {
+			t.Errorf("Expected first entry suffix length 4, got %d", entry1.SuffixLen)
+		}
+		if entry1.DataOffset != 2000 {
+			t.Errorf("Expected first entry data offset 2000, got %d", entry1.DataOffset)
+		}
+		suffix1 := leafPage.data[entry1.SuffixOffset:entry1.SuffixOffset+entry1.SuffixLen]
+		if !bytes.Equal(suffix1, []byte("key1")) {
+			t.Errorf("Expected first entry suffix 'key1', got %s", suffix1)
+		}
+
+		// Verify second entry
+		entry2 := leafPage.Entries[1]
+		if entry2.SuffixLen != 4 {
+			t.Errorf("Expected second entry suffix length 4, got %d", entry2.SuffixLen)
+		}
+		if entry2.DataOffset != 3000 {
+			t.Errorf("Expected second entry data offset 3000, got %d", entry2.DataOffset)
+		}
+		suffix2 := leafPage.data[entry2.SuffixOffset:entry2.SuffixOffset+entry2.SuffixLen]
+		if !bytes.Equal(suffix2, []byte("key2")) {
+			t.Errorf("Expected second entry suffix 'key2', got %s", suffix2)
+		}
+	})
+
+	t.Run("ParseLeafPageAddsToCache", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Get initial cache count
+		initialCacheCount := db.totalCachePages.Load()
+
+		// Create valid test data
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeLeaf
+		binary.LittleEndian.PutUint16(data[2:4], LeafHeaderSize)
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[4:8], 0)
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[4:8], checksum)
+
+		// Parse the page
+		_, err = db.parseLeafPage(data, 25)
+		if err != nil {
+			t.Fatalf("Failed to parse leaf page: %v", err)
+		}
+
+		// Verify page was added to cache
+		newCacheCount := db.totalCachePages.Load()
+		if newCacheCount <= initialCacheCount {
+			t.Error("Expected cache count to increase after parsing page")
+		}
+
+		// Verify we can get the page from cache
+		cachedPage, exists := db.getFromCache(25)
+		if !exists {
+			t.Error("Expected page to be in cache")
+		}
+		if cachedPage.pageType != ContentTypeLeaf {
+			t.Error("Expected cached page to be leaf type")
 		}
 	})
 }
