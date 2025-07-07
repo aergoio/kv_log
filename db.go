@@ -2410,30 +2410,6 @@ func (db *DB) iteratePages(callback func(*cacheBucket, uint32, *Page)) {
 	}
 }
 
-// Remove a page from the cache
-func (db *DB) removeFromCache(pageNumber uint32) {
-	bucket := &db.pageCache[pageNumber & 1023]
-
-	bucket.mutex.Lock()
-	defer bucket.mutex.Unlock()
-
-	// Check if the page exists before trying to delete it
-	page, exists := bucket.pages[pageNumber]
-	if exists {
-		// Count how many page versions we're removing
-		var count int64 = 0
-		for p := page; p != nil; p = p.next {
-			count++
-		}
-
-		// Delete the page
-		delete(bucket.pages, pageNumber)
-
-		// Decrement the total pages counter by the number of versions
-		db.totalCachePages.Add(-count)
-	}
-}
-
 // getWritablePage gets a writable version of a page
 // if the given page is already writable, it returns the page itself
 func (db *DB) getWritablePage(page *Page) (*Page, error) {
