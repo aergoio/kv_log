@@ -5778,3 +5778,431 @@ func TestParseLeafPage(t *testing.T) {
 		}
 	})
 }
+
+// TestGetWritablePage tests the getWritablePage function
+func TestGetWritablePage(t *testing.T) {
+	// Create a temporary database for testing
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_getwritablepage.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start a transaction
+	db.beginTransaction()
+	defer db.commitTransaction()
+
+	t.Run("AlreadyWritablePage", func(t *testing.T) {
+		// Create a new page that should be writable (in current transaction)
+		radixPage, err := db.allocateRadixPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix page: %v", err)
+		}
+
+		// Get a writable version - should be the same page
+		writablePage, err := db.getWritablePage(radixPage)
+		if err != nil {
+			t.Fatalf("Failed to get writable page: %v", err)
+		}
+
+		// Verify it's the same page instance (no cloning needed)
+		if writablePage != radixPage {
+			t.Error("Expected same page instance for already writable page")
+		}
+
+		// Verify the page number remains the same
+		if writablePage.pageNumber != radixPage.pageNumber {
+			t.Errorf("Page number changed: expected %d, got %d", radixPage.pageNumber, writablePage.pageNumber)
+		}
+
+		// Verify transaction sequence is set
+		if writablePage.txnSequence != db.txnSequence {
+			t.Errorf("Transaction sequence not set correctly: expected %d, got %d", db.txnSequence, writablePage.txnSequence)
+		}
+	})
+
+	t.Run("WALPageRequiresClone", func(t *testing.T) {
+		// Create a new page
+		radixPage, err := db.allocateRadixPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix page: %v", err)
+		}
+
+		// Mark it as part of WAL
+		radixPage.isWAL = true
+
+		// Get a writable version - should clone the page
+		writablePage, err := db.getWritablePage(radixPage)
+		if err != nil {
+			t.Fatalf("Failed to get writable page: %v", err)
+		}
+
+		// Verify it's a different page instance (cloned)
+		if writablePage == radixPage {
+			t.Error("Expected different page instance for WAL page")
+		}
+
+		// Verify the page number remains the same
+		if writablePage.pageNumber != radixPage.pageNumber {
+			t.Errorf("Page number changed: expected %d, got %d", radixPage.pageNumber, writablePage.pageNumber)
+		}
+
+		// Verify the cloned page is not marked as WAL
+		if writablePage.isWAL {
+			t.Error("Cloned page should not be marked as WAL")
+		}
+
+		// Verify transaction sequence is set
+		if writablePage.txnSequence != db.txnSequence {
+			t.Errorf("Transaction sequence not set correctly: expected %d, got %d", db.txnSequence, writablePage.txnSequence)
+		}
+
+		// Verify both pages are in cache
+		cachedPage, exists := db.getFromCache(radixPage.pageNumber)
+		if !exists {
+			t.Error("Page should exist in cache")
+		}
+		if cachedPage != writablePage {
+			t.Error("Most recent page in cache should be the cloned page")
+		}
+
+		// Verify the original page is linked from the cloned page
+		if cachedPage.next != radixPage {
+			t.Error("Original page should be linked from cloned page")
+		}
+	})
+
+	t.Run("OldTransactionRequiresClone", func(t *testing.T) {
+		// Create a new page
+		radixPage, err := db.allocateRadixPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix page: %v", err)
+		}
+
+		// Set an old transaction sequence
+		radixPage.txnSequence = db.txnSequence - 1
+
+		// Get a writable version - should clone the page
+		writablePage, err := db.getWritablePage(radixPage)
+		if err != nil {
+			t.Fatalf("Failed to get writable page: %v", err)
+		}
+
+		// Verify it's a different page instance (cloned)
+		if writablePage == radixPage {
+			t.Error("Expected different page instance for page from older transaction")
+		}
+
+		// Verify the page number remains the same
+		if writablePage.pageNumber != radixPage.pageNumber {
+			t.Errorf("Page number changed: expected %d, got %d", radixPage.pageNumber, writablePage.pageNumber)
+		}
+
+		// Verify transaction sequence is updated
+		if writablePage.txnSequence != db.txnSequence {
+			t.Errorf("Transaction sequence not updated: expected %d, got %d", db.txnSequence, writablePage.txnSequence)
+		}
+
+		// Verify both pages are in cache
+		cachedPage, exists := db.getFromCache(radixPage.pageNumber)
+		if !exists {
+			t.Error("Page should exist in cache")
+		}
+		if cachedPage != writablePage {
+			t.Error("Most recent page in cache should be the cloned page")
+		}
+
+		// Verify the original page is linked from the cloned page
+		if cachedPage.next != radixPage {
+			t.Error("Original page should be linked from cloned page")
+		}
+	})
+
+	t.Run("FlushSequenceRequiresClone", func(t *testing.T) {
+		// Set a flush sequence
+		db.flushSequence = db.txnSequence - 1
+
+		// Create a new page
+		radixPage, err := db.allocateRadixPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix page: %v", err)
+		}
+
+		// Set transaction sequence to be <= flush sequence
+		radixPage.txnSequence = db.flushSequence
+
+		// Get a writable version - should clone the page
+		writablePage, err := db.getWritablePage(radixPage)
+		if err != nil {
+			t.Fatalf("Failed to get writable page: %v", err)
+		}
+
+		// Verify it's a different page instance (cloned)
+		if writablePage == radixPage {
+			t.Error("Expected different page instance for page marked for flush")
+		}
+
+		// Verify the page number remains the same
+		if writablePage.pageNumber != radixPage.pageNumber {
+			t.Errorf("Page number changed: expected %d, got %d", radixPage.pageNumber, writablePage.pageNumber)
+		}
+
+		// Verify transaction sequence is updated
+		if writablePage.txnSequence != db.txnSequence {
+			t.Errorf("Transaction sequence not updated: expected %d, got %d", db.txnSequence, writablePage.txnSequence)
+		}
+
+		// Verify both pages are in cache
+		cachedPage, exists := db.getFromCache(radixPage.pageNumber)
+		if !exists {
+			t.Error("Page should exist in cache")
+		}
+		if cachedPage != writablePage {
+			t.Error("Most recent page in cache should be the cloned page")
+		}
+
+		// Reset flush sequence for other tests
+		db.flushSequence = 0
+	})
+}
+
+// TestCloneRadixPage tests the cloneRadixPage function
+func TestCloneRadixPage(t *testing.T) {
+	// Create a temporary database for testing
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_cloneradixpage.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start a transaction
+	db.beginTransaction()
+	defer db.commitTransaction()
+
+	// Create a radix page with some data
+	originalPage, err := db.allocateRadixPage()
+	if err != nil {
+		t.Fatalf("Failed to allocate radix page: %v", err)
+	}
+
+	// Set some test values
+	originalPage.SubPagesUsed = 2
+	originalPage.NextFreePage = 42
+	originalPage.dirty = true
+	originalPage.isWAL = true
+	originalPage.txnSequence = 100
+
+	// Set some data in the page
+	testByte := byte(123)
+	originalPage.data[100] = testByte
+
+	// Clone the page
+	clonedPage, err := db.cloneRadixPage(originalPage)
+	if err != nil {
+		t.Fatalf("Failed to clone radix page: %v", err)
+	}
+
+	// Verify page number remains the same
+	if clonedPage.pageNumber != originalPage.pageNumber {
+		t.Errorf("Page number changed: expected %d, got %d", originalPage.pageNumber, clonedPage.pageNumber)
+	}
+
+	// Verify page type remains the same
+	if clonedPage.pageType != originalPage.pageType {
+		t.Errorf("Page type changed: expected %c, got %c", originalPage.pageType, clonedPage.pageType)
+	}
+
+	// Verify dirty flag is copied
+	if clonedPage.dirty != originalPage.dirty {
+		t.Errorf("Dirty flag not copied: expected %v, got %v", originalPage.dirty, clonedPage.dirty)
+	}
+
+	// Verify WAL flag is reset
+	if clonedPage.isWAL {
+		t.Error("WAL flag should be reset in cloned page")
+	}
+
+	// Verify transaction sequence is copied
+	if clonedPage.txnSequence != originalPage.txnSequence {
+		t.Errorf("Transaction sequence not copied: expected %d, got %d", originalPage.txnSequence, clonedPage.txnSequence)
+	}
+
+	// Verify access time is copied
+	if clonedPage.accessTime != originalPage.accessTime {
+		t.Errorf("Access time not copied: expected %d, got %d", originalPage.accessTime, clonedPage.accessTime)
+	}
+
+	// Verify SubPagesUsed is copied
+	if clonedPage.SubPagesUsed != originalPage.SubPagesUsed {
+		t.Errorf("SubPagesUsed not copied: expected %d, got %d", originalPage.SubPagesUsed, clonedPage.SubPagesUsed)
+	}
+
+	// Verify NextFreePage is copied
+	if clonedPage.NextFreePage != originalPage.NextFreePage {
+		t.Errorf("NextFreePage not copied: expected %d, got %d", originalPage.NextFreePage, clonedPage.NextFreePage)
+	}
+
+	// Verify data is copied (deep copy)
+	if clonedPage.data[100] != testByte {
+		t.Errorf("Data not copied correctly: expected %d, got %d", testByte, clonedPage.data[100])
+	}
+
+	// Verify modifying cloned page doesn't affect original
+	clonedPage.data[100] = testByte + 1
+	if originalPage.data[100] != testByte {
+		t.Error("Modifying cloned page data affected original page")
+	}
+
+	// Verify both pages are in cache
+	cachedPage, exists := db.getFromCache(originalPage.pageNumber)
+	if !exists {
+		t.Error("Page should exist in cache")
+	}
+	if cachedPage != clonedPage {
+		t.Error("Most recent page in cache should be the cloned page")
+	}
+
+	// Verify the original page is linked from the cloned page
+	if cachedPage.next != originalPage {
+		t.Error("Original page should be linked from cloned page")
+	}
+}
+
+// TestCloneLeafPage tests the cloneLeafPage function
+func TestCloneLeafPage(t *testing.T) {
+	// Create a temporary database for testing
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_cloneleafpage.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start a transaction
+	db.beginTransaction()
+	defer db.commitTransaction()
+
+	// Create a leaf page with some data
+	originalPage, err := db.allocateLeafPage()
+	if err != nil {
+		t.Fatalf("Failed to allocate leaf page: %v", err)
+	}
+
+	// Add some entries to the page
+	err = db.addLeafEntry(originalPage, []byte("test_suffix"), 1000)
+	if err != nil {
+		t.Fatalf("Failed to add leaf entry: %v", err)
+	}
+
+	// Set some test values
+	originalPage.ContentSize = 100
+	originalPage.dirty = true
+	originalPage.isWAL = true
+	originalPage.txnSequence = 100
+
+	// Set some data in the page
+	testByte := byte(123)
+	originalPage.data[50] = testByte
+
+	// Clone the page
+	clonedPage, err := db.cloneLeafPage(originalPage)
+	if err != nil {
+		t.Fatalf("Failed to clone leaf page: %v", err)
+	}
+
+	// Verify page number remains the same
+	if clonedPage.pageNumber != originalPage.pageNumber {
+		t.Errorf("Page number changed: expected %d, got %d", originalPage.pageNumber, clonedPage.pageNumber)
+	}
+
+	// Verify page type remains the same
+	if clonedPage.pageType != originalPage.pageType {
+		t.Errorf("Page type changed: expected %c, got %c", originalPage.pageType, clonedPage.pageType)
+	}
+
+	// Verify dirty flag is copied
+	if clonedPage.dirty != originalPage.dirty {
+		t.Errorf("Dirty flag not copied: expected %v, got %v", originalPage.dirty, clonedPage.dirty)
+	}
+
+	// Verify WAL flag is reset
+	if clonedPage.isWAL {
+		t.Error("WAL flag should be reset in cloned page")
+	}
+
+	// Verify transaction sequence is copied
+	if clonedPage.txnSequence != originalPage.txnSequence {
+		t.Errorf("Transaction sequence not copied: expected %d, got %d", originalPage.txnSequence, clonedPage.txnSequence)
+	}
+
+	// Verify access time is copied
+	if clonedPage.accessTime != originalPage.accessTime {
+		t.Errorf("Access time not copied: expected %d, got %d", originalPage.accessTime, clonedPage.accessTime)
+	}
+
+	// Verify ContentSize is copied
+	if clonedPage.ContentSize != originalPage.ContentSize {
+		t.Errorf("ContentSize not copied: expected %d, got %d", originalPage.ContentSize, clonedPage.ContentSize)
+	}
+
+	// Verify entries are copied
+	if len(clonedPage.Entries) != len(originalPage.Entries) {
+		t.Errorf("Entries not copied correctly: expected %d entries, got %d", len(originalPage.Entries), len(clonedPage.Entries))
+	}
+
+	// Verify data is copied (deep copy)
+	if clonedPage.data[50] != testByte {
+		t.Errorf("Data not copied correctly: expected %d, got %d", testByte, clonedPage.data[50])
+	}
+
+	// Verify modifying cloned page doesn't affect original
+	clonedPage.data[50] = testByte + 1
+	if originalPage.data[50] != testByte {
+		t.Error("Modifying cloned page data affected original page")
+	}
+
+	// Verify both pages are in cache
+	cachedPage, exists := db.getFromCache(originalPage.pageNumber)
+	if !exists {
+		t.Error("Page should exist in cache")
+	}
+	if cachedPage != clonedPage {
+		t.Error("Most recent page in cache should be the cloned page")
+	}
+
+	// Verify the original page is linked from the cloned page
+	if cachedPage.next != originalPage {
+		t.Error("Original page should be linked from cloned page")
+	}
+
+	// Check that entry data is correctly copied
+	if len(originalPage.Entries) > 0 && len(clonedPage.Entries) > 0 {
+		originalEntry := originalPage.Entries[0]
+		clonedEntry := clonedPage.Entries[0]
+
+		// Verify entry data offset
+		if clonedEntry.DataOffset != originalEntry.DataOffset {
+			t.Errorf("Entry DataOffset not copied: expected %d, got %d", originalEntry.DataOffset, clonedEntry.DataOffset)
+		}
+
+		// Verify entry suffix length
+		if clonedEntry.SuffixLen != originalEntry.SuffixLen {
+			t.Errorf("Entry SuffixLen not copied: expected %d, got %d", originalEntry.SuffixLen, clonedEntry.SuffixLen)
+		}
+
+		// Verify suffix content is correctly copied
+		originalSuffix := originalPage.data[originalEntry.SuffixOffset:originalEntry.SuffixOffset+originalEntry.SuffixLen]
+		clonedSuffix := clonedPage.data[clonedEntry.SuffixOffset:clonedEntry.SuffixOffset+clonedEntry.SuffixLen]
+		if !bytes.Equal(clonedSuffix, originalSuffix) {
+			t.Errorf("Entry suffix not copied correctly: expected %v, got %v", originalSuffix, clonedSuffix)
+		}
+	}
+}
