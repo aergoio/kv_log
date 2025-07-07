@@ -2697,265 +2697,6 @@ func TestPageCacheAfterLeafOperations(t *testing.T) {
 	}
 }
 
-// TestEmptySuffixOnRadixPages tests empty suffix operations on radix pages
-func TestEmptySuffixOnRadixPages(t *testing.T) {
-	// Create a temporary database for testing
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_emptysuffix.db")
-
-	db, err := Open(dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-	defer db.Close()
-
-	// Start a transaction
-	db.beginTransaction()
-	defer db.commitTransaction()
-
-	t.Run("SetEmptySuffixOffset", func(t *testing.T) {
-		// Create a radix sub-page
-		radixSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate radix sub-page: %v", err)
-		}
-
-		// Test data
-		dataOffset := int64(12345)
-
-		// Set empty suffix offset
-		err = db.setEmptySuffixOffset(radixSubPage, dataOffset)
-		if err != nil {
-			t.Fatalf("Failed to set empty suffix offset: %v", err)
-		}
-
-		// Verify the offset was set correctly
-		retrievedOffset := db.getEmptySuffixOffset(radixSubPage)
-		if retrievedOffset != dataOffset {
-			t.Errorf("Expected empty suffix offset %d, got %d", dataOffset, retrievedOffset)
-		}
-
-		// Verify the page is marked as dirty
-		if !radixSubPage.Page.dirty {
-			t.Error("Radix page should be marked as dirty after setting empty suffix offset")
-		}
-	})
-
-	t.Run("GetEmptySuffixOffsetWhenZero", func(t *testing.T) {
-		// Create a new radix sub-page
-		radixSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate radix sub-page: %v", err)
-		}
-
-		// Get empty suffix offset on a fresh page (should be 0)
-		offset := db.getEmptySuffixOffset(radixSubPage)
-		if offset != 0 {
-			t.Errorf("Expected empty suffix offset 0 on fresh page, got %d", offset)
-		}
-	})
-
-	t.Run("SetOnEmptySuffixInsert", func(t *testing.T) {
-		// Create a radix sub-page
-		radixSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate radix sub-page: %v", err)
-		}
-
-		// Test data
-		key := []byte("test_key")
-		value := []byte("test_value")
-
-		// Test setOnEmptySuffix for a new insert
-		err = db.setOnEmptySuffix(radixSubPage, key, value, 0)
-		if err != nil {
-			t.Fatalf("Failed to set on empty suffix: %v", err)
-		}
-
-		// Verify the empty suffix offset was set
-		offset := db.getEmptySuffixOffset(radixSubPage)
-		if offset == 0 {
-			t.Error("Expected non-zero empty suffix offset after insert")
-		}
-
-		// Verify we can read the content back
-		content, err := db.readContent(offset)
-		if err != nil {
-			t.Fatalf("Failed to read content: %v", err)
-		}
-		if !bytes.Equal(content.key, key) {
-			t.Errorf("Expected key %v, got %v", key, content.key)
-		}
-		if !bytes.Equal(content.value, value) {
-			t.Errorf("Expected value %v, got %v", value, content.value)
-		}
-	})
-
-	t.Run("SetOnEmptySuffixUpdate", func(t *testing.T) {
-		// Create a radix sub-page
-		radixSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate radix sub-page: %v", err)
-		}
-
-		// Test data
-		key := []byte("test_key")
-		originalValue := []byte("original_value")
-		updatedValue := []byte("updated_value")
-
-		// First insert
-		err = db.setOnEmptySuffix(radixSubPage, key, originalValue, 0)
-		if err != nil {
-			t.Fatalf("Failed to insert on empty suffix: %v", err)
-		}
-
-		originalOffset := db.getEmptySuffixOffset(radixSubPage)
-
-		// Update with new value
-		err = db.setOnEmptySuffix(radixSubPage, key, updatedValue, 0)
-		if err != nil {
-			t.Fatalf("Failed to update on empty suffix: %v", err)
-		}
-
-		// Verify the offset changed (new data was appended)
-		updatedOffset := db.getEmptySuffixOffset(radixSubPage)
-		if originalOffset == updatedOffset {
-			t.Error("Expected offset to change after update")
-		}
-
-		// Verify the updated content
-		content, err := db.readContent(updatedOffset)
-		if err != nil {
-			t.Fatalf("Failed to read updated content: %v", err)
-		}
-		if !bytes.Equal(content.value, updatedValue) {
-			t.Errorf("Expected updated value %v, got %v", updatedValue, content.value)
-		}
-	})
-
-	t.Run("SetOnEmptySuffixUpdateSameValue", func(t *testing.T) {
-		// Create a radix sub-page
-		radixSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate radix sub-page: %v", err)
-		}
-
-		// Test data
-		key := []byte("test_key")
-		value := []byte("same_value")
-
-		// First insert
-		err = db.setOnEmptySuffix(radixSubPage, key, value, 0)
-		if err != nil {
-			t.Fatalf("Failed to insert on empty suffix: %v", err)
-		}
-
-		originalOffset := db.getEmptySuffixOffset(radixSubPage)
-		originalMainFileSize := db.mainFileSize
-
-		// "Update" with same value
-		err = db.setOnEmptySuffix(radixSubPage, key, value, 0)
-		if err != nil {
-			t.Fatalf("Failed to update with same value: %v", err)
-		}
-
-		// Verify the offset didn't change (no new data written)
-		updatedOffset := db.getEmptySuffixOffset(radixSubPage)
-		if originalOffset != updatedOffset {
-			t.Error("Expected offset to remain the same when updating with same value")
-		}
-
-		// Verify no new data was appended to main file
-		if db.mainFileSize != originalMainFileSize {
-			t.Error("Expected main file size to remain the same when updating with same value")
-		}
-	})
-
-	t.Run("SetOnEmptySuffixDelete", func(t *testing.T) {
-		// Create a radix sub-page
-		radixSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate radix sub-page: %v", err)
-		}
-
-		// Test data
-		key := []byte("test_key")
-		value := []byte("value_to_delete")
-
-		// First insert
-		err = db.setOnEmptySuffix(radixSubPage, key, value, 0)
-		if err != nil {
-			t.Fatalf("Failed to insert on empty suffix: %v", err)
-		}
-
-		// Verify entry exists
-		offset := db.getEmptySuffixOffset(radixSubPage)
-		if offset == 0 {
-			t.Error("Expected non-zero offset after insert")
-		}
-
-		// Delete the entry (empty value means delete)
-		err = db.setOnEmptySuffix(radixSubPage, key, []byte{}, 0)
-		if err != nil {
-			t.Fatalf("Failed to delete from empty suffix: %v", err)
-		}
-
-		// Verify the offset was cleared
-		deletedOffset := db.getEmptySuffixOffset(radixSubPage)
-		if deletedOffset != 0 {
-			t.Errorf("Expected offset to be 0 after delete, got %d", deletedOffset)
-		}
-	})
-
-	t.Run("SetOnEmptySuffixDeleteNonExistent", func(t *testing.T) {
-		// Create a radix sub-page
-		radixSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate radix sub-page: %v", err)
-		}
-
-		// Test data
-		key := []byte("non_existent_key")
-
-		// Try to delete a non-existent entry
-		err = db.setOnEmptySuffix(radixSubPage, key, []byte{}, 0)
-		if err != nil {
-			t.Fatalf("Delete of non-existent entry should not fail: %v", err)
-		}
-
-		// Verify offset remains 0
-		offset := db.getEmptySuffixOffset(radixSubPage)
-		if offset != 0 {
-			t.Errorf("Expected offset to remain 0, got %d", offset)
-		}
-	})
-
-	t.Run("ReindexingMode", func(t *testing.T) {
-		// Create a radix sub-page
-		radixSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate radix sub-page: %v", err)
-		}
-
-		// Test reindexing mode where dataOffset is provided (non-zero)
-		key := []byte("test_key")
-		value := []byte("test_value")
-		dataOffset := int64(54321) // Non-zero means reindexing
-
-		// In reindexing mode, we don't append new data
-		err = db.setOnEmptySuffix(radixSubPage, key, value, dataOffset)
-		if err != nil {
-			t.Fatalf("Failed to set in reindexing mode: %v", err)
-		}
-
-		// Verify the offset was set to the provided value
-		retrievedOffset := db.getEmptySuffixOffset(radixSubPage)
-		if retrievedOffset != dataOffset {
-			t.Errorf("Expected offset %d, got %d", dataOffset, retrievedOffset)
-		}
-	})
-}
-
 // ================================================================================================
 // Leaf Entry Management Tests
 // ================================================================================================
@@ -3967,6 +3708,787 @@ func TestRebuildLeafPageData(t *testing.T) {
 
 			// Move to next entry position
 			pos += varint.Size(uint64(entry.SuffixLen)) + entry.SuffixLen + 8
+		}
+	})
+}
+
+// ------------------------------------------------------------------------------------------------
+// Radix page tests
+// ------------------------------------------------------------------------------------------------
+
+// TestSetRadixEntry tests the setRadixEntry function for radix entry setting
+func TestSetRadixEntry(t *testing.T) {
+	// Create a temporary database for testing
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_setradixentry.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start a transaction
+	db.beginTransaction()
+	defer db.commitTransaction()
+
+	t.Run("SetSingleEntry", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data
+		byteValue := uint8('a')
+		pageNumber := uint32(12345)
+		nextSubPageIdx := uint8(7)
+
+		// Set the radix entry
+		db.setRadixEntry(radixSubPage, byteValue, pageNumber, nextSubPageIdx)
+
+		// Verify the page is marked as dirty
+		if !radixSubPage.Page.dirty {
+			t.Error("Radix page should be marked as dirty after setting entry")
+		}
+
+		// Verify the entry was set correctly using getRadixEntry
+		retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if retrievedPageNumber != pageNumber {
+			t.Errorf("Expected page number %d, got %d", pageNumber, retrievedPageNumber)
+		}
+		if retrievedNextSubPageIdx != nextSubPageIdx {
+			t.Errorf("Expected next sub-page index %d, got %d", nextSubPageIdx, retrievedNextSubPageIdx)
+		}
+	})
+
+	t.Run("SetMultipleEntries", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data - multiple entries with different byte values
+		testEntries := []struct {
+			byteValue       uint8
+			pageNumber      uint32
+			nextSubPageIdx  uint8
+		}{
+			{'a', 1000, 1},
+			{'z', 2000, 2},
+			{0x00, 3000, 3}, // Null byte
+			{0xFF, 4000, 4}, // Max byte value
+			{'A', 5000, 5},  // Upper case
+			{' ', 6000, 6},  // Space character
+			{'\t', 7000, 7}, // Tab character
+			{128, 8000, 8},  // High bit set
+		}
+
+		// Set all entries
+		for _, testEntry := range testEntries {
+			db.setRadixEntry(radixSubPage, testEntry.byteValue, testEntry.pageNumber, testEntry.nextSubPageIdx)
+		}
+
+		// Verify all entries were set correctly
+		for _, testEntry := range testEntries {
+			retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, testEntry.byteValue)
+			if retrievedPageNumber != testEntry.pageNumber {
+				t.Errorf("Byte %d: expected page number %d, got %d", testEntry.byteValue, testEntry.pageNumber, retrievedPageNumber)
+			}
+			if retrievedNextSubPageIdx != testEntry.nextSubPageIdx {
+				t.Errorf("Byte %d: expected next sub-page index %d, got %d", testEntry.byteValue, testEntry.nextSubPageIdx, retrievedNextSubPageIdx)
+			}
+		}
+	})
+
+	t.Run("OverwriteExistingEntry", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data
+		byteValue := uint8('x')
+		originalPageNumber := uint32(1000)
+		originalNextSubPageIdx := uint8(10)
+		newPageNumber := uint32(2000)
+		newNextSubPageIdx := uint8(20)
+
+		// Set the original entry
+		db.setRadixEntry(radixSubPage, byteValue, originalPageNumber, originalNextSubPageIdx)
+
+		// Verify original entry
+		retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if retrievedPageNumber != originalPageNumber {
+			t.Errorf("Expected original page number %d, got %d", originalPageNumber, retrievedPageNumber)
+		}
+		if retrievedNextSubPageIdx != originalNextSubPageIdx {
+			t.Errorf("Expected original next sub-page index %d, got %d", originalNextSubPageIdx, retrievedNextSubPageIdx)
+		}
+
+		// Overwrite with new entry
+		db.setRadixEntry(radixSubPage, byteValue, newPageNumber, newNextSubPageIdx)
+
+		// Verify new entry
+		retrievedPageNumber, retrievedNextSubPageIdx = db.getRadixEntry(radixSubPage, byteValue)
+		if retrievedPageNumber != newPageNumber {
+			t.Errorf("Expected new page number %d, got %d", newPageNumber, retrievedPageNumber)
+		}
+		if retrievedNextSubPageIdx != newNextSubPageIdx {
+			t.Errorf("Expected new next sub-page index %d, got %d", newNextSubPageIdx, retrievedNextSubPageIdx)
+		}
+	})
+
+	t.Run("SetAllPossibleByteValues", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Set entries for all possible byte values (0-255)
+		for i := 0; i <= 255; i++ {
+			byteValue := uint8(i)
+			pageNumber := uint32(10000 + i)
+			nextSubPageIdx := uint8(i % 256) // Ensure it stays within uint8 range
+
+			db.setRadixEntry(radixSubPage, byteValue, pageNumber, nextSubPageIdx)
+		}
+
+		// Verify all entries
+		for i := 0; i <= 255; i++ {
+			byteValue := uint8(i)
+			expectedPageNumber := uint32(10000 + i)
+			expectedNextSubPageIdx := uint8(i % 256)
+
+			retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+			if retrievedPageNumber != expectedPageNumber {
+				t.Errorf("Byte %d: expected page number %d, got %d", i, expectedPageNumber, retrievedPageNumber)
+			}
+			if retrievedNextSubPageIdx != expectedNextSubPageIdx {
+				t.Errorf("Byte %d: expected next sub-page index %d, got %d", i, expectedNextSubPageIdx, retrievedNextSubPageIdx)
+			}
+		}
+	})
+
+	t.Run("SetEntryWithZeroValues", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test setting entry with zero values
+		byteValue := uint8('m')
+		pageNumber := uint32(0)
+		nextSubPageIdx := uint8(0)
+
+		db.setRadixEntry(radixSubPage, byteValue, pageNumber, nextSubPageIdx)
+
+		// Verify zero values are stored correctly
+		retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if retrievedPageNumber != pageNumber {
+			t.Errorf("Expected page number %d, got %d", pageNumber, retrievedPageNumber)
+		}
+		if retrievedNextSubPageIdx != nextSubPageIdx {
+			t.Errorf("Expected next sub-page index %d, got %d", nextSubPageIdx, retrievedNextSubPageIdx)
+		}
+	})
+
+	t.Run("SetEntryWithMaxValues", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test setting entry with maximum values
+		byteValue := uint8(255)
+		pageNumber := uint32(4294967295) // Max uint32
+		nextSubPageIdx := uint8(255)     // Max uint8
+
+		db.setRadixEntry(radixSubPage, byteValue, pageNumber, nextSubPageIdx)
+
+		// Verify maximum values are stored correctly
+		retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if retrievedPageNumber != pageNumber {
+			t.Errorf("Expected page number %d, got %d", pageNumber, retrievedPageNumber)
+		}
+		if retrievedNextSubPageIdx != nextSubPageIdx {
+			t.Errorf("Expected next sub-page index %d, got %d", nextSubPageIdx, retrievedNextSubPageIdx)
+		}
+	})
+
+	t.Run("SetEntriesWithSamePageNumberDifferentSubPageIdx", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test setting multiple entries with same page number but different sub-page indexes
+		testEntries := []struct {
+			byteValue       uint8
+			nextSubPageIdx  uint8
+		}{
+			{'a', 1},
+			{'b', 2},
+			{'c', 3},
+		}
+
+		pageNumber := uint32(9999) // Same page number for all
+
+		// Set all entries with same page number
+		for _, testEntry := range testEntries {
+			db.setRadixEntry(radixSubPage, testEntry.byteValue, pageNumber, testEntry.nextSubPageIdx)
+		}
+
+		// Verify all entries
+		for _, testEntry := range testEntries {
+			retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, testEntry.byteValue)
+			if retrievedPageNumber != pageNumber {
+				t.Errorf("Byte %c: expected page number %d, got %d", testEntry.byteValue, pageNumber, retrievedPageNumber)
+			}
+			if retrievedNextSubPageIdx != testEntry.nextSubPageIdx {
+				t.Errorf("Byte %c: expected next sub-page index %d, got %d", testEntry.byteValue, testEntry.nextSubPageIdx, retrievedNextSubPageIdx)
+			}
+		}
+	})
+}
+
+// TestGetRadixEntry tests the getRadixEntry function for radix entry retrieval
+func TestGetRadixEntry(t *testing.T) {
+	// Create a temporary database for testing
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_getradixentry.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start a transaction
+	db.beginTransaction()
+	defer db.commitTransaction()
+
+	t.Run("GetFromEmptyRadixPage", func(t *testing.T) {
+		// Create a fresh radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Try to get entry from empty page
+		byteValue := uint8('a')
+		pageNumber, nextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+
+		// Should return zero values for empty entry
+		if pageNumber != 0 {
+			t.Errorf("Expected page number 0 for empty entry, got %d", pageNumber)
+		}
+		if nextSubPageIdx != 0 {
+			t.Errorf("Expected next sub-page index 0 for empty entry, got %d", nextSubPageIdx)
+		}
+	})
+
+	t.Run("GetExistingEntry", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Set an entry first
+		byteValue := uint8('x')
+		expectedPageNumber := uint32(5555)
+		expectedNextSubPageIdx := uint8(15)
+
+		db.setRadixEntry(radixSubPage, byteValue, expectedPageNumber, expectedNextSubPageIdx)
+
+		// Get the entry
+		retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+
+		// Verify the values
+		if retrievedPageNumber != expectedPageNumber {
+			t.Errorf("Expected page number %d, got %d", expectedPageNumber, retrievedPageNumber)
+		}
+		if retrievedNextSubPageIdx != expectedNextSubPageIdx {
+			t.Errorf("Expected next sub-page index %d, got %d", expectedNextSubPageIdx, retrievedNextSubPageIdx)
+		}
+	})
+
+	t.Run("GetNonExistentEntry", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Set some entries but not the one we'll try to get
+		db.setRadixEntry(radixSubPage, 'a', 1000, 1)
+		db.setRadixEntry(radixSubPage, 'b', 2000, 2)
+		db.setRadixEntry(radixSubPage, 'c', 3000, 3)
+
+		// Try to get an entry that wasn't set
+		byteValue := uint8('z')
+		pageNumber, nextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+
+		// Should return zero values for non-existent entry
+		if pageNumber != 0 {
+			t.Errorf("Expected page number 0 for non-existent entry, got %d", pageNumber)
+		}
+		if nextSubPageIdx != 0 {
+			t.Errorf("Expected next sub-page index 0 for non-existent entry, got %d", nextSubPageIdx)
+		}
+	})
+
+	t.Run("GetAllPossibleByteValues", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Set entries for specific byte values
+		setEntries := map[uint8]struct {
+			pageNumber     uint32
+			nextSubPageIdx uint8
+		}{
+			0:   {1000, 10},
+			1:   {1001, 11},
+			127: {1127, 127},
+			128: {1128, 128},
+			254: {1254, 254},
+			255: {1255, 255},
+		}
+
+		// Set the specific entries
+		for byteValue, values := range setEntries {
+			db.setRadixEntry(radixSubPage, byteValue, values.pageNumber, values.nextSubPageIdx)
+		}
+
+		// Test getting all possible byte values (0-255)
+		for i := 0; i <= 255; i++ {
+			byteValue := uint8(i)
+			pageNumber, nextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+
+			if values, exists := setEntries[byteValue]; exists {
+				// This byte value was set, should return the set values
+				if pageNumber != values.pageNumber {
+					t.Errorf("Byte %d: expected page number %d, got %d", i, values.pageNumber, pageNumber)
+				}
+				if nextSubPageIdx != values.nextSubPageIdx {
+					t.Errorf("Byte %d: expected next sub-page index %d, got %d", i, values.nextSubPageIdx, nextSubPageIdx)
+				}
+			} else {
+				// This byte value was not set, should return zero values
+				if pageNumber != 0 {
+					t.Errorf("Byte %d: expected page number 0 for unset entry, got %d", i, pageNumber)
+				}
+				if nextSubPageIdx != 0 {
+					t.Errorf("Byte %d: expected next sub-page index 0 for unset entry, got %d", i, nextSubPageIdx)
+				}
+			}
+		}
+	})
+
+	t.Run("GetAfterOverwrite", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		byteValue := uint8('t')
+
+		// Set original entry
+		originalPageNumber := uint32(7777)
+		originalNextSubPageIdx := uint8(77)
+		db.setRadixEntry(radixSubPage, byteValue, originalPageNumber, originalNextSubPageIdx)
+
+		// Verify original entry
+		pageNumber, nextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if pageNumber != originalPageNumber {
+			t.Errorf("Expected original page number %d, got %d", originalPageNumber, pageNumber)
+		}
+		if nextSubPageIdx != originalNextSubPageIdx {
+			t.Errorf("Expected original next sub-page index %d, got %d", originalNextSubPageIdx, nextSubPageIdx)
+		}
+
+		// Overwrite with new entry
+		newPageNumber := uint32(8888)
+		newNextSubPageIdx := uint8(88)
+		db.setRadixEntry(radixSubPage, byteValue, newPageNumber, newNextSubPageIdx)
+
+		// Verify new entry is returned
+		pageNumber, nextSubPageIdx = db.getRadixEntry(radixSubPage, byteValue)
+		if pageNumber != newPageNumber {
+			t.Errorf("Expected new page number %d, got %d", newPageNumber, pageNumber)
+		}
+		if nextSubPageIdx != newNextSubPageIdx {
+			t.Errorf("Expected new next sub-page index %d, got %d", newNextSubPageIdx, nextSubPageIdx)
+		}
+	})
+
+	t.Run("GetZeroValues", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Set entry with zero values
+		byteValue := uint8('z')
+		pageNumber := uint32(0)
+		nextSubPageIdx := uint8(0)
+
+		db.setRadixEntry(radixSubPage, byteValue, pageNumber, nextSubPageIdx)
+
+		// Get the entry and verify zero values are returned correctly
+		retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if retrievedPageNumber != pageNumber {
+			t.Errorf("Expected page number %d, got %d", pageNumber, retrievedPageNumber)
+		}
+		if retrievedNextSubPageIdx != nextSubPageIdx {
+			t.Errorf("Expected next sub-page index %d, got %d", nextSubPageIdx, retrievedNextSubPageIdx)
+		}
+	})
+
+	t.Run("GetMaxValues", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Set entry with maximum values
+		byteValue := uint8('M')
+		pageNumber := uint32(4294967295) // Max uint32
+		nextSubPageIdx := uint8(255)     // Max uint8
+
+		db.setRadixEntry(radixSubPage, byteValue, pageNumber, nextSubPageIdx)
+
+		// Get the entry and verify maximum values are returned correctly
+		retrievedPageNumber, retrievedNextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if retrievedPageNumber != pageNumber {
+			t.Errorf("Expected page number %d, got %d", pageNumber, retrievedPageNumber)
+		}
+		if retrievedNextSubPageIdx != nextSubPageIdx {
+			t.Errorf("Expected next sub-page index %d, got %d", nextSubPageIdx, retrievedNextSubPageIdx)
+		}
+	})
+
+	t.Run("GetAfterMultipleOperations", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Perform multiple set and get operations to test consistency
+		operations := []struct {
+			operation       string
+			byteValue       uint8
+			pageNumber      uint32
+			nextSubPageIdx  uint8
+		}{
+			{"set", 'a', 1000, 10},
+			{"set", 'b', 2000, 20},
+			{"set", 'c', 3000, 30},
+			{"set", 'a', 1001, 11}, // Overwrite 'a'
+			{"set", 'd', 4000, 40},
+			{"set", 'b', 0, 0},     // Set 'b' to zero values
+		}
+
+		// Current expected state
+		expectedState := make(map[uint8]struct {
+			pageNumber     uint32
+			nextSubPageIdx uint8
+		})
+
+		for _, op := range operations {
+			if op.operation == "set" {
+				db.setRadixEntry(radixSubPage, op.byteValue, op.pageNumber, op.nextSubPageIdx)
+				expectedState[op.byteValue] = struct {
+					pageNumber     uint32
+					nextSubPageIdx uint8
+				}{op.pageNumber, op.nextSubPageIdx}
+			}
+
+			// Verify current state after each operation
+			for byteValue, expected := range expectedState {
+				pageNumber, nextSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+				if pageNumber != expected.pageNumber {
+					t.Errorf("After operation %v, byte %c: expected page number %d, got %d",
+						op, byteValue, expected.pageNumber, pageNumber)
+				}
+				if nextSubPageIdx != expected.nextSubPageIdx {
+					t.Errorf("After operation %v, byte %c: expected next sub-page index %d, got %d",
+						op, byteValue, expected.nextSubPageIdx, nextSubPageIdx)
+				}
+			}
+		}
+	})
+}
+
+// TestEmptySuffixOnRadixPages tests empty suffix operations on radix pages
+func TestEmptySuffixOnRadixPages(t *testing.T) {
+	// Create a temporary database for testing
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_emptysuffix.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start a transaction
+	db.beginTransaction()
+	defer db.commitTransaction()
+
+	t.Run("SetEmptySuffixOffset", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data
+		dataOffset := int64(12345)
+
+		// Set empty suffix offset
+		err = db.setEmptySuffixOffset(radixSubPage, dataOffset)
+		if err != nil {
+			t.Fatalf("Failed to set empty suffix offset: %v", err)
+		}
+
+		// Verify the offset was set correctly
+		retrievedOffset := db.getEmptySuffixOffset(radixSubPage)
+		if retrievedOffset != dataOffset {
+			t.Errorf("Expected empty suffix offset %d, got %d", dataOffset, retrievedOffset)
+		}
+
+		// Verify the page is marked as dirty
+		if !radixSubPage.Page.dirty {
+			t.Error("Radix page should be marked as dirty after setting empty suffix offset")
+		}
+	})
+
+	t.Run("GetEmptySuffixOffsetWhenZero", func(t *testing.T) {
+		// Create a new radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Get empty suffix offset on a fresh page (should be 0)
+		offset := db.getEmptySuffixOffset(radixSubPage)
+		if offset != 0 {
+			t.Errorf("Expected empty suffix offset 0 on fresh page, got %d", offset)
+		}
+	})
+
+	t.Run("SetOnEmptySuffixInsert", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data
+		key := []byte("test_key")
+		value := []byte("test_value")
+
+		// Test setOnEmptySuffix for a new insert
+		err = db.setOnEmptySuffix(radixSubPage, key, value, 0)
+		if err != nil {
+			t.Fatalf("Failed to set on empty suffix: %v", err)
+		}
+
+		// Verify the empty suffix offset was set
+		offset := db.getEmptySuffixOffset(radixSubPage)
+		if offset == 0 {
+			t.Error("Expected non-zero empty suffix offset after insert")
+		}
+
+		// Verify we can read the content back
+		content, err := db.readContent(offset)
+		if err != nil {
+			t.Fatalf("Failed to read content: %v", err)
+		}
+		if !bytes.Equal(content.key, key) {
+			t.Errorf("Expected key %v, got %v", key, content.key)
+		}
+		if !bytes.Equal(content.value, value) {
+			t.Errorf("Expected value %v, got %v", value, content.value)
+		}
+	})
+
+	t.Run("SetOnEmptySuffixUpdate", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data
+		key := []byte("test_key")
+		originalValue := []byte("original_value")
+		updatedValue := []byte("updated_value")
+
+		// First insert
+		err = db.setOnEmptySuffix(radixSubPage, key, originalValue, 0)
+		if err != nil {
+			t.Fatalf("Failed to insert on empty suffix: %v", err)
+		}
+
+		originalOffset := db.getEmptySuffixOffset(radixSubPage)
+
+		// Update with new value
+		err = db.setOnEmptySuffix(radixSubPage, key, updatedValue, 0)
+		if err != nil {
+			t.Fatalf("Failed to update on empty suffix: %v", err)
+		}
+
+		// Verify the offset changed (new data was appended)
+		updatedOffset := db.getEmptySuffixOffset(radixSubPage)
+		if originalOffset == updatedOffset {
+			t.Error("Expected offset to change after update")
+		}
+
+		// Verify the updated content
+		content, err := db.readContent(updatedOffset)
+		if err != nil {
+			t.Fatalf("Failed to read updated content: %v", err)
+		}
+		if !bytes.Equal(content.value, updatedValue) {
+			t.Errorf("Expected updated value %v, got %v", updatedValue, content.value)
+		}
+	})
+
+	t.Run("SetOnEmptySuffixUpdateSameValue", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data
+		key := []byte("test_key")
+		value := []byte("same_value")
+
+		// First insert
+		err = db.setOnEmptySuffix(radixSubPage, key, value, 0)
+		if err != nil {
+			t.Fatalf("Failed to insert on empty suffix: %v", err)
+		}
+
+		originalOffset := db.getEmptySuffixOffset(radixSubPage)
+		originalMainFileSize := db.mainFileSize
+
+		// "Update" with same value
+		err = db.setOnEmptySuffix(radixSubPage, key, value, 0)
+		if err != nil {
+			t.Fatalf("Failed to update with same value: %v", err)
+		}
+
+		// Verify the offset didn't change (no new data written)
+		updatedOffset := db.getEmptySuffixOffset(radixSubPage)
+		if originalOffset != updatedOffset {
+			t.Error("Expected offset to remain the same when updating with same value")
+		}
+
+		// Verify no new data was appended to main file
+		if db.mainFileSize != originalMainFileSize {
+			t.Error("Expected main file size to remain the same when updating with same value")
+		}
+	})
+
+	t.Run("SetOnEmptySuffixDelete", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data
+		key := []byte("test_key")
+		value := []byte("value_to_delete")
+
+		// First insert
+		err = db.setOnEmptySuffix(radixSubPage, key, value, 0)
+		if err != nil {
+			t.Fatalf("Failed to insert on empty suffix: %v", err)
+		}
+
+		// Verify entry exists
+		offset := db.getEmptySuffixOffset(radixSubPage)
+		if offset == 0 {
+			t.Error("Expected non-zero offset after insert")
+		}
+
+		// Delete the entry (empty value means delete)
+		err = db.setOnEmptySuffix(radixSubPage, key, []byte{}, 0)
+		if err != nil {
+			t.Fatalf("Failed to delete from empty suffix: %v", err)
+		}
+
+		// Verify the offset was cleared
+		deletedOffset := db.getEmptySuffixOffset(radixSubPage)
+		if deletedOffset != 0 {
+			t.Errorf("Expected offset to be 0 after delete, got %d", deletedOffset)
+		}
+	})
+
+	t.Run("SetOnEmptySuffixDeleteNonExistent", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data
+		key := []byte("non_existent_key")
+
+		// Try to delete a non-existent entry
+		err = db.setOnEmptySuffix(radixSubPage, key, []byte{}, 0)
+		if err != nil {
+			t.Fatalf("Delete of non-existent entry should not fail: %v", err)
+		}
+
+		// Verify offset remains 0
+		offset := db.getEmptySuffixOffset(radixSubPage)
+		if offset != 0 {
+			t.Errorf("Expected offset to remain 0, got %d", offset)
+		}
+	})
+
+	t.Run("ReindexingMode", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test reindexing mode where dataOffset is provided (non-zero)
+		key := []byte("test_key")
+		value := []byte("test_value")
+		dataOffset := int64(54321) // Non-zero means reindexing
+
+		// In reindexing mode, we don't append new data
+		err = db.setOnEmptySuffix(radixSubPage, key, value, dataOffset)
+		if err != nil {
+			t.Fatalf("Failed to set in reindexing mode: %v", err)
+		}
+
+		// Verify the offset was set to the provided value
+		retrievedOffset := db.getEmptySuffixOffset(radixSubPage)
+		if retrievedOffset != dataOffset {
+			t.Errorf("Expected offset %d, got %d", dataOffset, retrievedOffset)
 		}
 	})
 }
