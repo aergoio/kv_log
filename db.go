@@ -1709,11 +1709,10 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 		if bytesRead == 0 {
 			return nil, fmt.Errorf("failed to parse key length")
 		}
-		keyLength := int(keyLength64)
-
-		if keyLength > MaxKeyLength {
-			return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength)
+		if keyLength64 > MaxKeyLength {
+			return nil, fmt.Errorf("key length exceeds maximum allowed size: %d", keyLength64)
 		}
+		keyLength := int(keyLength64)
 
 		// Read enough to get key + value length
 		headerSize := 1 + bytesRead + keyLength + 10 // type + key length varint + key + estimated value length varint

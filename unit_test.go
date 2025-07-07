@@ -8,7 +8,15 @@ import (
 	"path/filepath"
 	"encoding/binary"
 	"github.com/aergoio/kv_log/varint"
+	"hash/crc32"
+	"os"
 )
+
+// createTempFile creates a temporary database file for testing
+func createTempFile(t *testing.T) string {
+	tmpDir := t.TempDir()
+	return filepath.Join(tmpDir, "test.db")
+}
 
 func TestShouldSkipSubtree(t *testing.T) {
 	// Create a mock iterator with different range constraints
@@ -4489,6 +4497,608 @@ func TestEmptySuffixOnRadixPages(t *testing.T) {
 		retrievedOffset := db.getEmptySuffixOffset(radixSubPage)
 		if retrievedOffset != dataOffset {
 			t.Errorf("Expected offset %d, got %d", dataOffset, retrievedOffset)
+		}
+	})
+}
+
+// TestFindLastValidCommit tests the findLastValidCommit function
+func TestFindLastValidCommit(t *testing.T) {
+	// Helper function to create test content
+	createTestContent := func(key, value []byte) []byte {
+		keyLenSize := varint.Size(uint64(len(key)))
+		valueLenSize := varint.Size(uint64(len(value)))
+		totalSize := 1 + keyLenSize + len(key) + valueLenSize + len(value)
+
+		content := make([]byte, totalSize)
+		offset := 0
+
+		// Write content type
+		content[offset] = ContentTypeData
+		offset++
+
+		// Write key length
+		keyLenWritten := varint.Write(content[offset:], uint64(len(key)))
+		offset += keyLenWritten
+
+		// Write key
+		copy(content[offset:], key)
+		offset += len(key)
+
+		// Write value length
+		valueLenWritten := varint.Write(content[offset:], uint64(len(value)))
+		offset += valueLenWritten
+
+		// Write value
+		copy(content[offset:], value)
+
+		return content
+	}
+
+	// Helper function to create commit marker
+	createCommitMarker := func(checksum uint32) []byte {
+		marker := make([]byte, 5)
+		marker[0] = ContentTypeCommit
+		binary.BigEndian.PutUint32(marker[1:5], checksum)
+		return marker
+	}
+
+	t.Run("EmptyContent", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Test with empty content (just the header)
+		validSize, err := db.findLastValidCommit(PageSize)
+		if err != nil {
+			t.Fatalf("Failed to find last valid commit: %v", err)
+		}
+
+		if validSize != PageSize {
+			t.Errorf("Expected valid size %d, got %d", PageSize, validSize)
+		}
+	})
+
+	t.Run("SingleValidTransaction", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Manually write a transaction to main file
+		content1 := createTestContent([]byte("key1"), []byte("value1"))
+		content2 := createTestContent([]byte("key2"), []byte("value2"))
+
+		// Calculate checksum
+		checksum := crc32.ChecksumIEEE(content1)
+		checksum = crc32.Update(checksum, crc32.IEEETable, content2)
+
+		commitMarker := createCommitMarker(checksum)
+
+		// Write to main file
+		startOffset := db.mainFileSize
+		db.mainFile.Write(content1)
+		db.mainFile.Write(content2)
+		db.mainFile.Write(commitMarker)
+
+		// Update file size
+		newSize := startOffset + int64(len(content1)) + int64(len(content2)) + int64(len(commitMarker))
+		db.mainFileSize = newSize
+
+		// Test findLastValidCommit
+		validSize, err := db.findLastValidCommit(startOffset)
+		if err != nil {
+			t.Fatalf("Failed to find last valid commit: %v", err)
+		}
+
+		if validSize != newSize {
+			t.Errorf("Expected valid size %d, got %d", newSize, validSize)
+		}
+	})
+
+	t.Run("MultipleValidTransactions", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		startOffset := db.mainFileSize
+
+		// First transaction
+		content1 := createTestContent([]byte("key1"), []byte("value1"))
+		checksum1 := crc32.ChecksumIEEE(content1)
+		commit1 := createCommitMarker(checksum1)
+
+		db.mainFile.Write(content1)
+		db.mainFile.Write(commit1)
+
+		// Second transaction
+		content2 := createTestContent([]byte("key2"), []byte("value2"))
+		checksum2 := crc32.ChecksumIEEE(content2)
+		commit2 := createCommitMarker(checksum2)
+
+		db.mainFile.Write(content2)
+		db.mainFile.Write(commit2)
+
+		// Update file size
+		newSize := startOffset + int64(len(content1)) + int64(len(commit1)) + int64(len(content2)) + int64(len(commit2))
+		db.mainFileSize = newSize
+
+		// Test findLastValidCommit
+		validSize, err := db.findLastValidCommit(startOffset)
+		if err != nil {
+			t.Fatalf("Failed to find last valid commit: %v", err)
+		}
+
+		if validSize != newSize {
+			t.Errorf("Expected valid size %d, got %d", newSize, validSize)
+		}
+	})
+
+	t.Run("InvalidChecksum", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		startOffset := db.mainFileSize
+
+		// Valid transaction
+		content1 := createTestContent([]byte("key1"), []byte("value1"))
+		checksum1 := crc32.ChecksumIEEE(content1)
+		commit1 := createCommitMarker(checksum1)
+
+		db.mainFile.Write(content1)
+		db.mainFile.Write(commit1)
+
+		validTxnEnd := db.mainFileSize + int64(len(content1)) + int64(len(commit1))
+
+		// Invalid transaction (wrong checksum)
+		content2 := createTestContent([]byte("key2"), []byte("value2"))
+		wrongChecksum := uint32(12345) // Intentionally wrong
+		commit2 := createCommitMarker(wrongChecksum)
+
+		db.mainFile.Write(content2)
+		db.mainFile.Write(commit2)
+
+		// Update file size to include invalid transaction
+		db.mainFileSize = validTxnEnd + int64(len(content2)) + int64(len(commit2))
+
+		// Test findLastValidCommit - should stop at the first valid transaction
+		validSize, err := db.findLastValidCommit(startOffset)
+		if err != nil {
+			t.Fatalf("Failed to find last valid commit: %v", err)
+		}
+
+		if validSize != validTxnEnd {
+			t.Errorf("Expected valid size %d, got %d", validTxnEnd, validSize)
+		}
+	})
+
+	t.Run("IncompleteTransaction", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		startOffset := db.mainFileSize
+
+		// Valid transaction
+		content1 := createTestContent([]byte("key1"), []byte("value1"))
+		checksum1 := crc32.ChecksumIEEE(content1)
+		commit1 := createCommitMarker(checksum1)
+
+		db.mainFile.Write(content1)
+		db.mainFile.Write(commit1)
+
+		validTxnEnd := db.mainFileSize + int64(len(content1)) + int64(len(commit1))
+
+		// Incomplete transaction (content without commit marker)
+		content2 := createTestContent([]byte("key2"), []byte("value2"))
+		db.mainFile.Write(content2)
+
+		// Update file size to include incomplete transaction
+		db.mainFileSize = validTxnEnd + int64(len(content2))
+
+		// Test findLastValidCommit - should stop at the last valid commit
+		validSize, err := db.findLastValidCommit(startOffset)
+		if err != nil {
+			t.Fatalf("Failed to find last valid commit: %v", err)
+		}
+
+		if validSize != validTxnEnd {
+			t.Errorf("Expected valid size %d, got %d", validTxnEnd, validSize)
+		}
+	})
+}
+
+// TestRecoverUnindexedContent tests the recoverUnindexedContent function
+func TestRecoverUnindexedContent(t *testing.T) {
+	t.Run("NoUnindexedContent", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Set lastIndexedOffset to current file size (everything is indexed)
+		db.lastIndexedOffset = db.mainFileSize
+
+		// Test recovery - should be a no-op
+		err = db.recoverUnindexedContent()
+		if err != nil {
+			t.Fatalf("Failed to recover unindexed content: %v", err)
+		}
+	})
+
+	t.Run("RecoverSingleTransaction", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Set lastIndexedOffset to header size (nothing indexed yet)
+		db.lastIndexedOffset = PageSize
+
+		// Add some data using normal operations to create committed transactions
+		err = db.Set([]byte("key1"), []byte("value1"))
+		if err != nil {
+			t.Fatalf("Failed to set key1: %v", err)
+		}
+
+		err = db.Set([]byte("key2"), []byte("value2"))
+		if err != nil {
+			t.Fatalf("Failed to set key2: %v", err)
+		}
+
+		// Reset lastIndexedOffset to simulate unindexed content
+		db.lastIndexedOffset = PageSize
+
+		// Clear the index by reinitializing it
+		db.indexFile.Truncate(0)
+		db.indexFileSize = 0
+		err = db.initializeIndexFile()
+		if err != nil {
+			t.Fatalf("Failed to reinitialize index: %v", err)
+		}
+
+		// Test recovery
+		err = db.recoverUnindexedContent()
+		if err != nil {
+			t.Fatalf("Failed to recover unindexed content: %v", err)
+		}
+
+		// Verify that we can read the recovered data
+		value1, err := db.Get([]byte("key1"))
+		if err != nil {
+			t.Fatalf("Failed to get key1 after recovery: %v", err)
+		}
+		if !bytes.Equal(value1, []byte("value1")) {
+			t.Errorf("Expected value1, got %v", value1)
+		}
+
+		value2, err := db.Get([]byte("key2"))
+		if err != nil {
+			t.Fatalf("Failed to get key2 after recovery: %v", err)
+		}
+		if !bytes.Equal(value2, []byte("value2")) {
+			t.Errorf("Expected value2, got %v", value2)
+		}
+	})
+
+	t.Run("RecoverWithUncommittedData", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Add committed data
+		err = db.Set([]byte("key1"), []byte("value1"))
+		if err != nil {
+			t.Fatalf("Failed to set key1: %v", err)
+		}
+
+		originalFileSize := db.mainFileSize
+
+		// Manually append uncommitted data to the main file
+		db.beginTransaction()
+		_, err = db.appendData([]byte("key2"), []byte("value2"))
+		if err != nil {
+			t.Fatalf("Failed to append data: %v", err)
+		}
+		// Don't commit - leave it uncommitted
+		db.rollbackTransaction()
+
+		// Reset file size to include uncommitted data
+		fileInfo, _ := db.mainFile.Stat()
+		db.mainFileSize = fileInfo.Size()
+
+		// Reset lastIndexedOffset to simulate unindexed content
+		db.lastIndexedOffset = PageSize
+
+		// Clear the index
+		db.indexFile.Truncate(0)
+		db.indexFileSize = 0
+		err = db.initializeIndexFile()
+		if err != nil {
+			t.Fatalf("Failed to reinitialize index: %v", err)
+		}
+
+		// Test recovery - should truncate uncommitted data
+		err = db.recoverUnindexedContent()
+		if err != nil {
+			t.Fatalf("Failed to recover unindexed content: %v", err)
+		}
+
+		// Verify that uncommitted data was truncated
+		if db.mainFileSize > originalFileSize {
+			t.Errorf("Expected file size to be truncated to %d, got %d", originalFileSize, db.mainFileSize)
+		}
+
+		// Verify that committed data is still accessible
+		value1, err := db.Get([]byte("key1"))
+		if err != nil {
+			t.Fatalf("Failed to get key1 after recovery: %v", err)
+		}
+		if !bytes.Equal(value1, []byte("value1")) {
+			t.Errorf("Expected value1, got %v", value1)
+		}
+
+		// Verify that uncommitted data is not accessible
+		_, err = db.Get([]byte("key2"))
+		if err == nil {
+			t.Error("Expected key2 to not be found after recovery")
+		}
+	})
+
+	t.Run("RecoverPartiallyCorruptedData", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Add valid committed data
+		err = db.Set([]byte("key1"), []byte("value1"))
+		if err != nil {
+			t.Fatalf("Failed to set key1: %v", err)
+		}
+
+		validFileSize := db.mainFileSize
+
+		// Manually append corrupted data
+		corruptedData := []byte{ContentTypeData, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} // Invalid varint
+		db.mainFile.Write(corruptedData)
+		db.mainFileSize += int64(len(corruptedData))
+
+		// Reset lastIndexedOffset
+		db.lastIndexedOffset = PageSize
+
+		// Clear the index
+		db.indexFile.Truncate(0)
+		db.indexFileSize = 0
+		err = db.initializeIndexFile()
+		if err != nil {
+			t.Fatalf("Failed to reinitialize index: %v", err)
+		}
+
+		// Test recovery - should stop at corruption and truncate
+		err = db.recoverUnindexedContent()
+		if err != nil {
+			t.Fatalf("Failed to recover unindexed content: %v", err)
+		}
+
+		// Verify that file was truncated to remove corruption
+		if db.mainFileSize != validFileSize {
+			t.Errorf("Expected file size %d after truncation, got %d", validFileSize, db.mainFileSize)
+		}
+
+		// Verify that valid data is still accessible
+		value1, err := db.Get([]byte("key1"))
+		if err != nil {
+			t.Fatalf("Failed to get key1 after recovery: %v", err)
+		}
+		if !bytes.Equal(value1, []byte("value1")) {
+			t.Errorf("Expected value1, got %v", value1)
+		}
+	})
+
+	t.Run("RecoverMultipleTransactions", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Add multiple transactions
+		keys := []string{"key1", "key2", "key3", "key4", "key5"}
+		values := []string{"value1", "value2", "value3", "value4", "value5"}
+
+		for i, key := range keys {
+			err = db.Set([]byte(key), []byte(values[i]))
+			if err != nil {
+				t.Fatalf("Failed to set %s: %v", key, err)
+			}
+		}
+
+		// Reset lastIndexedOffset to simulate all content being unindexed
+		db.lastIndexedOffset = PageSize
+
+		// Clear the index
+		db.indexFile.Truncate(0)
+		db.indexFileSize = 0
+		err = db.initializeIndexFile()
+		if err != nil {
+			t.Fatalf("Failed to reinitialize index: %v", err)
+		}
+
+		// Test recovery
+		err = db.recoverUnindexedContent()
+		if err != nil {
+			t.Fatalf("Failed to recover unindexed content: %v", err)
+		}
+
+		// Verify all data is accessible after recovery
+		for i, key := range keys {
+			value, err := db.Get([]byte(key))
+			if err != nil {
+				t.Fatalf("Failed to get %s after recovery: %v", key, err)
+			}
+			if !bytes.Equal(value, []byte(values[i])) {
+				t.Errorf("Expected %s, got %v", values[i], value)
+			}
+		}
+	})
+
+	t.Run("RecoverWithDeletions", func(t *testing.T) {
+		// Create a test database
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+		defer db.Close()
+
+		// Add data
+		err = db.Set([]byte("key1"), []byte("value1"))
+		if err != nil {
+			t.Fatalf("Failed to set key1: %v", err)
+		}
+
+		err = db.Set([]byte("key2"), []byte("value2"))
+		if err != nil {
+			t.Fatalf("Failed to set key2: %v", err)
+		}
+
+		// Delete key1
+		err = db.Delete([]byte("key1"))
+		if err != nil {
+			t.Fatalf("Failed to delete key1: %v", err)
+		}
+
+		// Reset lastIndexedOffset
+		db.lastIndexedOffset = PageSize
+
+		// Clear the index
+		db.indexFile.Truncate(0)
+		db.indexFileSize = 0
+		err = db.initializeIndexFile()
+		if err != nil {
+			t.Fatalf("Failed to reinitialize index: %v", err)
+		}
+
+		// Test recovery
+		err = db.recoverUnindexedContent()
+		if err != nil {
+			t.Fatalf("Failed to recover unindexed content: %v", err)
+		}
+
+		// Verify key1 is deleted and key2 exists
+		_, err = db.Get([]byte("key1"))
+		if err == nil {
+			t.Error("Expected key1 to be deleted after recovery")
+		}
+
+		value2, err := db.Get([]byte("key2"))
+		if err != nil {
+			t.Fatalf("Failed to get key2 after recovery: %v", err)
+		}
+		if !bytes.Equal(value2, []byte("value2")) {
+			t.Errorf("Expected value2, got %v", value2)
+		}
+	})
+
+	t.Run("ReadOnlyMode", func(t *testing.T) {
+		// Create a test database with some data
+		tmpFile := createTempFile(t)
+		defer os.Remove(tmpFile)
+
+		// First, create database with data
+		db, err := Open(tmpFile)
+		if err != nil {
+			t.Fatalf("Failed to open database: %v", err)
+		}
+
+		err = db.Set([]byte("key1"), []byte("value1"))
+		if err != nil {
+			t.Fatalf("Failed to set key1: %v", err)
+		}
+
+		db.Close()
+
+		// Reopen in read-only mode
+		opts := Options{"ReadOnly": true}
+		db, err = Open(tmpFile, opts)
+		if err != nil {
+			t.Fatalf("Failed to open database in read-only mode: %v", err)
+		}
+		defer db.Close()
+
+		// Simulate unindexed content
+		db.lastIndexedOffset = PageSize
+
+		// Test recovery in read-only mode - should still work for reading
+		err = db.recoverUnindexedContent()
+		if err != nil {
+			t.Fatalf("Failed to recover unindexed content in read-only mode: %v", err)
+		}
+
+		// Should be able to read the data
+		value1, err := db.Get([]byte("key1"))
+		if err != nil {
+			t.Fatalf("Failed to get key1 in read-only mode: %v", err)
+		}
+		if !bytes.Equal(value1, []byte("value1")) {
+			t.Errorf("Expected value1, got %v", value1)
 		}
 	})
 }
