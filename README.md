@@ -129,14 +129,25 @@ The database automatically recovers from crashes by:
 
 ## Pros and Cons
 
-- **Pro:** It is extremely fast for a disk-based database engine
+- **Pro:** It is extremely fast on reads for a disk-based database engine
 - **Con:** The index uses A LOT of disk space for bigger databases
 
 The index does not always grow linearly but in phases.
 
 Example case: The index file reaches ~25GB when the main db grows above ~4GB
 
-But it is more than 2x faster than BadgerDB on reads
+But it is more than 3.5x faster than BadgerDB on reads
+
+## Performance
+
+| Metric | LevelDB | BadgerDB | ForestDB | KV_Log |
+|--------|---------|----------|----------|--------|
+| Set 2M values | 2m 44.45s | 13.81s | 18.95s | 6.98s |
+| 20K txns (10 items each) | 1m 0.09s | 1.32s | 2.78s | 1.70s |
+| Space after write | 1052.08 MB | 2002.38 MB | 1715.76 MB | 1501.09 MB |
+| Space after close | 1158.78 MB | 1203.11 MB | 2223.16 MB | 1899.50 MB |
+| Read 2M values (fresh) | 1m 26.87s | 35.14s | 17.21s | 11.20s |
+| Read 2M values (cold) | 1m 34.46s | 38.36s | 16.84s | 10.81s |
 
 ## License
 
