@@ -472,7 +472,7 @@ func (db *DB) scanWAL() error {
 				return fmt.Errorf("failed to parse leaf page: %w", err)
 			}
 		} else if pageNumber == 0 {
-			_, err := db.parseHeaderPage(entry.Data, pageNumber)
+			_, err := db.parseHeaderPage(entry.Data)
 			if err != nil {
 				return fmt.Errorf("failed to parse header page: %w", err)
 			}

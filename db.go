@@ -1795,11 +1795,11 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 // Header page
 // ------------------------------------------------------------------------------------------------
 
-func (db *DB) parseHeaderPage(data []byte, pageNumber uint32) (*Page, error) {
+func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 
 	// Just store the data on the cache
 	headerPage := &Page{
-		pageNumber: pageNumber,
+		pageNumber: 0,
 		data:       data,
 	}
 
