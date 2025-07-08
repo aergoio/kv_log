@@ -127,6 +127,17 @@ The database automatically recovers from crashes by:
 - Single connection per database file: Only one process can open the database in write mode at a time
 - Concurrent access model: Supports one writer thread or multiple reader threads simultaneously
 
+## Pros and Cons
+
+- **Pro:** It is extremely fast for a disk-based database engine
+- **Con:** The index uses A LOT of disk space for bigger databases
+
+The index does not always grow linearly but in phases.
+
+Example case: The index file reaches ~25GB when the main db grows above ~4GB
+
+But it is more than 2x faster than BadgerDB on reads
+
 ## License
 
 Apache 2.0
