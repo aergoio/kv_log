@@ -3665,6 +3665,7 @@ func (db *DB) initializeRadixLevels() error {
 	rootRadixPage.SubPagesUsed = 1
 	db.markPageDirty(rootRadixPage)
 
+	/*
 	// Create root sub-page
 	rootSubPage := &RadixSubPage{
 		Page:       rootRadixPage,
@@ -3685,6 +3686,7 @@ func (db *DB) initializeRadixLevels() error {
 			return fmt.Errorf("failed to set radix entry for byte %d: %w", byteValue, err)
 		}
 	}
+	*/
 
 	return nil
 }
@@ -3820,6 +3822,9 @@ func (db *DB) recoverUnindexedContent() error {
 	if err != nil {
 		return fmt.Errorf("failed to get root radix sub-page: %w", err)
 	}
+
+	// Update the transaction sequence on the root radix sub-page
+	rootSubPage.Page.txnSequence = db.txnSequence
 
 	// Second pass: Process all committed data
 	currentOffset := lastIndexedOffset
