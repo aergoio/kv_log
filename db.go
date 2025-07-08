@@ -22,8 +22,6 @@ import (
 )
 
 const (
-	// Debug mode (set to false to disable debug prints)
-	DebugMode = false
 	// Page size (4KB)
 	PageSize = 4096
 	// Magic strings for database identification (6 bytes)
@@ -87,13 +85,6 @@ const (
 	SyncOn  = 1 // Sync after writes
 	SyncOff = 0 // Don't sync after writes
 )
-
-// debugPrint prints a message if debug mode is enabled
-func debugPrint(format string, args ...interface{}) {
-	if DebugMode {
-		fmt.Printf(format, args...)
-	}
-}
 
 // cacheBucket represents a bucket in the page cache with its own mutex
 type cacheBucket struct {
@@ -202,6 +193,26 @@ type LeafEntry struct {
 
 // Options represents configuration options for the database
 type Options map[string]interface{}
+
+// DebugMode controls whether debug prints are enabled
+var DebugMode bool
+
+// init initializes package-level variables
+func init() {
+	// Check for debug mode environment variable
+	debugEnv := os.Getenv("KV_LOG_DEBUG")
+	// Any non-empty value enables debug mode
+	if debugEnv != "" {
+		DebugMode = true
+	}
+}
+
+// debugPrint prints a message if debug mode is enabled
+func debugPrint(format string, args ...interface{}) {
+	if DebugMode {
+		fmt.Printf(format, args...)
+	}
+}
 
 // Open opens or creates a database file with the given options
 func Open(path string, options ...Options) (*DB, error) {
