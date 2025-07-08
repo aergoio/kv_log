@@ -112,6 +112,7 @@ type DB struct {
 	mainFileSize   int64 // Track main file size to avoid frequent stat calls
 	indexFileSize  int64 // Track index file size to avoid frequent stat calls
 	prevFileSize   int64 // Track main file size before the current transaction started
+	flushFileSize  int64 // Track main file size for flush operations
 	fileLocked     bool  // Track if the files are locked
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
@@ -1544,7 +1545,7 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	// The offset of the last indexed content in the main file
 	lastIndexedOffset := int64(PageSize)
 	if !isInit {
-		lastIndexedOffset = db.mainFileSize
+		lastIndexedOffset = db.flushFileSize
 	}
 
 	// The page number of the next free sub-page
@@ -1639,8 +1640,7 @@ func (db *DB) appendData(key, value []byte) (int64, error) {
 	db.txnChecksum = crc32.Update(db.txnChecksum, crc32.IEEETable, content)
 
 	// Update the file size
-	newFileSize := fileSize + int64(totalSize)
-	db.mainFileSize = newFileSize
+	db.mainFileSize += int64(totalSize)
 
 	debugPrint("Appended content at offset %d, size %d\n", fileSize, totalSize)
 
@@ -2922,11 +2922,16 @@ func (db *DB) flushIndexToDisk() error {
 	}
 
 	db.seqMutex.Lock()
-	// Set flush sequence number limit
+	// Set flush sequence number limit and determine the appropriate main file size for this flush
 	if db.inTransaction {
 		db.flushSequence = db.txnSequence - 1
+		// For worker thread flushes during transactions, use the file size from before the current transaction
+		// This ensures we only index content that has been committed
+		db.flushFileSize = db.prevFileSize
 	} else {
 		db.flushSequence = db.txnSequence
+		// When not in transaction, use current main file size
+		db.flushFileSize = db.mainFileSize
 	}
 	db.seqMutex.Unlock()
 
