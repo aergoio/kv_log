@@ -1,3 +1,5 @@
+[![Build Status](https://github.com/aergoio/kv_log/actions/workflows/ci.yml/badge.svg)](https://github.com/aergoio/kv_log/actions/workflows/ci.yml)
+
 # kv_log
 
 A high-performance embedded key-value database with a radix trie index structure.
