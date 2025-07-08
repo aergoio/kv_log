@@ -2,11 +2,11 @@
 
 # kv_log
 
-A high-performance embedded key-value database with a radix trie index structure.
+A high-performance embedded key-value database with a radix trie index structure
 
 ## Overview
 
-kv_log is a persistent key-value store designed for high performance and reliability. It uses a combination of append-only logging for data storage and a radix trie for efficient indexing.
+kv_log is a persistent key-value store designed for high performance and reliability. It uses a combination of append-only logging for data storage and a radix trie for indexing.
 
 ## Features
 
@@ -20,10 +20,11 @@ kv_log is a persistent key-value store designed for high performance and reliabi
 
 ## Architecture
 
-kv_log consists of two main files:
+kv_log databases consist of three files:
 
 1. **Main file**: Stores all key-value data in an append-only log format
 2. **Index file**: Contains the radix trie structure for efficient key lookups
+3. **WAL file**: Contains flushed index pages, for high durability
 
 ### Radix Trie Structure
 
@@ -99,7 +100,7 @@ db, err := kv_log.Open("path/to/database", options)
 
 - **Write Modes**: Choose between durability and performance
   - `CallerThread_WAL_Sync`: Maximum durability, lowest performance
-  - `WorkerThread_WAL`: Good performance and durability
+  - `WorkerThread_WAL`: Good performance and durability (default)
   - `WorkerThread_NoWAL_NoSync`: Maximum performance, lowest durability
 
 - **Cache Size**: Adjust based on available memory and workload
@@ -113,7 +114,6 @@ db, err := kv_log.Open("path/to/database", options)
 - Keys are limited to 2KB
 - Values are limited to 128MB
 - The database uses a page size of 4KB
-- File locking ensures safe concurrent access from multiple processes
 
 ## Recovery
 
@@ -150,6 +150,10 @@ But it is more than 3.5x faster than BadgerDB on reads
 | Space after close | 1158.78 MB | 1203.11 MB | 2223.16 MB | 1899.50 MB |
 | Read 2M values (fresh) | 1m 26.87s | 35.14s | 17.21s | 11.20s |
 | Read 2M values (cold) | 1m 34.46s | 38.36s | 16.84s | 10.81s |
+
+Benchmark writting 2 million records (key: 33 random bytes, value: 750 random bytes) in a single transaction and then reading them in non-sequential order
+
+Also insertion using 20 thousand transactions
 
 ## License
 
