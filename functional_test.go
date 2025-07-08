@@ -4106,3 +4106,216 @@ func TestTransactionVisibilityOnFreshDB(t *testing.T) {
 		t.Fatalf("db.Get returned wrong value after commit: got %s, want %s", string(got), val)
 	}
 }
+
+// TestLastIndexedOffsetUpdate tests that lastIndexedOffset is properly updated when the worker thread
+// flushes pages during active transactions. This test covers the exact scenario that was causing the bug
+// where lastIndexedOffset was not being updated because no dirty pages were found during flush.
+func TestLastIndexedOffsetUpdate(t *testing.T) {
+	dbPath := "test_last_indexed_offset.db"
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	// Open database with small dirty page threshold to trigger frequent flushes
+	options := Options{
+		"DirtyPageThreshold": 5, // Very small to trigger flushes quickly
+		"WorkerThread":       true,
+	}
+
+	db, err := Open(dbPath, options)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer func() {
+		db.Close()
+		os.Remove(dbPath)
+		os.Remove(dbPath + "-index")
+		os.Remove(dbPath + "-wal")
+	}()
+
+	// Initial state check
+	initialLastIndexed := db.lastIndexedOffset
+	initialMainFileSize := db.mainFileSize
+	t.Logf("Initial state - lastIndexedOffset: %d, mainFileSize: %d", initialLastIndexed, initialMainFileSize)
+
+	// Phase 1: Add some initial data and let it get properly indexed
+	t.Log("Phase 1: Adding initial data and ensuring it gets indexed")
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("initial-key-%d", i)
+		value := fmt.Sprintf("initial-value-%d", i)
+		err := db.Set([]byte(key), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set initial key %s: %v", key, err)
+		}
+	}
+
+	// Wait a bit for worker thread to flush
+	time.Sleep(100 * time.Millisecond)
+
+	// Force a manual flush to ensure everything is indexed
+	err = db.flushIndexToDisk()
+	if err != nil {
+		t.Fatalf("Manual flush failed: %v", err)
+	}
+
+	afterInitialFlush := db.lastIndexedOffset
+	afterInitialMainFileSize := db.mainFileSize
+	t.Logf("After initial flush - lastIndexedOffset: %d, mainFileSize: %d", afterInitialFlush, afterInitialMainFileSize)
+
+	// Verify that lastIndexedOffset was updated
+	if afterInitialFlush <= initialLastIndexed {
+		t.Fatalf("lastIndexedOffset should have increased after initial data, got %d, was %d", afterInitialFlush, initialLastIndexed)
+	}
+
+	// Phase 2: Start a transaction and add data without committing
+	t.Log("Phase 2: Starting transaction and adding data without committing")
+
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Track state before transaction data
+	beforeTxLastIndexed := db.lastIndexedOffset
+	beforeTxMainFileSize := db.mainFileSize
+	t.Logf("Before transaction data - lastIndexedOffset: %d, mainFileSize: %d", beforeTxLastIndexed, beforeTxMainFileSize)
+
+	// Add data within the transaction
+	for i := 0; i < 15; i++ {
+		key := fmt.Sprintf("tx-key-%d", i)
+		value := fmt.Sprintf("tx-value-%d-" + strings.Repeat("x", 100), i) // Make values larger to increase file size
+		err := tx.Set([]byte(key), []byte(value))
+		if err != nil {
+			t.Fatalf("Failed to set transaction key %s: %v", key, err)
+		}
+	}
+
+	// At this point, main file size should have grown but lastIndexedOffset should NOT be updated
+	// to the current main file size because the transaction hasn't committed yet
+	afterTxDataLastIndexed := db.lastIndexedOffset
+	afterTxDataMainFileSize := db.mainFileSize
+	t.Logf("After transaction data (before commit) - lastIndexedOffset: %d, mainFileSize: %d", afterTxDataLastIndexed, afterTxDataMainFileSize)
+
+	// Verify that main file size grew (data was written)
+	if afterTxDataMainFileSize <= beforeTxMainFileSize {
+		t.Fatalf("Main file size should have grown after transaction data, got %d, was %d", afterTxDataMainFileSize, beforeTxMainFileSize)
+	}
+
+	// Phase 3: Force a flush while transaction is still active
+	// This simulates the worker thread flushing during an active transaction
+	t.Log("Phase 3: Forcing flush during active transaction")
+
+	// Wait a bit to let any automatic flushes happen
+	time.Sleep(100 * time.Millisecond)
+
+	// Force manual flush while transaction is active
+	err = db.flushIndexToDisk()
+	if err != nil {
+		t.Fatalf("Manual flush during transaction failed: %v", err)
+	}
+
+	afterFlushDuringTxLastIndexed := db.lastIndexedOffset
+	afterFlushDuringTxMainFileSize := db.mainFileSize
+	t.Logf("After flush during transaction - lastIndexedOffset: %d, mainFileSize: %d", afterFlushDuringTxLastIndexed, afterFlushDuringTxMainFileSize)
+
+	// CRITICAL TEST: The lastIndexedOffset should NOT be updated to the current main file size
+	// because the transaction data hasn't been committed yet. It should remain at the
+	// file size from before the transaction (prevFileSize).
+	if afterFlushDuringTxLastIndexed > beforeTxMainFileSize {
+		t.Fatalf("lastIndexedOffset should not exceed pre-transaction main file size during active transaction. "+
+			"lastIndexedOffset: %d, pre-transaction mainFileSize: %d, current mainFileSize: %d",
+			afterFlushDuringTxLastIndexed, beforeTxMainFileSize, afterFlushDuringTxMainFileSize)
+	}
+
+	// Phase 4: Commit the transaction and verify lastIndexedOffset gets updated
+	t.Log("Phase 4: Committing transaction and verifying lastIndexedOffset update")
+
+	err = tx.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
+	}
+
+	// Wait a bit for any post-commit processing
+	time.Sleep(100 * time.Millisecond)
+
+	// Force another flush after commit
+	err = db.flushIndexToDisk()
+	if err != nil {
+		t.Fatalf("Manual flush after commit failed: %v", err)
+	}
+
+	afterCommitLastIndexed := db.lastIndexedOffset
+	afterCommitMainFileSize := db.mainFileSize
+	t.Logf("After commit and flush - lastIndexedOffset: %d, mainFileSize: %d", afterCommitLastIndexed, afterCommitMainFileSize)
+
+	// After commit, lastIndexedOffset should be updated to reflect the new main file size
+	if afterCommitLastIndexed != afterCommitMainFileSize {
+		t.Fatalf("After commit, lastIndexedOffset should equal mainFileSize. "+
+			"lastIndexedOffset: %d, mainFileSize: %d", afterCommitLastIndexed, afterCommitMainFileSize)
+	}
+
+	// Phase 5: Verify that the fix works for multiple transactions
+	t.Log("Phase 5: Testing multiple transactions to ensure consistent behavior")
+
+	for round := 0; round < 3; round++ {
+		t.Logf("Transaction round %d", round+1)
+
+		beforeRoundMainFileSize := db.mainFileSize
+
+		tx2, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction round %d: %v", round+1, err)
+		}
+
+		// Add some data
+		for i := 0; i < 5; i++ {
+			key := fmt.Sprintf("round-%d-key-%d", round, i)
+			value := fmt.Sprintf("round-%d-value-%d-" + strings.Repeat("y", 50), round, i)
+			err := tx2.Set([]byte(key), []byte(value))
+			if err != nil {
+				t.Fatalf("Failed to set key in round %d: %v", round+1, err)
+			}
+		}
+
+		// Force flush during transaction
+		err = db.flushIndexToDisk()
+		if err != nil {
+			t.Fatalf("Flush during transaction round %d failed: %v", round+1, err)
+		}
+
+		duringTxLastIndexed := db.lastIndexedOffset
+
+		// Verify lastIndexedOffset doesn't exceed pre-transaction file size
+		if duringTxLastIndexed > beforeRoundMainFileSize {
+			t.Fatalf("Round %d: lastIndexedOffset should not exceed pre-transaction file size. "+
+				"lastIndexedOffset: %d, pre-transaction mainFileSize: %d",
+				round+1, duringTxLastIndexed, beforeRoundMainFileSize)
+		}
+
+		// Commit transaction
+		err = tx2.Commit()
+		if err != nil {
+			t.Fatalf("Failed to commit transaction round %d: %v", round+1, err)
+		}
+
+		// Force flush after commit
+		err = db.flushIndexToDisk()
+		if err != nil {
+			t.Fatalf("Flush after commit round %d failed: %v", round+1, err)
+		}
+
+		afterRoundLastIndexed := db.lastIndexedOffset
+		afterRoundMainFileSize := db.mainFileSize
+
+		// Verify lastIndexedOffset matches mainFileSize after commit
+		if afterRoundLastIndexed != afterRoundMainFileSize {
+			t.Fatalf("Round %d: After commit, lastIndexedOffset should equal mainFileSize. "+
+				"lastIndexedOffset: %d, mainFileSize: %d",
+				round+1, afterRoundLastIndexed, afterRoundMainFileSize)
+		}
+
+		t.Logf("Round %d completed successfully", round+1)
+	}
+
+	t.Log("TestLastIndexedOffsetUpdate completed successfully")
+}
