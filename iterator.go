@@ -214,6 +214,7 @@ func (it *Iterator) processRadixByte(pos *radixIterPos, subPage *RadixSubPage, b
 			pageNumber: nextPageNumber,
 			pageType:   ContentTypeLeaf,
 			leafLoaded: false,
+			subPageIdx: nextSubPageIdx,
 		})
 		return it.processLeafPage(&it.stack[len(it.stack)-1]), false // Return result of processLeafPage, don't continue
 	}
@@ -356,20 +357,26 @@ func (it *Iterator) loadAndSortLeafEntries(pos *radixIterPos) bool {
 	// Clear previous entries
 	it.leafEntries = it.leafEntries[:0]
 
-	// Load all entries from the leaf page - construct keys from prefix + suffix
-	for _, entry := range leafPage.Entries {
-		// Get the suffix from the leaf page data
-		suffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-		// Construct the full key from key prefix + suffix
-		fullKey := make([]byte, len(it.keyPrefix)+entry.SuffixLen)
-		copy(fullKey, it.keyPrefix)
-		copy(fullKey[len(it.keyPrefix):], suffix)
+	// Load entries from the specific sub-page - construct keys from prefix + suffix
+	subPageInfo := leafPage.SubPages[pos.subPageIdx]
+	if subPageInfo != nil {
+		for _, entry := range subPageInfo.Entries {
+			// Get the suffix from the leaf page data
+			subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+			suffixOffset := subPageDataStart + entry.SuffixOffset
+			suffix := leafPage.data[suffixOffset:suffixOffset+entry.SuffixLen]
 
-		// Add to our list with the constructed key and data offset
-		it.leafEntries = append(it.leafEntries, leafEntry{
-			key:        fullKey,
-			dataOffset: entry.DataOffset,
-		})
+			// Construct the full key from key prefix + suffix
+			fullKey := make([]byte, len(it.keyPrefix)+entry.SuffixLen)
+			copy(fullKey, it.keyPrefix)
+			copy(fullKey[len(it.keyPrefix):], suffix)
+
+			// Add to our list with the constructed key and data offset
+			it.leafEntries = append(it.leafEntries, leafEntry{
+				key:        fullKey,
+				dataOffset: entry.DataOffset,
+			})
+		}
 	}
 
 	// Sort entries by key (ascending or descending based on reverse flag)
@@ -502,6 +509,7 @@ func (it *Iterator) seekToStart() {
 						pageNumber: nextPageNumber,
 						pageType:   ContentTypeLeaf,
 						leafLoaded: false,
+						subPageIdx: nextSubPageIdx,
 					})
 					break
 				}

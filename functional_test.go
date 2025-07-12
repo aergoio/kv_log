@@ -2808,12 +2808,25 @@ func printPageTraversalInfo(db *DB, key []byte) {
 			leafPage := page
 			suffix := key[keyPos+1:]
 			fmt.Printf("  Looking for suffix: '%s' (bytes: %v)\n", string(suffix), suffix)
-			fmt.Printf("  Leaf page has %d entries:\n", len(leafPage.Entries))
+			totalEntries := 0
+			for _, subPageInfo := range leafPage.SubPages {
+				if subPageInfo != nil {
+					totalEntries += len(subPageInfo.Entries)
+				}
+			}
+			fmt.Printf("  Leaf page has %d entries across sub-pages:\n", totalEntries)
 
-			for i, entry := range leafPage.Entries {
-				entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-				fmt.Printf("    Entry %d: suffix='%s' (bytes: %v), dataOffset=%d\n",
-					i, string(entrySuffix), entrySuffix, entry.DataOffset)
+			for subPageIdx, subPageInfo := range leafPage.SubPages {
+				if subPageInfo != nil {
+					fmt.Printf("    Sub-page %d has %d entries:\n", subPageIdx, len(subPageInfo.Entries))
+					for i, entry := range subPageInfo.Entries {
+						subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+						suffixOffset := subPageDataStart + entry.SuffixOffset
+						entrySuffix := leafPage.data[suffixOffset:suffixOffset+entry.SuffixLen]
+						fmt.Printf("      Entry %d: suffix='%s' (bytes: %v), dataOffset=%d\n",
+							i, string(entrySuffix), entrySuffix, entry.DataOffset)
+					}
+				}
 			}
 			return
 		} else {
@@ -2830,7 +2843,7 @@ func printPageTraversalInfo(db *DB, key []byte) {
 
 func TestLeafPageToRadixPageConversion(t *testing.T) {
 	// Create a test database
-	dbPath := "test_leaf_to_radix_conversion.db"
+	dbPath := "test_leaf_subpage_to_radix_subpage_conversion.db"
 
 	// Clean up any existing test database
 	os.Remove(dbPath)
@@ -2849,16 +2862,16 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 		os.Remove(dbPath + "-wal")
 	}()
 
-	// Use the same prefix as TestTransactionRollback to ensure keys share the same path
+	// Use keys that will all go to the same leaf sub-page initially
 	keyPrefix := "aa"
-	keySuffix := "_some-long-suffix-here-to-consume-a-lot-of-space-and-fill-up-the-leaf-page-quickly"
+	keySuffix := "_some-long-suffix-here-to-consume-a-lot-of-space-and-fill-up-the-leaf-sub-page-quickly"
 
 	// Helper function to get page information for a key
-	getPageInfo := func(key []byte) (uint32, byte, uint16, int, error) {
+	getPageInfo := func(key []byte) (uint32, byte, uint8, uint16, int, error) {
 		// Navigate to the page containing this key
 		rootSubPage, err := db.getRootRadixSubPage()
 		if err != nil {
-			return 0, 0, 0, 0, err
+			return 0, 0, 0, 0, 0, err
 		}
 
 		currentSubPage := rootSubPage
@@ -2870,18 +2883,27 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 			nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
 
 			if nextPageNumber == 0 {
-				return 0, 0, 0, 0, fmt.Errorf("key path doesn't exist")
+				return 0, 0, 0, 0, 0, fmt.Errorf("key path doesn't exist")
 			}
 
 			page, err := db.getPage(nextPageNumber)
 			if err != nil {
-				return 0, 0, 0, 0, err
+				return 0, 0, 0, 0, 0, err
 			}
 
 			if page.pageType == ContentTypeLeaf {
-				// Found the leaf page
+				// Found the leaf page - we already know which sub-page from nextSubPageIdx
 				leafPage := page
-				return leafPage.pageNumber, leafPage.pageType, leafPage.ContentSize, len(leafPage.Entries), nil
+
+				// Calculate total entries across all sub-pages
+				totalEntries := 0
+				for _, sp := range leafPage.SubPages {
+					if sp != nil {
+						totalEntries += len(sp.Entries)
+					}
+				}
+
+				return leafPage.pageNumber, leafPage.pageType, nextSubPageIdx, leafPage.ContentSize, totalEntries, nil
 			} else if page.pageType == ContentTypeRadix {
 				// Continue traversing
 				currentSubPage = &RadixSubPage{
@@ -2890,7 +2912,7 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 				}
 				keyPos++
 			} else {
-				return 0, 0, 0, 0, fmt.Errorf("invalid page type: %c", page.pageType)
+				return 0, 0, 0, 0, 0, fmt.Errorf("invalid page type: %c", page.pageType)
 			}
 		}
 
@@ -2898,10 +2920,10 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 		emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
 		if emptySuffixOffset != 0 {
 			// The key exists as an empty suffix in a radix page
-			return currentSubPage.Page.pageNumber, currentSubPage.Page.pageType, 0, 0, nil
+			return currentSubPage.Page.pageNumber, currentSubPage.Page.pageType, currentSubPage.SubPageIdx, 0, 0, nil
 		}
 
-		return 0, 0, 0, 0, fmt.Errorf("key not found")
+		return 0, 0, 0, 0, 0, fmt.Errorf("key not found")
 	}
 
 	// Helper function to check if a specific page is a radix page
@@ -2913,13 +2935,13 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 		return page.pageType, nil
 	}
 
-	// Phase 1: Fill up a leaf page
+	// Phase 1: Fill up a leaf sub-page until conversion happens
 	var keyCount int
 	var firstPageNumber uint32
 	var conversionDetected bool
 	var conversionKeyIndex int
 
-	// Insert keys until we detect the conversion
+	// Insert keys until we detect the conversion from leaf sub-page to radix sub-page
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
 		value := fmt.Sprintf("value-%d", i)
@@ -2930,7 +2952,7 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 		}
 
 		// Get page information for this key
-		pageNumber, _, _, _, err := getPageInfo([]byte(key))
+		pageNumber, pageType, _, _, _, err := getPageInfo([]byte(key))
 		if err != nil {
 			t.Fatalf("Failed to get page info for key %s: %v", key, err)
 		}
@@ -2938,20 +2960,27 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 		// Remember the first page number
 		if i == 0 {
 			firstPageNumber = pageNumber
+			if pageType != ContentTypeLeaf {
+				t.Fatalf("Expected first key to be in a leaf page, got %c", pageType)
+			}
 		}
 
-		// Check if the page number changed (indicating conversion happened)
+		// Check if we've moved to a different page (indicating conversion happened)
 		if i > 0 && pageNumber != firstPageNumber && !conversionDetected {
-			// Check if the original page is now a radix page
+			// Check if the original page is still a leaf page or became a radix page
 			originalPageType, err := checkPageType(firstPageNumber)
 			if err != nil {
 				t.Fatalf("Failed to check original page type: %v", err)
 			}
 
-			if originalPageType == ContentTypeRadix {
-				conversionDetected = true
-				conversionKeyIndex = i
-			}
+			// In the new schema, the original leaf page might still be a leaf page,
+			// but the entries should have been redistributed to new pages
+			conversionDetected = true
+			conversionKeyIndex = i
+
+			// Log information about the conversion
+			t.Logf("Conversion detected at key %d: original page %d (type %c), new page %d (type %c)",
+				i, firstPageNumber, originalPageType, pageNumber, pageType)
 		}
 
 		keyCount = i + 1
@@ -2963,38 +2992,50 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 	}
 
 	if !conversionDetected {
-		t.Fatalf("Expected leaf page to be converted to radix page, but conversion was not detected after %d keys", keyCount)
+		t.Fatalf("Expected leaf sub-page to be converted to radix sub-page, but conversion was not detected after %d keys", keyCount)
 	}
 
 	// Phase 2: Verify the conversion created the expected structure
-	// Get the radix page that was converted
-	page, err := db.getPage(firstPageNumber)
-	if err != nil {
-		t.Fatalf("Failed to get converted radix page: %v", err)
-	}
+	// Count how many different pages our keys ended up in
+	pageDistribution := make(map[uint32][]int) // page number -> list of key indices
+	// Track page+sub-page combinations
+	pageSubPageDistribution := make(map[string][]int) // "pageNum:subPageIdx" -> list of key indices
 
-	if page.pageType != ContentTypeRadix {
-		t.Fatalf("Expected radix page, got %c", page.pageType)
-	}
-
-	// Count how many leaf pages were created after the conversion
-	leafPageCount := 0
-	leafPages := make(map[uint32]bool)
-
-	// Check each key to see which leaf pages they ended up in
+	// Check each key to see which pages they ended up in
 	for i := 0; i < keyCount; i++ {
 		key := fmt.Sprintf("%s%d%s", keyPrefix, i, keySuffix)
-		pageNumber, pageType, _, _, err := getPageInfo([]byte(key))
+		pageNumber, pageType, subPageIdx, _, _, err := getPageInfo([]byte(key))
 		if err != nil {
 			t.Fatalf("Failed to get page info for key %s after conversion: %v", key, err)
 		}
 
-		if pageType == ContentTypeLeaf {
-			if !leafPages[pageNumber] {
-				leafPages[pageNumber] = true
-				leafPageCount++
-			}
+		if _, exists := pageDistribution[pageNumber]; !exists {
+			pageDistribution[pageNumber] = make([]int, 0)
 		}
+		pageDistribution[pageNumber] = append(pageDistribution[pageNumber], i)
+
+		// Track page+sub-page distribution
+		pageSubPageKey := fmt.Sprintf("%d:%d", pageNumber, subPageIdx)
+		if _, exists := pageSubPageDistribution[pageSubPageKey]; !exists {
+			pageSubPageDistribution[pageSubPageKey] = make([]int, 0)
+		}
+		pageSubPageDistribution[pageSubPageKey] = append(pageSubPageDistribution[pageSubPageKey], i)
+
+		// Log which page each key ended up in
+		if i < 10 || i >= keyCount-5 { // Log first 10 and last 5 keys
+			t.Logf("Key %d (%s) -> page %d (type %c), sub-page %d", i, key, pageNumber, pageType, subPageIdx)
+		}
+	}
+
+	t.Logf("After conversion: keys distributed across %d pages", len(pageDistribution))
+	for pageNum, keyIndices := range pageDistribution {
+		pageType, _ := checkPageType(pageNum)
+		t.Logf("Page %d (type %c): %d keys", pageNum, pageType, len(keyIndices))
+	}
+
+	t.Logf("Sub-page distribution across %d page+sub-page combinations:", len(pageSubPageDistribution))
+	for pageSubPageKey, keyIndices := range pageSubPageDistribution {
+		t.Logf("  %s: %d keys %v", pageSubPageKey, len(keyIndices), keyIndices)
 	}
 
 	// Phase 3: Verify all keys are still accessible
@@ -3105,11 +3146,11 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 	keySuffix := "_with_some_additional_content_to_make_entries_larger-user_profile_data_very_long_common_here_"
 
 	// Helper function to get page information for a key
-	getPageInfo := func(key []byte) (uint32, byte, uint16, int, error) {
+	getPageInfo := func(key []byte) (uint32, byte, uint8, uint16, int, error) {
 		// Navigate to the page containing this key
 		rootSubPage, err := db.getRootRadixSubPage()
 		if err != nil {
-			return 0, 0, 0, 0, err
+			return 0, 0, 0, 0, 0, err
 		}
 
 		currentSubPage := rootSubPage
@@ -3121,18 +3162,27 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 			nextPageNumber, nextSubPageIdx := db.getRadixEntry(currentSubPage, byteValue)
 
 			if nextPageNumber == 0 {
-				return 0, 0, 0, 0, fmt.Errorf("key path doesn't exist")
+				return 0, 0, 0, 0, 0, fmt.Errorf("key path doesn't exist")
 			}
 
 			page, err := db.getPage(nextPageNumber)
 			if err != nil {
-				return 0, 0, 0, 0, err
+				return 0, 0, 0, 0, 0, err
 			}
 
 			if page.pageType == ContentTypeLeaf {
-				// Found the leaf page
+				// Found the leaf page - we already know which sub-page from nextSubPageIdx
 				leafPage := page
-				return leafPage.pageNumber, leafPage.pageType, leafPage.ContentSize, len(leafPage.Entries), nil
+
+				// Calculate total entries across all sub-pages
+				totalEntries := 0
+				for _, sp := range leafPage.SubPages {
+					if sp != nil {
+						totalEntries += len(sp.Entries)
+					}
+				}
+
+				return leafPage.pageNumber, leafPage.pageType, nextSubPageIdx, leafPage.ContentSize, totalEntries, nil
 			} else if page.pageType == ContentTypeRadix {
 				// Continue traversing
 				currentSubPage = &RadixSubPage{
@@ -3141,7 +3191,7 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 				}
 				keyPos++
 			} else {
-				return 0, 0, 0, 0, fmt.Errorf("invalid page type: %c", page.pageType)
+				return 0, 0, 0, 0, 0, fmt.Errorf("invalid page type: %c", page.pageType)
 			}
 		}
 
@@ -3149,10 +3199,10 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 		emptySuffixOffset := db.getEmptySuffixOffset(currentSubPage)
 		if emptySuffixOffset != 0 {
 			// The key exists as an empty suffix in a radix page
-			return currentSubPage.Page.pageNumber, currentSubPage.Page.pageType, 0, 0, nil
+			return currentSubPage.Page.pageNumber, currentSubPage.Page.pageType, currentSubPage.SubPageIdx, 0, 0, nil
 		}
 
-		return 0, 0, 0, 0, fmt.Errorf("key not found")
+		return 0, 0, 0, 0, 0, fmt.Errorf("key not found")
 	}
 
 	// Helper function to check if a specific page is a radix page
@@ -3164,7 +3214,7 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 		return page.pageType, nil
 	}
 
-	// Phase 1: Fill up a leaf page with very similar keys
+	// Phase 1: Fill up a leaf sub-page with very similar keys
 	var keyCount int
 	var firstPageNumber uint32
 	var conversionDetected bool
@@ -3174,7 +3224,7 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 	// with long common prefixes
 	for i := 0; i < 200; i++ { // Increase limit since similar keys might pack differently
 		// Create keys that are identical except for the number at the end
-		// Format: "user_profile_data_very_long_common_prefix_here_000001_with_some_additional_content_to_make_entries_larger"
+		// Format: "prefix000001_with_some_additional_content_to_make_entries_larger-user_profile_data_very_long_common_here_"
 		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
 		value := fmt.Sprintf("user_data_%d", i)
 
@@ -3184,7 +3234,7 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 		}
 
 		// Get page information for this key
-		pageNumber, _, _, _, err := getPageInfo([]byte(key))
+		pageNumber, pageType, _, _, _, err := getPageInfo([]byte(key))
 		if err != nil {
 			t.Fatalf("Failed to get page info for key %s: %v", key, err)
 		}
@@ -3192,20 +3242,27 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 		// Remember the first page number
 		if i == 0 {
 			firstPageNumber = pageNumber
+			if pageType != ContentTypeLeaf {
+				t.Fatalf("Expected first key to be in a leaf page, got %c", pageType)
+			}
 		}
 
-		// Check if the page number changed (indicating conversion happened)
+		// Check if we've moved to a different page (indicating conversion happened)
 		if i > 0 && pageNumber != firstPageNumber && !conversionDetected {
-			// Check if the original page is now a radix page
+			// Check if the original page is still a leaf page or became a radix page
 			originalPageType, err := checkPageType(firstPageNumber)
 			if err != nil {
 				t.Fatalf("Failed to check original page type: %v", err)
 			}
 
-			if originalPageType == ContentTypeRadix {
-				conversionDetected = true
-				conversionKeyIndex = i
-			}
+			// In the new schema, the original leaf page might still be a leaf page,
+			// but the entries should have been redistributed to new pages
+			conversionDetected = true
+			conversionKeyIndex = i
+
+			// Log information about the conversion
+			t.Logf("Conversion detected at key %d: original page %d (type %c), new page %d (type %c)",
+				i, firstPageNumber, originalPageType, pageNumber, pageType)
 		}
 
 		keyCount = i + 1
@@ -3217,39 +3274,50 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 	}
 
 	if !conversionDetected {
-		t.Fatalf("Expected leaf page to be converted to radix page, but conversion was not detected after %d keys", keyCount)
+		t.Fatalf("Expected leaf sub-page to be converted to radix sub-page, but conversion was not detected after %d keys", keyCount)
 	}
 
 	// Phase 2: Analyze how similar keys are distributed after conversion
-	// Get the radix page that was converted
-	page, err := db.getPage(firstPageNumber)
-	if err != nil {
-		t.Fatalf("Failed to get converted radix page: %v", err)
-	}
+	// Count how many different pages our keys ended up in
+	pageDistribution := make(map[uint32][]int) // page number -> list of key indices
+	// Track page+sub-page combinations
+	pageSubPageDistribution := make(map[string][]int) // "pageNum:subPageIdx" -> list of key indices
 
-	if page.pageType != ContentTypeRadix {
-		t.Fatalf("Expected radix page, got %c", page.pageType)
-	}
-
-	// Count how many leaf pages were created and analyze key distribution
-	leafPageCount := 0
-	leafPages := make(map[uint32][]int) // page number -> list of key indices
-
-	// Check each key to see which leaf pages they ended up in
+	// Check each key to see which pages they ended up in
 	for i := 0; i < keyCount; i++ {
 		key := fmt.Sprintf("%s%06d%s", keyPrefix, i, keySuffix)
-		pageNumber, pageType, _, _, err := getPageInfo([]byte(key))
+		pageNumber, pageType, subPageIdx, _, _, err := getPageInfo([]byte(key))
 		if err != nil {
 			t.Fatalf("Failed to get page info for key %s after conversion: %v", key, err)
 		}
 
-		if pageType == ContentTypeLeaf {
-			if _, exists := leafPages[pageNumber]; !exists {
-				leafPages[pageNumber] = make([]int, 0)
-				leafPageCount++
-			}
-			leafPages[pageNumber] = append(leafPages[pageNumber], i)
+		if _, exists := pageDistribution[pageNumber]; !exists {
+			pageDistribution[pageNumber] = make([]int, 0)
 		}
+		pageDistribution[pageNumber] = append(pageDistribution[pageNumber], i)
+
+		// Track page+sub-page distribution
+		pageSubPageKey := fmt.Sprintf("%d:%d", pageNumber, subPageIdx)
+		if _, exists := pageSubPageDistribution[pageSubPageKey]; !exists {
+			pageSubPageDistribution[pageSubPageKey] = make([]int, 0)
+		}
+		pageSubPageDistribution[pageSubPageKey] = append(pageSubPageDistribution[pageSubPageKey], i)
+
+		// Log which page each key ended up in for the first few keys
+		if i < 10 {
+			t.Logf("Key %d (%s) -> page %d (type %c), sub-page %d", i, key, pageNumber, pageType, subPageIdx)
+		}
+	}
+
+	t.Logf("After conversion: keys distributed across %d pages", len(pageDistribution))
+	for pageNum, keyIndices := range pageDistribution {
+		pageType, _ := checkPageType(pageNum)
+		t.Logf("Page %d (type %c): %d keys", pageNum, pageType, len(keyIndices))
+	}
+
+	t.Logf("Sub-page distribution across %d page+sub-page combinations:", len(pageSubPageDistribution))
+	for pageSubPageKey, keyIndices := range pageSubPageDistribution {
+		t.Logf("  %s: %d keys %v", pageSubPageKey, len(keyIndices), keyIndices)
 	}
 
 	// Phase 3: Verify all keys are still accessible
@@ -3657,7 +3725,7 @@ func TestHeaderReadingWithWAL(t *testing.T) {
 
 	// Store the current lastIndexedOffset (this should be in WAL but not in index file)
 	originalOffset := db.mainFileSize
-	originalFreeHead := db.freeSubPagesHead
+	originalFreeHead := db.freeRadixPagesHead
 
 	// Close the database (will commit the changes to the WAL file)
 	err = db.Close()
@@ -3676,9 +3744,9 @@ func TestHeaderReadingWithWAL(t *testing.T) {
 		t.Errorf("lastIndexedOffset mismatch: expected %d, got %d", originalOffset, db2.lastIndexedOffset)
 	}
 
-	// Verify that the freeSubPagesHead was read from WAL
-	if db2.freeSubPagesHead != originalFreeHead {
-		t.Errorf("freeSubPagesHead mismatch: expected %d, got %d", originalFreeHead, db2.freeSubPagesHead)
+	// Verify that the freeRadixPagesHead was read from WAL
+	if db2.freeRadixPagesHead != originalFreeHead {
+		t.Errorf("freeRadixPagesHead mismatch: expected %d, got %d", originalFreeHead, db2.freeRadixPagesHead)
 	}
 
 	// Verify that we can still read both keys (showing WAL was properly loaded)
@@ -3733,7 +3801,7 @@ func TestHeaderReadingWithoutWAL(t *testing.T) {
 
 	// Store the current mainFileSize for comparison
 	originalOffset := db.mainFileSize
-	originalFreeHead := db.freeSubPagesHead
+	originalFreeHead := db.freeRadixPagesHead
 
 	// Close the database (will commit the changes to the WAL file)
 	err = db.Close()
@@ -3771,9 +3839,9 @@ func TestHeaderReadingWithoutWAL(t *testing.T) {
 		t.Errorf("lastIndexedOffset mismatch: expected %d, got %d", originalOffset, db3.lastIndexedOffset)
 	}
 
-	// Verify that the freeSubPagesHead was read correctly from index file
-	if db3.freeSubPagesHead != originalFreeHead {
-		t.Errorf("freeSubPagesHead mismatch: expected %d, got %d", originalFreeHead, db3.freeSubPagesHead)
+	// Verify that the freeRadixPagesHead was read correctly from index file
+	if db3.freeRadixPagesHead != originalFreeHead {
+		t.Errorf("freeRadixPagesHead mismatch: expected %d, got %d", originalFreeHead, db3.freeRadixPagesHead)
 	}
 
 	// Verify that we can still read the data
