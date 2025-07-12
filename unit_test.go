@@ -1571,45 +1571,64 @@ func TestDiscardOldPageVersions(t *testing.T) {
 // TestAddLeafEntry tests the addLeafEntry function
 // Note: addLeafEntry handles non-empty suffixes on leaf pages.
 // Empty suffixes (when all key bytes are consumed) are handled by setOnEmptySuffix on radix pages.
-func TestAddLeafEntry(t *testing.T) {
+// TestAddEntryToNewLeafSubPage tests the addEntryToNewLeafSubPage function
+func TestAddEntryToNewLeafSubPage(t *testing.T) {
 	// Create a temporary database for testing
 	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_addleafentry.db")
+	dbPath := filepath.Join(tmpDir, "test_addentrytonewleafsubpage.db")
 
+	// Open the database
 	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 	defer db.Close()
 
-	// Start a transaction to create pages in current transaction sequence
+	// Start a transaction
 	db.beginTransaction()
-	defer db.commitTransaction()
+	defer db.rollbackTransaction()
 
-	t.Run("AddEntryToEmptyLeafPage", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		// Test data
-		suffix := []byte("test_suffix")
+	t.Run("AddEntryToNewSubPage", func(t *testing.T) {
+		// Test 1: Add an entry to a new leaf sub-page
+		suffix := []byte("test")
 		dataOffset := int64(1000)
 
-		// Add the entry
-		err = db.addLeafEntry(leafPage, suffix, dataOffset)
+		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffset)
 		if err != nil {
-			t.Fatalf("Failed to add leaf entry: %v", err)
+			t.Fatalf("Failed to add entry to new leaf sub-page: %v", err)
 		}
 
-		// Verify the entry was added correctly
-		if len(leafPage.Entries) != 1 {
-			t.Errorf("Expected 1 entry, got %d", len(leafPage.Entries))
+		// Verify the leaf sub-page was created
+		if leafSubPage == nil {
+			t.Fatal("Expected leaf sub-page to be created")
 		}
 
-		// Check entry details
-		entry := leafPage.Entries[0]
+		// Verify the leaf page was created
+		if leafSubPage.Page == nil {
+			t.Fatal("Expected leaf page to be created")
+		}
+
+		// Verify the sub-page index is valid (could be any available ID 0-255)
+		if leafSubPage.SubPageIdx > 255 {
+			t.Errorf("Expected sub-page index <= 255, got %d", leafSubPage.SubPageIdx)
+		}
+
+		// Verify the sub-page info exists
+		if len(leafSubPage.Page.SubPages) <= int(leafSubPage.SubPageIdx) {
+			t.Fatalf("SubPages array too small for index %d", leafSubPage.SubPageIdx)
+		}
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if subPageInfo == nil {
+			t.Fatal("Expected sub-page info to exist")
+		}
+
+		// Verify the entry was added
+		if len(subPageInfo.Entries) != 1 {
+			t.Fatalf("Expected 1 entry, got %d", len(subPageInfo.Entries))
+		}
+
+		// Verify the entry content
+		entry := subPageInfo.Entries[0]
 		if entry.SuffixLen != len(suffix) {
 			t.Errorf("Expected suffix length %d, got %d", len(suffix), entry.SuffixLen)
 		}
@@ -1617,249 +1636,251 @@ func TestAddLeafEntry(t *testing.T) {
 			t.Errorf("Expected data offset %d, got %d", dataOffset, entry.DataOffset)
 		}
 
-		// Verify the suffix in the page data
-		entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-		if !bytes.Equal(entrySuffix, suffix) {
-			t.Errorf("Expected suffix %v, got %v", suffix, entrySuffix)
+		// Verify the suffix can be read from the page data
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+		suffixOffset := subPageDataStart + entry.SuffixOffset
+		actualSuffix := leafSubPage.Page.data[suffixOffset:suffixOffset+entry.SuffixLen]
+		if !bytes.Equal(actualSuffix, suffix) {
+			t.Errorf("Expected suffix %v, got %v", suffix, actualSuffix)
+		}
+
+		// Verify the sub-page header in the page data
+		subPageOffset := int(subPageInfo.Offset)
+		subPageID := leafSubPage.Page.data[subPageOffset]
+		if subPageID != leafSubPage.SubPageIdx {
+			t.Errorf("Expected sub-page ID %d in header, got %d", leafSubPage.SubPageIdx, subPageID)
+		}
+
+		subPageSize := binary.LittleEndian.Uint16(leafSubPage.Page.data[subPageOffset+1:subPageOffset+3])
+		if subPageSize != subPageInfo.Size {
+			t.Errorf("Expected sub-page size %d in header, got %d", subPageInfo.Size, subPageSize)
+		}
+	})
+
+	t.Run("AddLongSuffixEntry", func(t *testing.T) {
+		// Test 2: Add a very long suffix to test boundary conditions
+		longSuffix := make([]byte, 1000)
+		for i := range longSuffix {
+			longSuffix[i] = byte(i % 256)
+		}
+		dataOffset2 := int64(2000)
+
+		leafSubPage2, err := db.addEntryToNewLeafSubPage(longSuffix, dataOffset2)
+		if err != nil {
+			t.Fatalf("Failed to add long suffix entry: %v", err)
+		}
+
+		// Verify the long suffix entry
+		subPageInfo2 := leafSubPage2.Page.SubPages[leafSubPage2.SubPageIdx]
+		if len(subPageInfo2.Entries) != 1 {
+			t.Fatalf("Expected 1 entry in second sub-page, got %d", len(subPageInfo2.Entries))
+		}
+
+		entry2 := subPageInfo2.Entries[0]
+		if entry2.SuffixLen != len(longSuffix) {
+			t.Errorf("Expected suffix length %d, got %d", len(longSuffix), entry2.SuffixLen)
+		}
+		if entry2.DataOffset != dataOffset2 {
+			t.Errorf("Expected data offset %d, got %d", dataOffset2, entry2.DataOffset)
+		}
+
+		// Verify the long suffix can be read correctly
+		subPageDataStart := int(subPageInfo2.Offset) + 3 // Skip 3-byte header
+		suffixOffset := subPageDataStart + entry2.SuffixOffset
+		actualLongSuffix := leafSubPage2.Page.data[suffixOffset:suffixOffset+entry2.SuffixLen]
+		if !bytes.Equal(actualLongSuffix, longSuffix) {
+			t.Error("Long suffix content mismatch")
+		}
+	})
+
+	t.Run("AddEmptySuffixEntry", func(t *testing.T) {
+		// Test 3: Add an empty suffix
+		emptySuffix := []byte{}
+		dataOffset3 := int64(3000)
+
+		leafSubPage3, err := db.addEntryToNewLeafSubPage(emptySuffix, dataOffset3)
+		if err != nil {
+			t.Fatalf("Failed to add empty suffix entry: %v", err)
+		}
+
+		// Verify the empty suffix entry
+		subPageInfo3 := leafSubPage3.Page.SubPages[leafSubPage3.SubPageIdx]
+		if len(subPageInfo3.Entries) != 1 {
+			t.Fatalf("Expected 1 entry with empty suffix, got %d", len(subPageInfo3.Entries))
+		}
+
+		entry3 := subPageInfo3.Entries[0]
+		if entry3.SuffixLen != 0 {
+			t.Errorf("Expected suffix length 0, got %d", entry3.SuffixLen)
+		}
+		if entry3.DataOffset != dataOffset3 {
+			t.Errorf("Expected data offset %d, got %d", dataOffset3, entry3.DataOffset)
+		}
+	})
+
+	t.Run("VerifyLeafPageStructure", func(t *testing.T) {
+		// Test 4: Verify the leaf page structure is correct
+		suffix := []byte("structure_test")
+		dataOffset := int64(4000)
+
+		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffset)
+		if err != nil {
+			t.Fatalf("Failed to add entry: %v", err)
+		}
+
+		leafPage := leafSubPage.Page
+
+		// Verify page type
+		if leafPage.pageType != ContentTypeLeaf {
+			t.Errorf("Expected page type %c, got %c", ContentTypeLeaf, leafPage.pageType)
 		}
 
 		// Verify page is marked as dirty
 		if !leafPage.dirty {
-			t.Error("Leaf page should be marked as dirty after adding entry")
+			t.Error("Expected page to be marked as dirty")
+		}
+
+		// Verify content size is reasonable
+		if leafPage.ContentSize <= LeafHeaderSize {
+			t.Errorf("Expected content size > %d, got %d", LeafHeaderSize, leafPage.ContentSize)
+		}
+
+		if leafPage.ContentSize > PageSize {
+			t.Errorf("Content size %d exceeds page size %d", leafPage.ContentSize, PageSize)
+		}
+
+		// Verify sub-page count - should have at least 1 sub-page
+		subPageCount := 0
+		for _, subPage := range leafPage.SubPages {
+			if subPage != nil {
+				subPageCount++
+			}
+		}
+		if subPageCount < 1 {
+			t.Errorf("Expected at least 1 sub-page, got %d", subPageCount)
+		}
+
+		// Verify SubPages array is properly sized (should be 256 entries)
+		if len(leafPage.SubPages) != 256 {
+			t.Errorf("Expected SubPages array size 256, got %d", len(leafPage.SubPages))
 		}
 	})
 
-	t.Run("AddMultipleEntries", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
+	t.Run("MultipleSubPagesInSamePage", func(t *testing.T) {
+		// Test 5: Add multiple sub-pages to the same leaf page
+		// Note: addEntryToNewLeafSubPage will automatically allocate leaf pages as needed
 
-		// Add multiple entries
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("entry1"), 1000},
-			{[]byte("entry2"), 2000},
-			{[]byte("entry3"), 3000},
+		// Add multiple small entries that should fit in the same page
+		suffixes := [][]byte{
+			[]byte("a"),
+			[]byte("b"),
+			[]byte("c"),
 		}
+		dataOffsets := []int64{5000, 6000, 7000}
 
-		for i, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
+		var leafSubPages []*LeafSubPage
+
+		for i, suffix := range suffixes {
+			leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffsets[i])
 			if err != nil {
 				t.Fatalf("Failed to add entry %d: %v", i, err)
 			}
+			leafSubPages = append(leafSubPages, leafSubPage)
 		}
 
-		// Verify all entries were added
-		if len(leafPage.Entries) != len(testEntries) {
-			t.Errorf("Expected %d entries, got %d", len(testEntries), len(leafPage.Entries))
+		// Verify all sub-pages were created
+		if len(leafSubPages) != 3 {
+			t.Fatalf("Expected 3 sub-pages, got %d", len(leafSubPages))
 		}
 
-		// Verify each entry
-		for i, testEntry := range testEntries {
-			entry := leafPage.Entries[i]
-			if entry.DataOffset != testEntry.dataOffset {
-				t.Errorf("Entry %d: expected data offset %d, got %d", i, testEntry.dataOffset, entry.DataOffset)
+		// Verify they have different sub-page IDs
+		usedIDs := make(map[uint8]bool)
+		for i, subPage := range leafSubPages {
+			if usedIDs[subPage.SubPageIdx] {
+				t.Errorf("Sub-page ID %d used multiple times", subPage.SubPageIdx)
+			}
+			usedIDs[subPage.SubPageIdx] = true
+
+			// Verify the entry content
+			subPageInfo := subPage.Page.SubPages[subPage.SubPageIdx]
+			if len(subPageInfo.Entries) != 1 {
+				t.Errorf("Sub-page %d: expected 1 entry, got %d", i, len(subPageInfo.Entries))
 			}
 
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, testEntry.suffix) {
-				t.Errorf("Entry %d: expected suffix %v, got %v", i, testEntry.suffix, entrySuffix)
+			entry := subPageInfo.Entries[0]
+			if entry.SuffixLen != len(suffixes[i]) {
+				t.Errorf("Sub-page %d: expected suffix length %d, got %d", i, len(suffixes[i]), entry.SuffixLen)
 			}
+			if entry.DataOffset != dataOffsets[i] {
+				t.Errorf("Sub-page %d: expected data offset %d, got %d", i, dataOffsets[i], entry.DataOffset)
+			}
+		}
+
+		// Count total sub-pages across all leaf pages
+		// Since addEntryToNewLeafSubPage may create multiple pages, we need to count across all pages
+		totalSubPageCount := 0
+		pageSet := make(map[uint32]bool)
+
+		for _, subPage := range leafSubPages {
+			pageSet[subPage.Page.pageNumber] = true
+		}
+
+		for pageNum := range pageSet {
+			for _, subPage := range leafSubPages {
+				if subPage.Page.pageNumber == pageNum {
+					for _, sp := range subPage.Page.SubPages {
+						if sp != nil {
+							totalSubPageCount++
+						}
+					}
+					break
+				}
+			}
+		}
+
+		if totalSubPageCount < 3 {
+			t.Errorf("Expected at least 3 sub-pages across all pages, got %d", totalSubPageCount)
 		}
 	})
 
-	t.Run("AddEntriesToPageWithExistingEntries", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
+	t.Run("SubPageIDAllocation", func(t *testing.T) {
+		// Test 6: Verify sub-page ID allocation works correctly
+		// Create many sub-pages to test ID allocation
+		var leafSubPages []*LeafSubPage
 
-		// Add initial entries to populate the page
-		initialEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("alpha"), 1000},
-			{[]byte("beta"), 2000},
-		}
+		for i := 0; i < 10; i++ {
+			suffix := []byte(fmt.Sprintf("test_%d", i))
+			dataOffset := int64(8000 + i*100)
 
-		for i, testEntry := range initialEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
+			leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffset)
 			if err != nil {
-				t.Fatalf("Failed to add initial entry %d: %v", i, err)
+				t.Fatalf("Failed to add entry %d: %v", i, err)
 			}
+			leafSubPages = append(leafSubPages, leafSubPage)
 		}
 
-		// Verify initial state
-		if len(leafPage.Entries) != 2 {
-			t.Fatalf("Expected 2 initial entries, got %d", len(leafPage.Entries))
-		}
-
-		// Now add more entries to the page that already has entries
-		additionalEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("gamma"), 3000},
-			{[]byte("delta"), 4000},
-		}
-
-		for i, testEntry := range additionalEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add additional entry %d: %v", i, err)
+		// Verify all sub-page IDs are unique
+		usedIDs := make(map[uint8]bool)
+		for i, subPage := range leafSubPages {
+			if usedIDs[subPage.SubPageIdx] {
+				t.Errorf("Sub-page ID %d used multiple times", subPage.SubPageIdx)
 			}
-		}
+			usedIDs[subPage.SubPageIdx] = true
 
-		// Verify all entries are present
-		expectedTotal := len(initialEntries) + len(additionalEntries)
-		if len(leafPage.Entries) != expectedTotal {
-			t.Errorf("Expected %d total entries, got %d", expectedTotal, len(leafPage.Entries))
-		}
-
-		// Verify initial entries are still correct
-		for i, testEntry := range initialEntries {
-			entry := leafPage.Entries[i]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, testEntry.suffix) {
-				t.Errorf("Initial entry %d suffix mismatch: expected %s, got %s", i, testEntry.suffix, entrySuffix)
+			// Verify the ID is within valid range
+			if subPage.SubPageIdx > 255 {
+				t.Errorf("Sub-page %d: ID %d exceeds maximum 255", i, subPage.SubPageIdx)
 			}
-			if entry.DataOffset != testEntry.dataOffset {
-				t.Errorf("Initial entry %d data offset mismatch: expected %d, got %d", i, testEntry.dataOffset, entry.DataOffset)
-			}
-		}
-
-		// Verify additional entries were added correctly
-		for i, testEntry := range additionalEntries {
-			entryIndex := len(initialEntries) + i
-			entry := leafPage.Entries[entryIndex]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, testEntry.suffix) {
-				t.Errorf("Additional entry %d suffix mismatch: expected %s, got %s", i, testEntry.suffix, entrySuffix)
-			}
-			if entry.DataOffset != testEntry.dataOffset {
-				t.Errorf("Additional entry %d data offset mismatch: expected %d, got %d", i, testEntry.dataOffset, entry.DataOffset)
-			}
-		}
-	})
-
-
-	t.Run("AddEntryWithEmptyBytes", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		// Test edge case: suffix with zero length but not nil
-		// This tests the varint encoding of length 0
-		suffix := []byte{}
-		dataOffset := int64(6000)
-
-		err = db.addLeafEntry(leafPage, suffix, dataOffset)
-		if err != nil {
-			t.Fatalf("Failed to add entry with zero-length suffix: %v", err)
-		}
-
-		// Verify the entry
-		if len(leafPage.Entries) != 1 {
-			t.Errorf("Expected 1 entry, got %d", len(leafPage.Entries))
-		}
-
-		entry := leafPage.Entries[0]
-		if entry.SuffixLen != 0 {
-			t.Errorf("Expected suffix length 0, got %d", entry.SuffixLen)
-		}
-		if entry.DataOffset != dataOffset {
-			t.Errorf("Expected data offset %d, got %d", dataOffset, entry.DataOffset)
-		}
-	})
-
-	t.Run("PageConversionWhenFull", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		originalPageNumber := leafPage.pageNumber
-
-		// Fill the page to near capacity
-		// Use a larger suffix to fill the page faster
-		maxEntries := 0
-		baseSuffix := []byte("very_long_suffix_that_will_fill_the_page_quickly_")
-		testDataOffset := int64(1000)
-
-		// Fill the page until it's nearly full
-		for {
-			// Create a long suffix to fill the page faster
-			suffix := append(baseSuffix, []byte(fmt.Sprintf("entry_%d", maxEntries))...)
-
-			// Calculate space needed for this entry more accurately
-			suffixLenSize := 1 // assume 1 byte for varint (for short suffixes)
-			if len(suffix) >= 128 {
-				suffixLenSize = 2 // 2 bytes for varint if suffix >= 128 bytes
-			}
-			entrySize := suffixLenSize + len(suffix) + 8 // suffix length varint + suffix + data offset
-
-			if int(leafPage.ContentSize)+entrySize > PageSize-50 { // Leave smaller margin
-				break
-			}
-
-			err = db.addLeafEntry(leafPage, suffix, testDataOffset+int64(maxEntries))
-			if err != nil {
-				t.Fatalf("Failed to add entry %d: %v", maxEntries, err)
-			}
-			maxEntries++
-		}
-
-		t.Logf("Added %d entries to leaf page, content size: %d/%d", maxEntries, leafPage.ContentSize, PageSize)
-
-		// Now add one more entry that should trigger conversion to radix page
-		finalSuffix := []byte("this_is_the_final_entry_that_should_cause_page_conversion_to_radix_because_the_page_is_full")
-		err = db.addLeafEntry(leafPage, finalSuffix, testDataOffset+int64(maxEntries))
-
-		// Check the result - either the page was converted or we got an error
-		if err != nil {
-			// If we got an error, it might be because conversion happened
-			t.Logf("Got error when adding final entry (this might indicate conversion): %v", err)
-		}
-
-		// Check if the page was converted by looking at the cache
-		page, exists := db.getFromCache(originalPageNumber)
-		if !exists {
-			t.Error("Page should still exist in cache after conversion")
-			return
-		}
-
-		// Log the current state for debugging
-		t.Logf("Page type after adding final entry: %c", page.pageType)
-
-		// The test passes if either:
-		// 1. The page was converted to radix, OR
-		// 2. The page remained as leaf but we got an error (indicating conversion was attempted)
-		if page.pageType == ContentTypeLeaf && err == nil {
-			// This is okay - maybe the page didn't actually fill up enough to trigger conversion
-			// Let's just log this instead of failing
-			t.Logf("Page remained as leaf - final content size: %d/%d", leafPage.ContentSize, PageSize)
-		} else if page.pageType == ContentTypeRadix {
-			t.Logf("Page was successfully converted to radix page")
 		}
 	})
 }
-
-// TestSetOnLeafPage tests the setOnLeafPage function for insert, update, and delete operations
-// Note: setOnLeafPage handles keys that have remaining suffix after processing key bytes.
+// TestSetOnLeafSubPage tests the setOnLeafSubPage function for insert, update, and delete operations
+// Note: setOnLeafSubPage handles keys that have remaining suffix after processing key bytes.
 // Empty suffixes (when all key bytes are consumed) are handled by setOnEmptySuffix on radix pages.
-func TestSetOnLeafPage(t *testing.T) {
+func TestSetOnLeafSubPage(t *testing.T) {
 	// Create a temporary database for testing
 	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_setonleafpage.db")
+	dbPath := filepath.Join(tmpDir, "test_setonleafsubpage.db")
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -1872,10 +1893,22 @@ func TestSetOnLeafPage(t *testing.T) {
 	defer db.commitTransaction()
 
 	t.Run("InsertNewEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a parent radix sub-page to simulate the tree structure
+		parentRadixPage, err := db.allocateRadixPage()
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to allocate parent radix page: %v", err)
+		}
+		parentSubPage := &RadixSubPage{
+			Page:       parentRadixPage,
+			SubPageIdx: 0,
+		}
+
+		// Create a leaf sub-page with initial entry
+		suffix := []byte("key")
+		dataOffset := int64(1000)
+		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffset)
+		if err != nil {
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
 		}
 
 		// Test data - simulate a key "test_key" where keyPos=4, so suffix is "key"
@@ -1884,26 +1917,32 @@ func TestSetOnLeafPage(t *testing.T) {
 		value := []byte("test_value")
 
 		// Mock appendData by writing test data to main file first
-		dataOffset, err := db.appendData(key, value)
+		dataOffset, err = db.appendData(key, value)
 		if err != nil {
 			t.Fatalf("Failed to append test data: %v", err)
 		}
 
-		// Now test setOnLeafPage
-		err = db.setOnLeafPage(leafPage, key, keyPos, value, dataOffset)
+		// Now test setOnLeafSubPage
+		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, key, keyPos, value, dataOffset)
 		if err != nil {
-			t.Fatalf("Failed to set on leaf page: %v", err)
+			t.Fatalf("Failed to set on leaf sub-page: %v", err)
 		}
 
-		// Verify the entry was added
-		if len(leafPage.Entries) != 1 {
-			t.Errorf("Expected 1 entry, got %d", len(leafPage.Entries))
+		// Verify the entry was added/updated
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if subPageInfo == nil {
+			t.Fatal("Expected sub-page info to exist")
+		}
+
+		if len(subPageInfo.Entries) != 1 {
+			t.Errorf("Expected 1 entry, got %d", len(subPageInfo.Entries))
 		}
 
 		// Verify the entry details
-		entry := leafPage.Entries[0]
+		entry := subPageInfo.Entries[0]
 		expectedSuffix := key[keyPos+1:] // "key"
-		entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip header
+		entrySuffix := leafSubPage.Page.data[subPageDataStart+entry.SuffixOffset:subPageDataStart+entry.SuffixOffset+entry.SuffixLen]
 		if !bytes.Equal(entrySuffix, expectedSuffix) {
 			t.Errorf("Expected suffix %v, got %v", expectedSuffix, entrySuffix)
 		}
@@ -1922,10 +1961,14 @@ func TestSetOnLeafPage(t *testing.T) {
 	})
 
 	t.Run("UpdateExistingEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a parent radix sub-page to simulate the tree structure
+		parentRadixPage, err := db.allocateRadixPage()
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to allocate parent radix page: %v", err)
+		}
+		parentSubPage := &RadixSubPage{
+			Page:       parentRadixPage,
+			SubPageIdx: 0,
 		}
 
 		// Test data
@@ -1934,18 +1977,25 @@ func TestSetOnLeafPage(t *testing.T) {
 		originalValue := []byte("original_value")
 		updatedValue := []byte("updated_value")
 
-		// First, insert the original entry
-		err = db.setOnLeafPage(leafPage, key, keyPos, originalValue, 0)
+		// Create a leaf sub-page with initial entry using the original value
+		suffix := key[keyPos+1:]
+		originalDataOffset, err := db.appendData(key, originalValue)
 		if err != nil {
-			t.Fatalf("Failed to insert original entry: %v", err)
+			t.Fatalf("Failed to append original data: %v", err)
+		}
+
+		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, originalDataOffset)
+		if err != nil {
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
 		}
 
 		// Verify original entry exists
-		if len(leafPage.Entries) != 1 {
-			t.Fatalf("Expected 1 entry after insert, got %d", len(leafPage.Entries))
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Fatalf("Expected 1 entry after insert, got %d", len(subPageInfo.Entries))
 		}
 
-		originalEntry := leafPage.Entries[0]
+		originalEntry := subPageInfo.Entries[0]
 		originalContent, err := db.readContent(originalEntry.DataOffset)
 		if err != nil {
 			t.Fatalf("Failed to read original content: %v", err)
@@ -1955,18 +2005,19 @@ func TestSetOnLeafPage(t *testing.T) {
 		}
 
 		// Now update the entry with new value
-		err = db.setOnLeafPage(leafPage, key, keyPos, updatedValue, 0)
+		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, key, keyPos, updatedValue, 0)
 		if err != nil {
 			t.Fatalf("Failed to update entry: %v", err)
 		}
 
 		// Verify still only one entry
-		if len(leafPage.Entries) != 1 {
-			t.Errorf("Expected 1 entry after update, got %d", len(leafPage.Entries))
+		subPageInfo = leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Errorf("Expected 1 entry after update, got %d", len(subPageInfo.Entries))
 		}
 
 		// Verify the entry was updated
-		updatedEntry := leafPage.Entries[0]
+		updatedEntry := subPageInfo.Entries[0]
 		updatedContent, err := db.readContent(updatedEntry.DataOffset)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
@@ -1982,10 +2033,14 @@ func TestSetOnLeafPage(t *testing.T) {
 	})
 
 	t.Run("UpdateWithSameValue", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a parent radix sub-page to simulate the tree structure
+		parentRadixPage, err := db.allocateRadixPage()
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to allocate parent radix page: %v", err)
+		}
+		parentSubPage := &RadixSubPage{
+			Page:       parentRadixPage,
+			SubPageIdx: 0,
 		}
 
 		// Test data
@@ -1993,31 +2048,40 @@ func TestSetOnLeafPage(t *testing.T) {
 		keyPos := 4
 		value := []byte("same_value")
 
-		// First, insert the entry
-		err = db.setOnLeafPage(leafPage, key, keyPos, value, 0)
+		// Create a leaf sub-page with initial entry
+		suffix := key[keyPos+1:]
+		originalDataOffset, err := db.appendData(key, value)
 		if err != nil {
-			t.Fatalf("Failed to insert entry: %v", err)
+			t.Fatalf("Failed to append original data: %v", err)
 		}
 
-		originalEntry := leafPage.Entries[0]
-		originalDataOffset := originalEntry.DataOffset
+		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, originalDataOffset)
+		if err != nil {
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
+		}
+
+		// Get the original entry
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		originalEntry := subPageInfo.Entries[0]
+		originalDataOffset = originalEntry.DataOffset
 
 		// Record the main file size before the "update"
 		originalMainFileSize := db.mainFileSize
 
 		// Now "update" with the same value
-		err = db.setOnLeafPage(leafPage, key, keyPos, value, 0)
+		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, key, keyPos, value, 0)
 		if err != nil {
 			t.Fatalf("Failed to update with same value: %v", err)
 		}
 
 		// Verify still only one entry
-		if len(leafPage.Entries) != 1 {
-			t.Errorf("Expected 1 entry, got %d", len(leafPage.Entries))
+		subPageInfo = leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Errorf("Expected 1 entry, got %d", len(subPageInfo.Entries))
 		}
 
 		// Verify the data offset didn't change (no new data was written)
-		updatedEntry := leafPage.Entries[0]
+		updatedEntry := subPageInfo.Entries[0]
 		if originalDataOffset != updatedEntry.DataOffset {
 			t.Error("Expected data offset to remain the same when updating with same value")
 		}
@@ -2029,14 +2093,18 @@ func TestSetOnLeafPage(t *testing.T) {
 	})
 
 	t.Run("UpdateFirstEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a parent radix sub-page to simulate the tree structure
+		parentRadixPage, err := db.allocateRadixPage()
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to allocate parent radix page: %v", err)
+		}
+		parentSubPage := &RadixSubPage{
+			Page:       parentRadixPage,
+			SubPageIdx: 0,
 		}
 
 		// Add multiple entries to test updating the first one
-		// All entries must share the same prefix up to keyPos for them to be on the same leaf page
+		// All entries must share the same prefix up to keyPos for them to be on the same leaf sub-page
 		// For keyPos=7, all keys share prefix "common_" and have different suffixes
 		testEntries := []struct {
 			key    []byte
@@ -2048,33 +2116,52 @@ func TestSetOnLeafPage(t *testing.T) {
 			{[]byte("common_gamma"), 7, []byte("third_value")},
 		}
 
+		var leafSubPage *LeafSubPage
+
 		// Insert all entries
 		for i, testEntry := range testEntries {
-			err = db.setOnLeafPage(leafPage, testEntry.key, testEntry.keyPos, testEntry.value, 0)
+			suffix := testEntry.key[testEntry.keyPos+1:]
+			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
 			if err != nil {
-				t.Fatalf("Failed to insert entry %d: %v", i, err)
+				t.Fatalf("Failed to append data for entry %d: %v", i, err)
+			}
+
+			if i == 0 {
+				// Create the first leaf sub-page
+				leafSubPage, err = db.addEntryToNewLeafSubPage(suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to create leaf sub-page: %v", err)
+				}
+			} else {
+				// Add to existing leaf sub-page
+				err = db.addEntryToLeafSubPage(parentSubPage, testEntry.key[testEntry.keyPos], leafSubPage, suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to add entry %d to leaf sub-page: %v", i, err)
+				}
 			}
 		}
 
 		// Verify all entries were added
-		if len(leafPage.Entries) != 3 {
-			t.Fatalf("Expected 3 entries, got %d", len(leafPage.Entries))
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 3 {
+			t.Fatalf("Expected 3 entries, got %d", len(subPageInfo.Entries))
 		}
 
 		// Update the first entry
 		newValue := []byte("updated_first_value")
-		err = db.setOnLeafPage(leafPage, testEntries[0].key, testEntries[0].keyPos, newValue, 0)
+		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, testEntries[0].key, testEntries[0].keyPos, newValue, 0)
 		if err != nil {
 			t.Fatalf("Failed to update first entry: %v", err)
 		}
 
 		// Verify still 3 entries
-		if len(leafPage.Entries) != 3 {
-			t.Errorf("Expected 3 entries after update, got %d", len(leafPage.Entries))
+		subPageInfo = leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 3 {
+			t.Errorf("Expected 3 entries after update, got %d", len(subPageInfo.Entries))
 		}
 
 		// Verify the first entry was updated
-		firstEntry := leafPage.Entries[0]
+		firstEntry := subPageInfo.Entries[0]
 		content, err := db.readContent(firstEntry.DataOffset)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
@@ -2085,7 +2172,7 @@ func TestSetOnLeafPage(t *testing.T) {
 
 		// Verify other entries remain unchanged
 		for i := 1; i < 3; i++ {
-			entry := leafPage.Entries[i]
+			entry := subPageInfo.Entries[i]
 			content, err := db.readContent(entry.DataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for entry %d: %v", i, err)
@@ -2097,10 +2184,14 @@ func TestSetOnLeafPage(t *testing.T) {
 	})
 
 	t.Run("UpdateMiddleEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a parent radix sub-page to simulate the tree structure
+		parentRadixPage, err := db.allocateRadixPage()
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to allocate parent radix page: %v", err)
+		}
+		parentSubPage := &RadixSubPage{
+			Page:       parentRadixPage,
+			SubPageIdx: 0,
 		}
 
 		// Add multiple entries to test updating the middle one
@@ -2115,28 +2206,46 @@ func TestSetOnLeafPage(t *testing.T) {
 			{[]byte("entry_c"), 5, []byte("value_c")},
 		}
 
+		var leafSubPage *LeafSubPage
+
 		// Insert all entries
 		for i, testEntry := range testEntries {
-			err = db.setOnLeafPage(leafPage, testEntry.key, testEntry.keyPos, testEntry.value, 0)
+			suffix := testEntry.key[testEntry.keyPos+1:]
+			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
 			if err != nil {
-				t.Fatalf("Failed to insert entry %d: %v", i, err)
+				t.Fatalf("Failed to append data for entry %d: %v", i, err)
+			}
+
+			if i == 0 {
+				// Create the first leaf sub-page
+				leafSubPage, err = db.addEntryToNewLeafSubPage(suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to create leaf sub-page: %v", err)
+				}
+			} else {
+				// Add to existing leaf sub-page
+				err = db.addEntryToLeafSubPage(parentSubPage, testEntry.key[testEntry.keyPos], leafSubPage, suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to add entry %d to leaf sub-page: %v", i, err)
+				}
 			}
 		}
 
 		// Update the middle entry (index 1)
 		newValue := []byte("updated_middle_value")
-		err = db.setOnLeafPage(leafPage, testEntries[1].key, testEntries[1].keyPos, newValue, 0)
+		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, testEntries[1].key, testEntries[1].keyPos, newValue, 0)
 		if err != nil {
 			t.Fatalf("Failed to update middle entry: %v", err)
 		}
 
 		// Verify still 3 entries
-		if len(leafPage.Entries) != 3 {
-			t.Errorf("Expected 3 entries after update, got %d", len(leafPage.Entries))
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 3 {
+			t.Errorf("Expected 3 entries after update, got %d", len(subPageInfo.Entries))
 		}
 
 		// Verify the middle entry was updated
-		middleEntry := leafPage.Entries[1]
+		middleEntry := subPageInfo.Entries[1]
 		content, err := db.readContent(middleEntry.DataOffset)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
@@ -2147,7 +2256,7 @@ func TestSetOnLeafPage(t *testing.T) {
 
 		// Verify other entries remain unchanged
 		for _, idx := range []int{0, 2} {
-			entry := leafPage.Entries[idx]
+			entry := subPageInfo.Entries[idx]
 			content, err := db.readContent(entry.DataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for entry %d: %v", idx, err)
@@ -2160,10 +2269,14 @@ func TestSetOnLeafPage(t *testing.T) {
 	})
 
 	t.Run("UpdateLastEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a parent radix sub-page to simulate the tree structure
+		parentRadixPage, err := db.allocateRadixPage()
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to allocate parent radix page: %v", err)
+		}
+		parentSubPage := &RadixSubPage{
+			Page:       parentRadixPage,
+			SubPageIdx: 0,
 		}
 
 		// Add multiple entries to test updating the last one
@@ -2178,28 +2291,46 @@ func TestSetOnLeafPage(t *testing.T) {
 			{[]byte("item_3"), 4, []byte("data_3")},
 		}
 
+		var leafSubPage *LeafSubPage
+
 		// Insert all entries
 		for i, testEntry := range testEntries {
-			err = db.setOnLeafPage(leafPage, testEntry.key, testEntry.keyPos, testEntry.value, 0)
+			suffix := testEntry.key[testEntry.keyPos+1:]
+			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
 			if err != nil {
-				t.Fatalf("Failed to insert entry %d: %v", i, err)
+				t.Fatalf("Failed to append data for entry %d: %v", i, err)
+			}
+
+			if i == 0 {
+				// Create the first leaf sub-page
+				leafSubPage, err = db.addEntryToNewLeafSubPage(suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to create leaf sub-page: %v", err)
+				}
+			} else {
+				// Add to existing leaf sub-page
+				err = db.addEntryToLeafSubPage(parentSubPage, testEntry.key[testEntry.keyPos], leafSubPage, suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to add entry %d to leaf sub-page: %v", i, err)
+				}
 			}
 		}
 
 		// Update the last entry (index 2)
 		newValue := []byte("updated_last_value")
-		err = db.setOnLeafPage(leafPage, testEntries[2].key, testEntries[2].keyPos, newValue, 0)
+		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, testEntries[2].key, testEntries[2].keyPos, newValue, 0)
 		if err != nil {
 			t.Fatalf("Failed to update last entry: %v", err)
 		}
 
 		// Verify still 3 entries
-		if len(leafPage.Entries) != 3 {
-			t.Errorf("Expected 3 entries after update, got %d", len(leafPage.Entries))
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 3 {
+			t.Errorf("Expected 3 entries after update, got %d", len(subPageInfo.Entries))
 		}
 
 		// Verify the last entry was updated
-		lastEntry := leafPage.Entries[2]
+		lastEntry := subPageInfo.Entries[2]
 		content, err := db.readContent(lastEntry.DataOffset)
 		if err != nil {
 			t.Fatalf("Failed to read updated content: %v", err)
@@ -2210,7 +2341,7 @@ func TestSetOnLeafPage(t *testing.T) {
 
 		// Verify other entries remain unchanged
 		for i := 0; i < 2; i++ {
-			entry := leafPage.Entries[i]
+			entry := subPageInfo.Entries[i]
 			content, err := db.readContent(entry.DataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for entry %d: %v", i, err)
@@ -2222,10 +2353,14 @@ func TestSetOnLeafPage(t *testing.T) {
 	})
 
 	t.Run("DeleteFirstEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a parent radix sub-page to simulate the tree structure
+		parentRadixPage, err := db.allocateRadixPage()
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to allocate parent radix page: %v", err)
+		}
+		parentSubPage := &RadixSubPage{
+			Page:       parentRadixPage,
+			SubPageIdx: 0,
 		}
 
 		// Add multiple entries to test deleting the first one
@@ -2240,34 +2375,53 @@ func TestSetOnLeafPage(t *testing.T) {
 			{[]byte("prefix_keep_2"), 6, []byte("third_value")},
 		}
 
+		var leafSubPage *LeafSubPage
+
 		// Insert all entries
 		for i, testEntry := range testEntries {
-			err = db.setOnLeafPage(leafPage, testEntry.key, testEntry.keyPos, testEntry.value, 0)
+			suffix := testEntry.key[testEntry.keyPos+1:]
+			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
 			if err != nil {
-				t.Fatalf("Failed to insert entry %d: %v", i, err)
+				t.Fatalf("Failed to append data for entry %d: %v", i, err)
+			}
+
+			if i == 0 {
+				// Create the first leaf sub-page
+				leafSubPage, err = db.addEntryToNewLeafSubPage(suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to create leaf sub-page: %v", err)
+				}
+			} else {
+				// Add to existing leaf sub-page
+				err = db.addEntryToLeafSubPage(parentSubPage, testEntry.key[testEntry.keyPos], leafSubPage, suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to add entry %d to leaf sub-page: %v", i, err)
+				}
 			}
 		}
 
 		// Verify all entries were added
-		if len(leafPage.Entries) != 3 {
-			t.Fatalf("Expected 3 entries, got %d", len(leafPage.Entries))
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 3 {
+			t.Fatalf("Expected 3 entries, got %d", len(subPageInfo.Entries))
 		}
 
 		// Delete the first entry by setting empty value
-		err = db.setOnLeafPage(leafPage, testEntries[0].key, testEntries[0].keyPos, []byte{}, 0)
+		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, testEntries[0].key, testEntries[0].keyPos, []byte{}, 0)
 		if err != nil {
 			t.Fatalf("Failed to delete first entry: %v", err)
 		}
 
 		// Verify entry was removed
-		if len(leafPage.Entries) != 2 {
-			t.Errorf("Expected 2 entries after deletion, got %d", len(leafPage.Entries))
+		subPageInfo = leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Errorf("Expected 2 entries after deletion, got %d", len(subPageInfo.Entries))
 		}
 
 		// Verify remaining entries are correct and shifted
 		expectedRemaining := testEntries[1:]
 		for i, expectedEntry := range expectedRemaining {
-			entry := leafPage.Entries[i]
+			entry := subPageInfo.Entries[i]
 			content, err := db.readContent(entry.DataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for remaining entry %d: %v", i, err)
@@ -2282,10 +2436,14 @@ func TestSetOnLeafPage(t *testing.T) {
 	})
 
 	t.Run("DeleteMiddleEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a parent radix sub-page to simulate the tree structure
+		parentRadixPage, err := db.allocateRadixPage()
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to allocate parent radix page: %v", err)
+		}
+		parentSubPage := &RadixSubPage{
+			Page:       parentRadixPage,
+			SubPageIdx: 0,
 		}
 
 		// Add multiple entries to test deleting the middle one
@@ -2300,23 +2458,41 @@ func TestSetOnLeafPage(t *testing.T) {
 			{[]byte("shared_last"), 6, []byte("value_3")},
 		}
 
+		var leafSubPage *LeafSubPage
+
 		// Insert all entries
 		for i, testEntry := range testEntries {
-			err = db.setOnLeafPage(leafPage, testEntry.key, testEntry.keyPos, testEntry.value, 0)
+			suffix := testEntry.key[testEntry.keyPos+1:]
+			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
 			if err != nil {
-				t.Fatalf("Failed to insert entry %d: %v", i, err)
+				t.Fatalf("Failed to append data for entry %d: %v", i, err)
+			}
+
+			if i == 0 {
+				// Create the first leaf sub-page
+				leafSubPage, err = db.addEntryToNewLeafSubPage(suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to create leaf sub-page: %v", err)
+				}
+			} else {
+				// Add to existing leaf sub-page
+				err = db.addEntryToLeafSubPage(parentSubPage, testEntry.key[testEntry.keyPos], leafSubPage, suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to add entry %d to leaf sub-page: %v", i, err)
+				}
 			}
 		}
 
 		// Delete the middle entry (index 1)
-		err = db.setOnLeafPage(leafPage, testEntries[1].key, testEntries[1].keyPos, []byte{}, 0)
+		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, testEntries[1].key, testEntries[1].keyPos, []byte{}, 0)
 		if err != nil {
 			t.Fatalf("Failed to delete middle entry: %v", err)
 		}
 
 		// Verify entry was removed
-		if len(leafPage.Entries) != 2 {
-			t.Errorf("Expected 2 entries after deletion, got %d", len(leafPage.Entries))
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Errorf("Expected 2 entries after deletion, got %d", len(subPageInfo.Entries))
 		}
 
 		// Verify remaining entries are correct
@@ -2330,7 +2506,7 @@ func TestSetOnLeafPage(t *testing.T) {
 		}
 
 		for i, expectedEntry := range expectedRemaining {
-			entry := leafPage.Entries[i]
+			entry := subPageInfo.Entries[i]
 			content, err := db.readContent(entry.DataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for remaining entry %d: %v", i, err)
@@ -2345,10 +2521,14 @@ func TestSetOnLeafPage(t *testing.T) {
 	})
 
 	t.Run("DeleteLastEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a parent radix sub-page to simulate the tree structure
+		parentRadixPage, err := db.allocateRadixPage()
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to allocate parent radix page: %v", err)
+		}
+		parentSubPage := &RadixSubPage{
+			Page:       parentRadixPage,
+			SubPageIdx: 0,
 		}
 
 		// Add multiple entries to test deleting the last one
@@ -2363,28 +2543,46 @@ func TestSetOnLeafPage(t *testing.T) {
 			{[]byte("data_remove"), 4, []byte("data_remove")},
 		}
 
+		var leafSubPage *LeafSubPage
+
 		// Insert all entries
 		for i, testEntry := range testEntries {
-			err = db.setOnLeafPage(leafPage, testEntry.key, testEntry.keyPos, testEntry.value, 0)
+			suffix := testEntry.key[testEntry.keyPos+1:]
+			dataOffset, err := db.appendData(testEntry.key, testEntry.value)
 			if err != nil {
-				t.Fatalf("Failed to insert entry %d: %v", i, err)
+				t.Fatalf("Failed to append data for entry %d: %v", i, err)
+			}
+
+			if i == 0 {
+				// Create the first leaf sub-page
+				leafSubPage, err = db.addEntryToNewLeafSubPage(suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to create leaf sub-page: %v", err)
+				}
+			} else {
+				// Add to existing leaf sub-page
+				err = db.addEntryToLeafSubPage(parentSubPage, testEntry.key[testEntry.keyPos], leafSubPage, suffix, dataOffset)
+				if err != nil {
+					t.Fatalf("Failed to add entry %d to leaf sub-page: %v", i, err)
+				}
 			}
 		}
 
 		// Delete the last entry (index 2)
-		err = db.setOnLeafPage(leafPage, testEntries[2].key, testEntries[2].keyPos, []byte{}, 0)
+		err = db.setOnLeafSubPage(parentSubPage, leafSubPage, testEntries[2].key, testEntries[2].keyPos, []byte{}, 0)
 		if err != nil {
 			t.Fatalf("Failed to delete last entry: %v", err)
 		}
 
 		// Verify entry was removed
-		if len(leafPage.Entries) != 2 {
-			t.Errorf("Expected 2 entries after deletion, got %d", len(leafPage.Entries))
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Errorf("Expected 2 entries after deletion, got %d", len(subPageInfo.Entries))
 		}
 
 		// Verify remaining entries are correct (first two entries)
 		for i := 0; i < 2; i++ {
-			entry := leafPage.Entries[i]
+			entry := subPageInfo.Entries[i]
 			content, err := db.readContent(entry.DataOffset)
 			if err != nil {
 				t.Fatalf("Failed to read content for remaining entry %d: %v", i, err)
@@ -2398,216 +2596,205 @@ func TestSetOnLeafPage(t *testing.T) {
 		}
 	})
 
-	t.Run("DeleteNonExistingEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+	t.Run("InsertNewEntryInSubPage", func(t *testing.T) {
+		// Create a leaf sub-page with an existing entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("existing"), 1000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
 		}
 
-		// Add some entries
-		// All entries share the same prefix "testing" up to keyPos=7
-		testEntries := []struct {
-			key    []byte
-			keyPos int
-			value  []byte
-		}{
-			{[]byte("testing_key_1"), 7, []byte("value_1")},
-			{[]byte("testing_key_2"), 7, []byte("value_2")},
-		}
-
-		// Insert entries
-		for i, testEntry := range testEntries {
-			err = db.setOnLeafPage(leafPage, testEntry.key, testEntry.keyPos, testEntry.value, 0)
-			if err != nil {
-				t.Fatalf("Failed to insert entry %d: %v", i, err)
-			}
-		}
-
-		// Try to delete a non-existing entry (different suffix)
-		nonExistingKey := []byte("testing_nonexist")
-		err = db.setOnLeafPage(leafPage, nonExistingKey, 7, []byte{}, 0)
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
 		if err != nil {
-			t.Fatalf("Failed to handle deletion of non-existing entry: %v", err)
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
 		}
 
-		// Verify no entries were removed
-		if len(leafPage.Entries) != 2 {
-			t.Errorf("Expected 2 entries after attempting to delete non-existing entry, got %d", len(leafPage.Entries))
+		// Test data - simulate a key "test_key_new" where keyPos=8, so suffix is "new"
+		key := []byte("test_key_new")
+		keyPos := 8
+		value := []byte("new_value")
+
+		// Test setOnLeafSubPage for a new insert into existing sub-page
+		err = db.setOnLeafSubPage(parentRadixSubPage, leafSubPage, key, keyPos, value, 0)
+		if err != nil {
+			t.Fatalf("Failed to set on leaf sub-page: %v", err)
 		}
 
-		// Verify existing entries remain unchanged
-		for i, testEntry := range testEntries {
-			entry := leafPage.Entries[i]
-			content, err := db.readContent(entry.DataOffset)
-			if err != nil {
-				t.Fatalf("Failed to read content for entry %d: %v", i, err)
+		// Verify the entry was added (should have 2 entries now)
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Errorf("Expected 2 entries, got %d", len(subPageInfo.Entries))
+		}
+
+		// Find the new entry by suffix
+		var newEntry *LeafEntry
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+		expectedSuffix := key[keyPos+1:] // "new"
+
+		for _, entry := range subPageInfo.Entries {
+			suffixOffset := subPageDataStart + entry.SuffixOffset
+			entrySuffix := leafSubPage.Page.data[suffixOffset:suffixOffset+entry.SuffixLen]
+			if bytes.Equal(entrySuffix, expectedSuffix) {
+				newEntry = &entry
+				break
 			}
-			if !bytes.Equal(content.key, testEntry.key) {
-				t.Errorf("Entry %d key changed unexpectedly: expected %v, got %v", i, testEntry.key, content.key)
-			}
-			if !bytes.Equal(content.value, testEntry.value) {
-				t.Errorf("Entry %d value changed unexpectedly: expected %v, got %v", i, testEntry.value, content.value)
-			}
+		}
+
+		if newEntry == nil {
+			t.Fatal("Expected to find new entry with suffix 'new'")
+		}
+
+		// Verify data can be read back
+		content, err := db.readContent(newEntry.DataOffset)
+		if err != nil {
+			t.Fatalf("Failed to read content: %v", err)
+		}
+		if !bytes.Equal(content.key, key) {
+			t.Errorf("Expected key %v, got %v", key, content.key)
+		}
+		if !bytes.Equal(content.value, value) {
+			t.Errorf("Expected value %v, got %v", value, content.value)
 		}
 	})
 
-	t.Run("DeleteExistingEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+	t.Run("DeleteExistingEntryFromSubPage", func(t *testing.T) {
+		// Create proper data offsets by writing to the database
+		keepKey := []byte("prefix_keep_me")
+		keepValue := []byte("keep_value")
+		keepDataOffset, err := db.appendData(keepKey, keepValue)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to append keep data: %v", err)
 		}
 
-		// Test data
-		key := []byte("test_key")
-		keyPos := 4
-		value := []byte("value_to_delete")
-
-		// First, insert the entry
-		err = db.setOnLeafPage(leafPage, key, keyPos, value, 0)
+		deleteKey := []byte("prefix_delete_me")
+		deleteValue := []byte("delete_value")
+		deleteDataOffset, err := db.appendData(deleteKey, deleteValue)
 		if err != nil {
-			t.Fatalf("Failed to insert entry: %v", err)
+			t.Fatalf("Failed to append delete data: %v", err)
 		}
 
-		// Verify entry exists
-		if len(leafPage.Entries) != 1 {
-			t.Fatalf("Expected 1 entry after insert, got %d", len(leafPage.Entries))
+		// Create a leaf sub-page with multiple entries
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("keep_me"), keepDataOffset)
+		if err != nil {
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
 		}
 
-		// Now delete the entry (empty value means delete)
-		err = db.setOnLeafPage(leafPage, key, keyPos, []byte{}, 0)
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
+		}
+
+		// Add another entry to delete
+		err = db.addEntryToLeafSubPage(parentRadixSubPage, 'd', leafSubPage, []byte("delete_me"), deleteDataOffset)
+		if err != nil {
+			t.Fatalf("Failed to add second entry: %v", err)
+		}
+
+		// Verify we have 2 entries
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Fatalf("Expected 2 entries before delete, got %d", len(subPageInfo.Entries))
+		}
+
+		// Test data for deletion
+		key := []byte("prefix_delete_me")
+		keyPos := 6 // So suffix is "delete_me"
+
+		// Delete the entry (empty value means delete)
+		err = db.setOnLeafSubPage(parentRadixSubPage, leafSubPage, key, keyPos, []byte{}, 0)
 		if err != nil {
 			t.Fatalf("Failed to delete entry: %v", err)
 		}
 
-		// Verify entry was removed
-		if len(leafPage.Entries) != 0 {
-			t.Errorf("Expected 0 entries after delete, got %d", len(leafPage.Entries))
+		// Verify we now have 1 entry
+		subPageInfo = leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Errorf("Expected 1 entry after delete, got %d", len(subPageInfo.Entries))
+		}
+
+		// Verify the remaining entry is the correct one
+		remainingEntry := subPageInfo.Entries[0]
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+		suffixOffset := subPageDataStart + remainingEntry.SuffixOffset
+		remainingSuffix := leafSubPage.Page.data[suffixOffset:suffixOffset+remainingEntry.SuffixLen]
+		if !bytes.Equal(remainingSuffix, []byte("keep_me")) {
+			t.Errorf("Expected remaining suffix 'keep_me', got %v", remainingSuffix)
 		}
 	})
 
-	t.Run("DeleteNonExistentEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+	t.Run("DeleteNonExistentEntryFromSubPage", func(t *testing.T) {
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("existing"), 6000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
 		}
 
-		// Test data
-		key := []byte("non_existent_key")
-		keyPos := 4
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
+		}
+
+		// Test data for non-existent entry
+		key := []byte("prefix_nonexistent")
+		keyPos := 6 // So suffix is "nonexistent"
 
 		// Try to delete a non-existent entry
-		err = db.setOnLeafPage(leafPage, key, keyPos, []byte{}, 0)
+		err = db.setOnLeafSubPage(parentRadixSubPage, leafSubPage, key, keyPos, []byte{}, 0)
 		if err != nil {
 			t.Fatalf("Delete of non-existent entry should not fail: %v", err)
 		}
 
-		// Verify no entries exist
-		if len(leafPage.Entries) != 0 {
-			t.Errorf("Expected 0 entries, got %d", len(leafPage.Entries))
-		}
-	})
-
-	t.Run("MultipleEntriesManagement", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		// Insert multiple entries
-		testEntries := []struct {
-			key   []byte
-			value []byte
-		}{
-			{[]byte("key1_suffix1"), []byte("value1")},
-			{[]byte("key2_suffix2"), []byte("value2")},
-			{[]byte("key3_suffix3"), []byte("value3")},
-		}
-
-		keyPos := 4 // Simulating all keys have same prefix "key1", "key2", etc.
-
-		// Insert all entries
-		for i, entry := range testEntries {
-			err = db.setOnLeafPage(leafPage, entry.key, keyPos, entry.value, 0)
-			if err != nil {
-				t.Fatalf("Failed to insert entry %d: %v", i, err)
-			}
-		}
-
-		// Verify all entries exist
-		if len(leafPage.Entries) != len(testEntries) {
-			t.Errorf("Expected %d entries, got %d", len(testEntries), len(leafPage.Entries))
-		}
-
-		// Update the second entry
-		newValue := []byte("updated_value2")
-		err = db.setOnLeafPage(leafPage, testEntries[1].key, keyPos, newValue, 0)
-		if err != nil {
-			t.Fatalf("Failed to update entry: %v", err)
-		}
-
-		// Verify still same number of entries
-		if len(leafPage.Entries) != len(testEntries) {
-			t.Errorf("Expected %d entries after update, got %d", len(testEntries), len(leafPage.Entries))
-		}
-
-		// Delete the first entry
-		err = db.setOnLeafPage(leafPage, testEntries[0].key, keyPos, []byte{}, 0)
-		if err != nil {
-			t.Fatalf("Failed to delete entry: %v", err)
-		}
-
-		// Verify one less entry
-		if len(leafPage.Entries) != len(testEntries)-1 {
-			t.Errorf("Expected %d entries after delete, got %d", len(testEntries)-1, len(leafPage.Entries))
-		}
-
-		// Verify remaining entries are correct
-		remainingKeys := [][]byte{testEntries[1].key, testEntries[2].key}
-		for i, entry := range leafPage.Entries {
-			expectedSuffix := remainingKeys[i][keyPos+1:]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, expectedSuffix) {
-				t.Errorf("Entry %d: expected suffix %v, got %v", i, expectedSuffix, entrySuffix)
-			}
+		// Verify the original entry is still there
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Errorf("Expected 1 entry to remain, got %d", len(subPageInfo.Entries))
 		}
 	})
 
 	t.Run("ReindexingMode", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a leaf sub-page
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("reindex"), 7000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
+		}
+
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
 		}
 
 		// Test reindexing mode where dataOffset is provided (non-zero)
-		key := []byte("test_key")
-		keyPos := 4
-		value := []byte("test_value")
+		key := []byte("test_reindex")
+		keyPos := 4 // So suffix is "reindex"
+		value := []byte("reindex_value")
 		dataOffset := int64(12345) // Non-zero means reindexing
 
 		// In reindexing mode, we don't append new data
-		err = db.setOnLeafPage(leafPage, key, keyPos, value, dataOffset)
+		err = db.setOnLeafSubPage(parentRadixSubPage, leafSubPage, key, keyPos, value, dataOffset)
 		if err != nil {
 			t.Fatalf("Failed to set in reindexing mode: %v", err)
 		}
 
-		// Verify the entry was added with the provided offset
-		if len(leafPage.Entries) != 1 {
-			t.Errorf("Expected 1 entry, got %d", len(leafPage.Entries))
+		// Verify the entry was updated with the provided offset
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Errorf("Expected 1 entry, got %d", len(subPageInfo.Entries))
 		}
 
-		entry := leafPage.Entries[0]
+		entry := subPageInfo.Entries[0]
 		if entry.DataOffset != dataOffset {
 			t.Errorf("Expected data offset %d, got %d", dataOffset, entry.DataOffset)
 		}
 	})
 }
 
-// TestPageCacheAfterLeafOperations tests the page cache state after leaf page operations
+// ================================================================================================
+// Page Cache Tests
+// ================================================================================================
+
 func TestPageCacheAfterLeafOperations(t *testing.T) {
 	// Create a temporary database for testing
 	tmpDir := t.TempDir()
@@ -2634,6 +2821,15 @@ func TestPageCacheAfterLeafOperations(t *testing.T) {
 	}
 
 	pageNumber := leafPage.pageNumber
+	// Make sure the page number is greater than 1
+	if pageNumber <= 1 {
+		t.Fatalf("Expected page number greater than 1, got %d", pageNumber)
+	}
+
+	// Add the page to the free list so addEntryToNewLeafSubPage can use it
+	db.addToFreeLeafPagesList(leafPage)
+
+	t.Logf("Test allocated leaf page %d and added to free list", pageNumber)
 
 	// Verify the page is in cache
 	cachedPage, exists := db.getFromCache(pageNumber)
@@ -2647,19 +2843,45 @@ func TestPageCacheAfterLeafOperations(t *testing.T) {
 		t.Error("Cached page should be the same as the leaf page")
 	}
 
-	// Add some entries to the page
+	// Add some entries to the page using the new multi-sub-page format
+	// Note: Each call to addEntryToNewLeafSubPage may create new pages
+	var leafSubPages []*LeafSubPage
 	for i := 0; i < 5; i++ {
-		suffix := []byte(fmt.Sprintf("suffix_%d", i))
-		dataOffset := int64(1000 + i*100)
-		err = db.addLeafEntry(leafPage, suffix, dataOffset)
+		// Create proper keys and suffixes - suffix should be part of the key
+		key := []byte(fmt.Sprintf("test_key_%d", i))
+		value := []byte(fmt.Sprintf("test_value_%d", i))
+
+		// Create proper data offsets by writing to the database
+		dataOffset, err := db.appendData(key, value)
+		if err != nil {
+			t.Fatalf("Failed to append data for entry %d: %v", i, err)
+		}
+
+		// Use the key suffix (skip first byte to simulate radix path)
+		suffix := key[1:] // Skip first byte as if we're at radix depth 1
+
+		// Debug: Check what's in the free list before allocation
+		t.Logf("Before adding entry %d, checking free list state", i)
+
+		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffset)
 		if err != nil {
 			t.Fatalf("Failed to add entry %d: %v", i, err)
 		}
+		leafSubPages = append(leafSubPages, leafSubPage)
+		t.Logf("Added entry %d (key=%s, suffix=%s) to page %d", i, key, suffix, leafSubPage.Page.pageNumber)
 	}
 
-	// Verify the page is marked as dirty
-	if !leafPage.dirty {
-		t.Error("Leaf page should be marked as dirty after modifications")
+	// Verify the pages with sub-pages are marked as dirty
+	dirtyPageFound := false
+	for _, subPage := range leafSubPages {
+		if subPage.Page.dirty {
+			dirtyPageFound = true
+			t.Logf("Page %d is correctly marked as dirty", subPage.Page.pageNumber)
+			break
+		}
+	}
+	if !dirtyPageFound {
+		t.Error("At least one leaf page should be marked as dirty after modifications")
 	}
 
 	// Get updated cache stats
@@ -2676,24 +2898,59 @@ func TestPageCacheAfterLeafOperations(t *testing.T) {
 		t.Error("Leaf page count should have increased")
 	}
 
-	// Test that page remains accessible through cache
-	retrievedPage, err := db.getLeafPage(pageNumber)
-	if err != nil {
-		t.Fatalf("Failed to retrieve leaf page from cache: %v", err)
+	// Verify sub-pages are preserved in the new format
+	// Count sub-pages across all pages created
+	totalSubPageCount := 0
+	pageSet := make(map[uint32]*LeafPage)
+
+	for _, subPage := range leafSubPages {
+		pageSet[subPage.Page.pageNumber] = subPage.Page
 	}
 
-	// Verify it's the same page instance (should be from cache)
-	if retrievedPage.pageNumber != pageNumber {
-		t.Errorf("Expected page number %d, got %d", pageNumber, retrievedPage.pageNumber)
+	// Test that pages remain accessible through cache
+	// Note: The original page may not have the sub-pages since addEntryToNewLeafSubPage may create new pages
+	for pageNum := range pageSet {
+		retrievedPage, err := db.getLeafPage(pageNum)
+		if err != nil {
+			t.Fatalf("Failed to retrieve leaf page %d from cache: %v", pageNum, err)
+		}
+
+		// Verify it's the same page instance (should be from cache)
+		if retrievedPage.pageNumber != pageNum {
+			t.Errorf("Expected page number %d, got %d", pageNum, retrievedPage.pageNumber)
+		}
 	}
 
-	// Verify entries are preserved
-	if len(retrievedPage.Entries) != 5 {
-		t.Errorf("Expected 5 entries, got %d", len(retrievedPage.Entries))
+	for pageNum, page := range pageSet {
+		subPageCountForPage := 0
+		for i, subPage := range page.SubPages {
+			if subPage != nil {
+				subPageCountForPage++
+				totalSubPageCount++
+
+				// Log entries within this sub-page
+				for j, entry := range subPage.Entries {
+					// Read the suffix from the page data
+					subPageDataStart := int(subPage.Offset) + 3 // Skip 3-byte header
+					suffixOffset := subPageDataStart + entry.SuffixOffset
+					suffix := page.data[suffixOffset:suffixOffset+entry.SuffixLen]
+					t.Logf("Page %d SubPage[%d] Entry[%d]: suffix=%q, dataOffset=%d",
+						pageNum, i, j, suffix, entry.DataOffset)
+				}
+			}
+		}
+		t.Logf("Page %d has %d sub-pages", pageNum, subPageCountForPage)
 	}
 
-	// Test page access time is updated
+	t.Logf("Total sub-pages across all pages: %d", totalSubPageCount)
+	if totalSubPageCount < 5 {
+		t.Errorf("Expected at least 5 sub-pages across all pages, got %d", totalSubPageCount)
+	}
+
+	// Test page access time is updated for the original page
 	originalAccessTime := cachedPage.accessTime
+	t.Logf("Original access time: %d", originalAccessTime)
+
 	_, err = db.getLeafPage(pageNumber)
 	if err != nil {
 		t.Fatalf("Failed to access page again: %v", err)
@@ -2701,6 +2958,8 @@ func TestPageCacheAfterLeafOperations(t *testing.T) {
 
 	// Access time should have been updated
 	updatedPage, _ := db.getFromCache(pageNumber)
+	t.Logf("Updated access time: %d", updatedPage.accessTime)
+
 	if updatedPage.accessTime <= originalAccessTime {
 		t.Error("Access time should have been updated")
 	}
@@ -2710,11 +2969,11 @@ func TestPageCacheAfterLeafOperations(t *testing.T) {
 // Leaf Entry Management Tests
 // ================================================================================================
 
-// TestParseLeafEntries tests the parseLeafEntries function with various entry formats
-func TestParseLeafEntries(t *testing.T) {
+// TestParseLeafSubPages tests the parseLeafSubPages function with the new multi-sub-page format
+func TestParseLeafSubPages(t *testing.T) {
 	// Create a temporary database for testing
 	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_parseleafentries.db")
+	dbPath := filepath.Join(tmpDir, "test_parseleafsubpages.db")
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -2733,525 +2992,492 @@ func TestParseLeafEntries(t *testing.T) {
 			t.Fatalf("Failed to allocate leaf page: %v", err)
 		}
 
-		// Parse entries from empty page
-		entries, err := db.parseLeafEntries(leafPage)
+		// Parse sub-pages from empty page
+		err = db.parseLeafSubPages(leafPage)
 		if err != nil {
 			t.Fatalf("Failed to parse empty leaf page: %v", err)
 		}
 
-		// Should have no entries
-		if len(entries) != 0 {
-			t.Errorf("Expected 0 entries in empty page, got %d", len(entries))
+		// Should have 256 sub-page slots, all nil
+		if len(leafPage.SubPages) != 256 {
+			t.Errorf("Expected 256 sub-page slots, got %d", len(leafPage.SubPages))
+		}
+
+		// Count non-nil sub-pages
+		subPageCount := 0
+		for _, subPage := range leafPage.SubPages {
+			if subPage != nil {
+				subPageCount++
+			}
+		}
+		if subPageCount != 0 {
+			t.Errorf("Expected 0 sub-pages in empty page, got %d", subPageCount)
 		}
 	})
 
-	t.Run("ParseSingleEntry", func(t *testing.T) {
-		// Create a new leaf page
+	t.Run("ParseSingleSubPage", func(t *testing.T) {
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("test_suffix"), 1000)
+		if err != nil {
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
+		}
+
+		leafPage := leafSubPage.Page
+
+		// Clear sub-pages and re-parse to test parsing
+		leafPage.SubPages = nil
+		err = db.parseLeafSubPages(leafPage)
+		if err != nil {
+			t.Fatalf("Failed to parse leaf sub-pages: %v", err)
+		}
+
+		// Should have 256 sub-page slots
+		if len(leafPage.SubPages) != 256 {
+			t.Errorf("Expected 256 sub-page slots, got %d", len(leafPage.SubPages))
+		}
+
+		// Should have one non-nil sub-page
+		subPageCount := 0
+		var parsedSubPage *LeafSubPageInfo
+		for _, subPage := range leafPage.SubPages {
+			if subPage != nil {
+				subPageCount++
+				parsedSubPage = subPage
+			}
+		}
+		if subPageCount != 1 {
+			t.Errorf("Expected 1 sub-page, got %d", subPageCount)
+		}
+
+		// Verify the parsed sub-page
+		if parsedSubPage == nil {
+			t.Fatal("Expected non-nil parsed sub-page")
+		}
+
+		if len(parsedSubPage.Entries) != 1 {
+			t.Errorf("Expected 1 entry in sub-page, got %d", len(parsedSubPage.Entries))
+		}
+
+		entry := parsedSubPage.Entries[0]
+		if entry.SuffixLen != 11 { // "test_suffix" length
+			t.Errorf("Expected suffix length 11, got %d", entry.SuffixLen)
+		}
+		if entry.DataOffset != 1000 {
+			t.Errorf("Expected data offset 1000, got %d", entry.DataOffset)
+		}
+	})
+
+	t.Run("ParseCorruptedSubPage", func(t *testing.T) {
+		// Create a leaf page with corrupted sub-page data
 		leafPage, err := db.allocateLeafPage()
 		if err != nil {
 			t.Fatalf("Failed to allocate leaf page: %v", err)
 		}
 
-		// Add a single entry
-		suffix := []byte("test_suffix")
-		dataOffset := int64(1000)
-		err = db.addLeafEntry(leafPage, suffix, dataOffset)
-		if err != nil {
-			t.Fatalf("Failed to add leaf entry: %v", err)
-		}
+		// Create corrupted sub-page data - sub-page size exceeds content size
+		offset := int(LeafHeaderSize)
+		leafPage.data[offset] = 0 // Sub-page ID
+		binary.LittleEndian.PutUint16(leafPage.data[offset+1:], 1000) // Size larger than available space
+		leafPage.ContentSize = uint16(offset + 10) // Small content size
 
-		// Parse entries
-		entries, err := db.parseLeafEntries(leafPage)
-		if err != nil {
-			t.Fatalf("Failed to parse leaf entries: %v", err)
+		// Try to parse - should fail
+		err = db.parseLeafSubPages(leafPage)
+		if err == nil {
+			t.Error("Expected error for corrupted sub-page, got nil")
 		}
-
-		// Verify single entry
-		if len(entries) != 1 {
-			t.Errorf("Expected 1 entry, got %d", len(entries))
-		}
-
-		entry := entries[0]
-		if entry.SuffixLen != len(suffix) {
-			t.Errorf("Expected suffix length %d, got %d", len(suffix), entry.SuffixLen)
-		}
-		if entry.DataOffset != dataOffset {
-			t.Errorf("Expected data offset %d, got %d", dataOffset, entry.DataOffset)
-		}
-
-		// Verify suffix data
-		entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-		if !bytes.Equal(entrySuffix, suffix) {
-			t.Errorf("Expected suffix %v, got %v", suffix, entrySuffix)
+		if !strings.Contains(err.Error(), "exceeds content size") {
+			t.Errorf("Expected 'exceeds content size' error, got: %v", err)
 		}
 	})
 
-	t.Run("ParseMultipleEntries", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+	t.Run("ParseMultipleSubPages", func(t *testing.T) {
+		// Create multiple leaf sub-pages to test parsing multiple sub-pages
+		leafSubPage1, err := db.addEntryToNewLeafSubPage([]byte("entry1"), 1000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to create first leaf sub-page: %v", err)
 		}
 
-		// Add multiple entries with different sizes
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("short"), 1000},
-			{[]byte("medium_length_suffix"), 2000},
-			{[]byte("very_long_suffix_that_takes_more_space"), 3000},
-			{[]byte("a"), 4000}, // Single character
-			{[]byte(""), 5000},  // Empty suffix
-		}
-
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry with suffix %q: %v", testEntry.suffix, err)
-			}
-		}
-
-		// Parse entries
-		entries, err := db.parseLeafEntries(leafPage)
+		// Add more sub-pages to the same leaf page
+		_, err = db.addEntryToNewLeafSubPage([]byte("entry2"), 2000)
 		if err != nil {
-			t.Fatalf("Failed to parse leaf entries: %v", err)
+			t.Fatalf("Failed to create second leaf sub-page: %v", err)
 		}
 
-		// Verify all entries
-		if len(entries) != len(testEntries) {
-			t.Errorf("Expected %d entries, got %d", len(testEntries), len(entries))
-		}
+		// Get the leaf page (should be the same for both sub-pages if they fit)
+		leafPage := leafSubPage1.Page
 
-		for i, testEntry := range testEntries {
-			entry := entries[i]
-			if entry.SuffixLen != len(testEntry.suffix) {
-				t.Errorf("Entry %d: expected suffix length %d, got %d", i, len(testEntry.suffix), entry.SuffixLen)
-			}
-			if entry.DataOffset != testEntry.dataOffset {
-				t.Errorf("Entry %d: expected data offset %d, got %d", i, testEntry.dataOffset, entry.DataOffset)
-			}
-
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, testEntry.suffix) {
-				t.Errorf("Entry %d: expected suffix %v, got %v", i, testEntry.suffix, entrySuffix)
-			}
-		}
-	})
-
-	t.Run("ParseEntriesWithSpecialCharacters", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Clear sub-pages and re-parse to test parsing
+		leafPage.SubPages = nil
+		err = db.parseLeafSubPages(leafPage)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to parse multiple leaf sub-pages: %v", err)
 		}
 
-		// Add entries with special characters and binary data
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("unicode_テスト"), 1000},
-			{[]byte{0x00, 0x01, 0x02, 0xFF}, 2000}, // Binary data
-			{[]byte("special!@#$%^&*()"), 3000},      // Special characters
-			{[]byte("tabs\tand\nnewlines"), 4000},   // Control characters
-		}
-
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry with suffix %q: %v", testEntry.suffix, err)
+		// Count non-nil sub-pages
+		subPageCount := 0
+		for _, subPage := range leafPage.SubPages {
+			if subPage != nil {
+				subPageCount++
 			}
 		}
 
-		// Parse entries
-		entries, err := db.parseLeafEntries(leafPage)
-		if err != nil {
-			t.Fatalf("Failed to parse leaf entries: %v", err)
+		// Should have at least 1 sub-page (might be 2 if they fit on same page)
+		if subPageCount < 1 {
+			t.Errorf("Expected at least 1 sub-page, got %d", subPageCount)
 		}
 
-		// Verify all entries
-		for i, testEntry := range testEntries {
-			entry := entries[i]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, testEntry.suffix) {
-				t.Errorf("Entry %d: expected suffix %v, got %v", i, testEntry.suffix, entrySuffix)
-			}
-		}
-	})
-
-	t.Run("ParseCorruptedPage", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		// Test 1: Content size that would try to read beyond the data buffer
-		// Set content size to something that would cause the parser to try to read beyond available data
-		leafPage.ContentSize = uint16(PageSize - 4) // Close to end but would try to read 8 bytes for data offset
-
-		// The current implementation doesn't bounds-check, so this will likely panic
-		// We'll use recover to catch the panic and consider it expected behavior
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Expected - the function panics when trying to read beyond bounds
-					t.Logf("Correctly panicked when reading corrupted page: %v", r)
+		// Verify each non-nil sub-page has valid entries
+		for i, subPage := range leafPage.SubPages {
+			if subPage != nil {
+				if len(subPage.Entries) == 0 {
+					t.Errorf("Sub-page %d has no entries", i)
 				}
-			}()
-
-			// Try to parse entries - this will likely panic due to bounds check
-			_, err = db.parseLeafEntries(leafPage)
-			if err != nil {
-				t.Logf("Correctly returned error for corrupted page: %v", err)
-			}
-		}()
-
-		// Test 2: Incomplete varint data
-		leafPage2, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate second leaf page: %v", err)
-		}
-
-		// For SQLite4 varint, 0xFF means we need 9 bytes total (1 + 8 bytes)
-		// But we'll only provide partial data, causing varint.Read to return 0, 0
-		pos := int(LeafHeaderSize)
-		leafPage2.data[pos] = 0xFF   // This means we need 8 more bytes for the varint
-		// Don't write the remaining 8 bytes, leaving incomplete varint data
-
-		// Set content size to include this incomplete varint
-		leafPage2.ContentSize = uint16(pos + 5) // Only 5 bytes total, but varint needs 9
-
-		// Try to parse - this should detect the incomplete varint (bytesRead == 0)
-		_, err = db.parseLeafEntries(leafPage2)
-		if err != nil {
-			// Expected - corruption detected
-			t.Logf("Correctly detected incomplete varint: %v", err)
-		} else {
-			// If it didn't error, that's unexpected but not necessarily wrong
-			t.Logf("Parsing completed without error despite incomplete varint")
-		}
-
-		// Test 3: Valid varint but insufficient data for suffix + data offset
-		leafPage3, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate third leaf page: %v", err)
-		}
-
-		pos = int(LeafHeaderSize)
-		// Write a varint indicating suffix length of 100 bytes
-		suffixLen := uint64(100)
-		written := varint.Write(leafPage3.data[pos:], suffixLen)
-		pos += written
-
-		// But don't provide the 100 bytes of suffix + 8 bytes of data offset
-		// Set content size to something smaller
-		leafPage3.ContentSize = uint16(pos + 10) // Only 10 more bytes, but we need 100 + 8 = 108
-
-		// This should cause parseLeafEntries to try to read beyond the available data
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					// Expected - panic when trying to read beyond bounds
-					t.Logf("Correctly panicked with insufficient data for suffix: %v", r)
+				for j, entry := range subPage.Entries {
+					if entry.SuffixLen <= 0 {
+						t.Errorf("Sub-page %d entry %d has invalid suffix length: %d", i, j, entry.SuffixLen)
+					}
+					if entry.DataOffset <= 0 {
+						t.Errorf("Sub-page %d entry %d has invalid data offset: %d", i, j, entry.DataOffset)
+					}
 				}
-			}()
-
-			_, err = db.parseLeafEntries(leafPage3)
-			if err != nil {
-				t.Logf("Correctly returned error for insufficient data: %v", err)
 			}
-		}()
+		}
+	})
+}
+
+// TestParseLeafPage tests the parseLeafPage function with the new multi-sub-page format
+func TestParseLeafPage(t *testing.T) {
+	// Create a temporary database for testing
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_parseleafpage.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start a transaction to create pages in current transaction sequence
+	db.beginTransaction()
+	defer db.commitTransaction()
+
+	t.Run("ParseValidLeafPageWithSubPages", func(t *testing.T) {
+		// Create a leaf sub-page with entries using the new format
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("test_key"), 1000)
+		if err != nil {
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
+		}
+
+		leafPage := leafSubPage.Page
+
+		// Write the leaf page to get proper data format
+		err = db.writeLeafPage(leafPage)
+		if err != nil {
+			t.Fatalf("Failed to write leaf page: %v", err)
+		}
+
+		// Now test parsing the written page data
+		parsedPage, err := db.parseLeafPage(leafPage.data, leafPage.pageNumber)
+		if err != nil {
+			t.Fatalf("Failed to parse leaf page: %v", err)
+		}
+
+		// Verify parsed fields
+		if parsedPage.pageNumber != leafPage.pageNumber {
+			t.Errorf("Expected page number %d, got %d", leafPage.pageNumber, parsedPage.pageNumber)
+		}
+
+		if parsedPage.pageType != ContentTypeLeaf {
+			t.Errorf("Expected page type %c, got %c", ContentTypeLeaf, parsedPage.pageType)
+		}
+
+		if parsedPage.ContentSize != leafPage.ContentSize {
+			t.Errorf("Expected ContentSize %d, got %d", leafPage.ContentSize, parsedPage.ContentSize)
+		}
+
+		// Verify SubPages array is properly initialized
+		if len(parsedPage.SubPages) != 256 {
+			t.Errorf("Expected 256 sub-page slots, got %d", len(parsedPage.SubPages))
+		}
+
+		// Count non-nil sub-pages
+		subPageCount := 0
+		for _, subPage := range parsedPage.SubPages {
+			if subPage != nil {
+				subPageCount++
+			}
+		}
+		if subPageCount == 0 {
+			t.Error("Expected at least one sub-page after parsing")
+		}
+
+		// Verify the parsed sub-page has entries
+		var foundSubPage *LeafSubPageInfo
+		for _, subPage := range parsedPage.SubPages {
+			if subPage != nil {
+				foundSubPage = subPage
+				break
+			}
+		}
+
+		if foundSubPage == nil {
+			t.Fatal("Expected to find at least one sub-page")
+		}
+
+		if len(foundSubPage.Entries) == 0 {
+			t.Error("Expected sub-page to have entries")
+		}
+
+		// Verify the entry details
+		entry := foundSubPage.Entries[0]
+		if entry.SuffixLen != 8 { // "test_key" length
+			t.Errorf("Expected suffix length 8, got %d", entry.SuffixLen)
+		}
+		if entry.DataOffset != 1000 {
+			t.Errorf("Expected data offset 1000, got %d", entry.DataOffset)
+		}
+
+		if parsedPage.dirty {
+			t.Error("Expected parsed page to not be dirty")
+		}
+
+		if parsedPage.accessTime == 0 {
+			t.Error("Expected access time to be set")
+		}
+	})
+
+	t.Run("ParseLeafPageWrongType", func(t *testing.T) {
+		// Create test data with wrong content type
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeRadix    // Wrong type for leaf page
+		binary.LittleEndian.PutUint16(data[2:4], LeafHeaderSize) // ContentSize
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[4:8], 0)
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[4:8], checksum)
+
+		// Parse should fail
+		_, err = db.parseLeafPage(data, 1)
+		if err == nil {
+			t.Error("Expected error for wrong content type, got nil")
+		}
+		if !strings.Contains(err.Error(), "not a leaf page") {
+			t.Errorf("Expected 'not a leaf page' error, got: %v", err)
+		}
+	})
+
+	t.Run("ParseLeafPageBadChecksum", func(t *testing.T) {
+		// Create test data with bad checksum
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeLeaf
+		binary.LittleEndian.PutUint16(data[2:4], LeafHeaderSize) // ContentSize
+		binary.BigEndian.PutUint32(data[4:8], 0xCAFEBABE) // Wrong checksum
+
+		// Parse should fail
+		_, err = db.parseLeafPage(data, 1)
+		if err == nil {
+			t.Error("Expected error for bad checksum, got nil")
+		}
+		if !strings.Contains(err.Error(), "checksum mismatch") {
+			t.Errorf("Expected 'checksum mismatch' error, got: %v", err)
+		}
+	})
+
+	t.Run("ParseLeafPageEmptyContent", func(t *testing.T) {
+		// Create test data for empty leaf page (only header)
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeLeaf
+		binary.LittleEndian.PutUint16(data[2:4], LeafHeaderSize) // Only header content
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[4:8], 0)
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[4:8], checksum)
+
+		// Parse should succeed
+		leafPage, err := db.parseLeafPage(data, 1)
+		if err != nil {
+			t.Fatalf("Failed to parse empty leaf page: %v", err)
+		}
+
+		// Verify empty page properties
+		if leafPage.ContentSize != LeafHeaderSize {
+			t.Errorf("Expected ContentSize %d, got %d", LeafHeaderSize, leafPage.ContentSize)
+		}
+
+		// Count non-nil sub-pages
+		subPageCount := 0
+		for _, subPage := range leafPage.SubPages {
+			if subPage != nil {
+				subPageCount++
+			}
+		}
+		if subPageCount != 0 {
+			t.Errorf("Expected 0 sub-pages in empty page, got %d", subPageCount)
+		}
+	})
+
+	t.Run("ParseLeafPageAddsToCache", func(t *testing.T) {
+		// Get initial cache count
+		initialCacheCount := db.totalCachePages.Load()
+
+		// Create valid test data
+		data := make([]byte, PageSize)
+		data[0] = ContentTypeLeaf
+		binary.LittleEndian.PutUint16(data[2:4], LeafHeaderSize)
+
+		// Calculate and set checksum
+		binary.BigEndian.PutUint32(data[4:8], 0)
+		checksum := crc32.ChecksumIEEE(data)
+		binary.BigEndian.PutUint32(data[4:8], checksum)
+
+		// Parse the page
+		_, err = db.parseLeafPage(data, 25)
+		if err != nil {
+			t.Fatalf("Failed to parse leaf page: %v", err)
+		}
+
+		// Verify page was added to cache
+		newCacheCount := db.totalCachePages.Load()
+		if newCacheCount <= initialCacheCount {
+			t.Error("Expected cache count to increase after parsing page")
+		}
+
+		// Verify we can get the page from cache
+		cachedPage, exists := db.getFromCache(25)
+		if !exists {
+			t.Error("Expected page to be in cache")
+		}
+		if cachedPage.pageType != ContentTypeLeaf {
+			t.Error("Expected cached page to be leaf type")
+		}
 	})
 }
 
 // TestRemoveLeafEntryAt tests the removeLeafEntryAt function with edge cases
-func TestRemoveLeafEntryAt(t *testing.T) {
+// TestRemoveEntryFromLeafSubPage tests the removeEntryFromLeafSubPage function
+func TestRemoveEntryFromLeafSubPage(t *testing.T) {
 	// Create a temporary database for testing
 	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_removeleafentryat.db")
+	dbPath := filepath.Join(tmpDir, "test_removeentryfromleafsubpage.db")
 
+	// Open the database
 	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
 	}
 	defer db.Close()
 
-	// Start a transaction to create pages in current transaction sequence
+	// Start a transaction
 	db.beginTransaction()
-	defer db.commitTransaction()
+	defer db.rollbackTransaction()
 
-	t.Run("RemoveFromEmptyPage", func(t *testing.T) {
-		// Create a new empty leaf page
-		leafPage, err := db.allocateLeafPage()
+	t.Run("RemoveEntryFromSubPage", func(t *testing.T) {
+		// Create a leaf sub-page with multiple entries
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("entry1"), 1000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to add first entry: %v", err)
 		}
 
-		// Try to remove from empty page
-		removed, err := db.removeLeafEntryAt(leafPage, 0)
+		// Create a mock parent radix sub-page for testing
+		parentRadixSubPage, err := db.allocateRadixSubPage()
 		if err != nil {
-			t.Fatalf("Unexpected error removing from empty page: %v", err)
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
 		}
-		if removed {
-			t.Error("Expected removal to fail on empty page")
-		}
-	})
 
-	t.Run("RemoveInvalidIndex", func(t *testing.T) {
-		// Create a new leaf page with one entry
-		leafPage, err := db.allocateLeafPage()
+		// Add more entries to the same sub-page
+		err = db.addEntryToLeafSubPage(parentRadixSubPage, 'a', leafSubPage, []byte("entry2"), 2000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to add second entry: %v", err)
 		}
 
-		// Add an entry
-		err = db.addLeafEntry(leafPage, []byte("test"), 1000)
+		err = db.addEntryToLeafSubPage(parentRadixSubPage, 'a', leafSubPage, []byte("entry3"), 3000)
 		if err != nil {
-			t.Fatalf("Failed to add entry: %v", err)
+			t.Fatalf("Failed to add third entry: %v", err)
 		}
 
-		// Try negative index
-		removed, err := db.removeLeafEntryAt(leafPage, -1)
-		if err != nil {
-			t.Fatalf("Unexpected error with negative index: %v", err)
-		}
-		if removed {
-			t.Error("Expected removal to fail with negative index")
+		// Verify we have 3 entries
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 3 {
+			t.Fatalf("Expected 3 entries, got %d", len(subPageInfo.Entries))
 		}
 
-		// Try index beyond bounds
-		removed, err = db.removeLeafEntryAt(leafPage, 5)
-		if err != nil {
-			t.Fatalf("Unexpected error with out-of-bounds index: %v", err)
-		}
-		if removed {
-			t.Error("Expected removal to fail with out-of-bounds index")
-		}
-
-		// Verify entry is still there
-		if len(leafPage.Entries) != 1 {
-			t.Error("Entry should still be present after failed removals")
-		}
-	})
-
-	t.Run("RemoveSingleEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		// Add a single entry
-		suffix := []byte("test_entry")
-		dataOffset := int64(1000)
-		err = db.addLeafEntry(leafPage, suffix, dataOffset)
-		if err != nil {
-			t.Fatalf("Failed to add entry: %v", err)
-		}
-
-		// Verify entry exists
-		if len(leafPage.Entries) != 1 {
-			t.Fatalf("Expected 1 entry before removal, got %d", len(leafPage.Entries))
-		}
-
-		// Remove the entry
-		removed, err := db.removeLeafEntryAt(leafPage, 0)
+		// Remove the middle entry (index 1)
+		err = db.removeEntryFromLeafSubPage(leafSubPage, 1)
 		if err != nil {
 			t.Fatalf("Failed to remove entry: %v", err)
 		}
-		if !removed {
-			t.Error("Expected removal to succeed")
+
+		// Verify we now have 2 entries
+		subPageInfo = leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Fatalf("Expected 2 entries after removal, got %d", len(subPageInfo.Entries))
 		}
 
-		// Verify entry is gone
-		if len(leafPage.Entries) != 0 {
-			t.Errorf("Expected 0 entries after removal, got %d", len(leafPage.Entries))
+		// Verify the remaining entries are correct
+		entry1 := subPageInfo.Entries[0]
+		if entry1.DataOffset != 1000 {
+			t.Errorf("Expected first entry data offset 1000, got %d", entry1.DataOffset)
 		}
 
-		// Verify page is marked as dirty
-		if !leafPage.dirty {
-			t.Error("Page should be marked as dirty after removal")
-		}
-
-		// Verify content size was updated
-		if leafPage.ContentSize != LeafHeaderSize {
-			t.Errorf("Expected content size to be header size (%d) after removing all entries, got %d", LeafHeaderSize, leafPage.ContentSize)
-		}
-	})
-
-	t.Run("RemoveFirstEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		// Add multiple entries
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("first"), 1000},
-			{[]byte("second"), 2000},
-			{[]byte("third"), 3000},
-		}
-
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry: %v", err)
-			}
-		}
-
-		// Remove first entry
-		removed, err := db.removeLeafEntryAt(leafPage, 0)
-		if err != nil {
-			t.Fatalf("Failed to remove first entry: %v", err)
-		}
-		if !removed {
-			t.Error("Expected removal to succeed")
-		}
-
-		// Verify remaining entries
-		if len(leafPage.Entries) != 2 {
-			t.Errorf("Expected 2 entries after removal, got %d", len(leafPage.Entries))
-		}
-
-		// Verify remaining entries are correct
-		expectedRemaining := testEntries[1:]
-		for i, expected := range expectedRemaining {
-			entry := leafPage.Entries[i]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, expected.suffix) {
-				t.Errorf("Remaining entry %d: expected suffix %v, got %v", i, expected.suffix, entrySuffix)
-			}
-			if entry.DataOffset != expected.dataOffset {
-				t.Errorf("Remaining entry %d: expected data offset %d, got %d", i, expected.dataOffset, entry.DataOffset)
-			}
-		}
-	})
-
-	t.Run("RemoveMiddleEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		// Add multiple entries
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("alpha"), 1000},
-			{[]byte("beta"), 2000},
-			{[]byte("gamma"), 3000},
-			{[]byte("delta"), 4000},
-		}
-
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry: %v", err)
-			}
-		}
-
-		// Remove middle entry (index 1)
-		removed, err := db.removeLeafEntryAt(leafPage, 1)
-		if err != nil {
-			t.Fatalf("Failed to remove middle entry: %v", err)
-		}
-		if !removed {
-			t.Error("Expected removal to succeed")
-		}
-
-		// Verify remaining entries
-		if len(leafPage.Entries) != 3 {
-			t.Errorf("Expected 3 entries after removal, got %d", len(leafPage.Entries))
-		}
-
-		// Verify remaining entries are correct (alpha, gamma, delta)
-		expectedRemaining := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("alpha"), 1000},
-			{[]byte("gamma"), 3000},
-			{[]byte("delta"), 4000},
-		}
-
-		for i, expected := range expectedRemaining {
-			entry := leafPage.Entries[i]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, expected.suffix) {
-				t.Errorf("Remaining entry %d: expected suffix %v, got %v", i, expected.suffix, entrySuffix)
-			}
-			if entry.DataOffset != expected.dataOffset {
-				t.Errorf("Remaining entry %d: expected data offset %d, got %d", i, expected.dataOffset, entry.DataOffset)
-			}
+		entry3 := subPageInfo.Entries[1]
+		if entry3.DataOffset != 3000 {
+			t.Errorf("Expected third entry data offset 3000, got %d", entry3.DataOffset)
 		}
 	})
 
 	t.Run("RemoveLastEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("single_entry"), 5000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to add entry: %v", err)
 		}
 
-		// Add multiple entries
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("one"), 1000},
-			{[]byte("two"), 2000},
-			{[]byte("three"), 3000},
+		// Verify we have 1 entry
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Fatalf("Expected 1 entry, got %d", len(subPageInfo.Entries))
 		}
 
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry: %v", err)
-			}
-		}
-
-		// Remove last entry
-		removed, err := db.removeLeafEntryAt(leafPage, 2)
+		// Remove the only entry
+		err = db.removeEntryFromLeafSubPage(leafSubPage, 0)
 		if err != nil {
-			t.Fatalf("Failed to remove last entry: %v", err)
-		}
-		if !removed {
-			t.Error("Expected removal to succeed")
+			t.Fatalf("Failed to remove entry: %v", err)
 		}
 
-		// Verify remaining entries
-		if len(leafPage.Entries) != 2 {
-			t.Errorf("Expected 2 entries after removal, got %d", len(leafPage.Entries))
+		// Verify the sub-page was removed entirely
+		if leafSubPage.Page.SubPages[leafSubPage.SubPageIdx] != nil {
+			t.Error("Expected sub-page to be removed when last entry is deleted")
+		}
+	})
+
+	t.Run("RemoveInvalidIndex", func(t *testing.T) {
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("test_entry"), 6000)
+		if err != nil {
+			t.Fatalf("Failed to add entry: %v", err)
 		}
 
-		// Verify remaining entries are correct
-		expectedRemaining := testEntries[:2]
-		for i, expected := range expectedRemaining {
-			entry := leafPage.Entries[i]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, expected.suffix) {
-				t.Errorf("Remaining entry %d: expected suffix %v, got %v", i, expected.suffix, entrySuffix)
-			}
-			if entry.DataOffset != expected.dataOffset {
-				t.Errorf("Remaining entry %d: expected data offset %d, got %d", i, expected.dataOffset, entry.DataOffset)
-			}
+		// Try to remove an invalid index
+		err = db.removeEntryFromLeafSubPage(leafSubPage, 5)
+		if err == nil {
+			t.Error("Expected error when removing invalid index")
+		}
+
+		// Verify the entry is still there
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Fatalf("Expected 1 entry to remain, got %d", len(subPageInfo.Entries))
 		}
 	})
 }
 
-// TestUpdateLeafEntryOffset tests the updateLeafEntryOffset function
-func TestUpdateLeafEntryOffset(t *testing.T) {
+// TestAddEntryToLeafSubPage tests the addEntryToLeafSubPage function with the new multi-sub-page format
+func TestAddEntryToLeafSubPage(t *testing.T) {
 	// Create a temporary database for testing
 	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_updateleafentryoffset.db")
+	dbPath := filepath.Join(tmpDir, "test_addentrytoLeafSubPage.db")
 
 	db, err := Open(dbPath)
 	if err != nil {
@@ -3259,199 +3485,414 @@ func TestUpdateLeafEntryOffset(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Start a transaction to create pages in current transaction sequence
+	// Start a transaction
 	db.beginTransaction()
-	defer db.commitTransaction()
+	defer db.rollbackTransaction()
 
-	t.Run("UpdateSingleEntry", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+	t.Run("AddEntryToExistingSubPage", func(t *testing.T) {
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("entry1"), 1000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to create initial leaf sub-page: %v", err)
 		}
 
-		// Add a single entry
-		suffix := []byte("test_entry")
-		originalOffset := int64(1000)
-		err = db.addLeafEntry(leafPage, suffix, originalOffset)
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
+		}
+
+		// Add a second entry to the same sub-page
+		err = db.addEntryToLeafSubPage(parentRadixSubPage, 'a', leafSubPage, []byte("entry2"), 2000)
+		if err != nil {
+			t.Fatalf("Failed to add second entry: %v", err)
+		}
+
+		// Verify we have 2 entries
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Fatalf("Expected 2 entries, got %d", len(subPageInfo.Entries))
+		}
+
+		// Verify the entries are correct
+		entry1 := subPageInfo.Entries[0]
+		if entry1.DataOffset != 1000 {
+			t.Errorf("Expected first entry data offset 1000, got %d", entry1.DataOffset)
+		}
+
+		entry2 := subPageInfo.Entries[1]
+		if entry2.DataOffset != 2000 {
+			t.Errorf("Expected second entry data offset 2000, got %d", entry2.DataOffset)
+		}
+
+		// Verify the suffixes can be read correctly
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+
+		suffix1Offset := subPageDataStart + entry1.SuffixOffset
+		actualSuffix1 := leafSubPage.Page.data[suffix1Offset:suffix1Offset+entry1.SuffixLen]
+		if !bytes.Equal(actualSuffix1, []byte("entry1")) {
+			t.Errorf("Expected suffix1 'entry1', got %v", actualSuffix1)
+		}
+
+		suffix2Offset := subPageDataStart + entry2.SuffixOffset
+		actualSuffix2 := leafSubPage.Page.data[suffix2Offset:suffix2Offset+entry2.SuffixLen]
+		if !bytes.Equal(actualSuffix2, []byte("entry2")) {
+			t.Errorf("Expected suffix2 'entry2', got %v", actualSuffix2)
+		}
+	})
+
+	t.Run("AddMultipleEntriesToSubPage", func(t *testing.T) {
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("base"), 1000)
+		if err != nil {
+			t.Fatalf("Failed to create initial leaf sub-page: %v", err)
+		}
+
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
+		}
+
+		// Add multiple entries
+		entries := []struct {
+			suffix     []byte
+			dataOffset int64
+		}{
+			{[]byte("alpha"), 2000},
+			{[]byte("beta"), 3000},
+			{[]byte("gamma"), 4000},
+			{[]byte("delta"), 5000},
+		}
+
+		for i, entry := range entries {
+			err = db.addEntryToLeafSubPage(parentRadixSubPage, 'x', leafSubPage, entry.suffix, entry.dataOffset)
+			if err != nil {
+				t.Fatalf("Failed to add entry %d: %v", i, err)
+			}
+		}
+
+		// Verify we have all entries (base + 4 new ones)
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		expectedCount := 1 + len(entries)
+		if len(subPageInfo.Entries) != expectedCount {
+			t.Fatalf("Expected %d entries, got %d", expectedCount, len(subPageInfo.Entries))
+		}
+
+		// Verify each entry can be read correctly
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+
+		for i := 1; i < len(subPageInfo.Entries); i++ { // Skip base entry at index 0
+			entry := subPageInfo.Entries[i]
+			expectedSuffix := entries[i-1].suffix
+			expectedDataOffset := entries[i-1].dataOffset
+
+			if entry.DataOffset != expectedDataOffset {
+				t.Errorf("Entry %d: expected data offset %d, got %d", i, expectedDataOffset, entry.DataOffset)
+			}
+
+			suffixOffset := subPageDataStart + entry.SuffixOffset
+			actualSuffix := leafSubPage.Page.data[suffixOffset:suffixOffset+entry.SuffixLen]
+			if !bytes.Equal(actualSuffix, expectedSuffix) {
+				t.Errorf("Entry %d: expected suffix %v, got %v", i, expectedSuffix, actualSuffix)
+			}
+		}
+	})
+
+	t.Run("AddEntryToFullSubPage", func(t *testing.T) {
+		// Create a leaf sub-page
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("start"), 1000)
+		if err != nil {
+			t.Fatalf("Failed to create initial leaf sub-page: %v", err)
+		}
+
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
+		}
+
+		// Fill the sub-page with many entries to make it full
+		// Add entries until we approach the page size limit
+		entryCount := 0
+		for {
+			suffix := []byte(fmt.Sprintf("entry_%d", entryCount))
+			dataOffset := int64(2000 + entryCount*100)
+
+			// Try to add the entry
+			err = db.addEntryToLeafSubPage(parentRadixSubPage, 'y', leafSubPage, suffix, dataOffset)
+			if err != nil {
+				// If we get an error, it might be because the sub-page is full
+				// This is expected behavior - the function should handle this gracefully
+				break
+			}
+
+			entryCount++
+
+			// Safety check to prevent infinite loop
+			if entryCount > 100 {
+				break
+			}
+		}
+
+		// Verify we added at least some entries
+		if entryCount < 5 {
+			t.Errorf("Expected to add at least 5 entries before hitting limit, got %d", entryCount)
+		}
+
+		// Verify the sub-page structure is still valid
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != entryCount+1 { // +1 for the initial "start" entry
+			t.Errorf("Expected %d entries in sub-page, got %d", entryCount+1, len(subPageInfo.Entries))
+		}
+	})
+
+	t.Run("AddEntryWithEmptySuffix", func(t *testing.T) {
+		// Create a leaf sub-page
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("normal"), 1000)
+		if err != nil {
+			t.Fatalf("Failed to create initial leaf sub-page: %v", err)
+		}
+
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
+		}
+
+		// Add an entry with empty suffix
+		err = db.addEntryToLeafSubPage(parentRadixSubPage, 'z', leafSubPage, []byte{}, 2000)
+		if err != nil {
+			t.Fatalf("Failed to add entry with empty suffix: %v", err)
+		}
+
+		// Verify we have 2 entries
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Fatalf("Expected 2 entries, got %d", len(subPageInfo.Entries))
+		}
+
+		// Verify the empty suffix entry
+		emptyEntry := subPageInfo.Entries[1]
+		if emptyEntry.SuffixLen != 0 {
+			t.Errorf("Expected empty suffix length 0, got %d", emptyEntry.SuffixLen)
+		}
+		if emptyEntry.DataOffset != 2000 {
+			t.Errorf("Expected data offset 2000, got %d", emptyEntry.DataOffset)
+		}
+	})
+
+	t.Run("AddEntryWithLargeSuffix", func(t *testing.T) {
+		// Create a leaf sub-page
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("small"), 1000)
+		if err != nil {
+			t.Fatalf("Failed to create initial leaf sub-page: %v", err)
+		}
+
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
+		}
+
+		// Add an entry with large suffix
+		largeSuffix := make([]byte, 500)
+		for i := range largeSuffix {
+			largeSuffix[i] = byte('A' + (i % 26))
+		}
+
+		err = db.addEntryToLeafSubPage(parentRadixSubPage, 'L', leafSubPage, largeSuffix, 3000)
+		if err != nil {
+			t.Fatalf("Failed to add entry with large suffix: %v", err)
+		}
+
+		// Verify we have 2 entries
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Fatalf("Expected 2 entries, got %d", len(subPageInfo.Entries))
+		}
+
+		// Verify the large suffix entry
+		largeEntry := subPageInfo.Entries[1]
+		if largeEntry.SuffixLen != len(largeSuffix) {
+			t.Errorf("Expected large suffix length %d, got %d", len(largeSuffix), largeEntry.SuffixLen)
+		}
+		if largeEntry.DataOffset != 3000 {
+			t.Errorf("Expected data offset 3000, got %d", largeEntry.DataOffset)
+		}
+
+		// Verify the large suffix can be read correctly
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+		suffixOffset := subPageDataStart + largeEntry.SuffixOffset
+		actualLargeSuffix := leafSubPage.Page.data[suffixOffset:suffixOffset+largeEntry.SuffixLen]
+		if !bytes.Equal(actualLargeSuffix, largeSuffix) {
+			t.Error("Large suffix content mismatch")
+		}
+	})
+
+	t.Run("VerifySubPageGrowth", func(t *testing.T) {
+		// Create a leaf sub-page
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("initial"), 1000)
+		if err != nil {
+			t.Fatalf("Failed to create initial leaf sub-page: %v", err)
+		}
+
+		// Create a mock parent radix sub-page
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
+		}
+
+		// Record initial sub-page size
+		initialSubPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		initialSize := initialSubPageInfo.Size
+
+		// Add an entry
+		err = db.addEntryToLeafSubPage(parentRadixSubPage, 'g', leafSubPage, []byte("growth_test"), 2000)
 		if err != nil {
 			t.Fatalf("Failed to add entry: %v", err)
 		}
 
-		// Verify original offset
-		if leafPage.Entries[0].DataOffset != originalOffset {
-			t.Fatalf("Expected original offset %d, got %d", originalOffset, leafPage.Entries[0].DataOffset)
+		// Verify sub-page size increased
+		updatedSubPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		updatedSize := updatedSubPageInfo.Size
+
+		if updatedSize <= initialSize {
+			t.Errorf("Expected sub-page size to increase from %d, got %d", initialSize, updatedSize)
 		}
 
-		// Update the offset
-		newOffset := int64(2000)
-		err = db.updateLeafEntryOffset(leafPage, 0, newOffset)
+		// Verify the leaf page content size also increased
+		if leafSubPage.Page.ContentSize <= LeafHeaderSize {
+			t.Errorf("Expected leaf page content size > %d, got %d", LeafHeaderSize, leafSubPage.Page.ContentSize)
+		}
+	})
+}
+
+// TestUpdateEntryInLeafSubPage tests the updateEntryInLeafSubPage function
+func TestUpdateEntryInLeafSubPage(t *testing.T) {
+	// Create a temporary database for testing
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_updateentryinleafsubpage.db")
+
+	// Open the database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start a transaction
+	db.beginTransaction()
+	defer db.rollbackTransaction()
+
+	t.Run("UpdateEntryInSubPage", func(t *testing.T) {
+		// Create a leaf sub-page with multiple entries
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("entry1"), 1000)
 		if err != nil {
-			t.Fatalf("Failed to update entry offset: %v", err)
+			t.Fatalf("Failed to add first entry: %v", err)
 		}
 
-		// Verify offset was updated in entry structure
-		if leafPage.Entries[0].DataOffset != newOffset {
-			t.Errorf("Expected updated offset %d, got %d", newOffset, leafPage.Entries[0].DataOffset)
+		// Create a mock parent radix sub-page for testing
+		parentRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate parent radix sub-page: %v", err)
 		}
 
-		// Verify offset was updated in raw page data
-		entry := leafPage.Entries[0]
-
-		// Calculate position of data offset in page data
-		pos := int(LeafHeaderSize)
-		// Skip suffix length varint
-		_, bytesRead := varint.Read(leafPage.data[pos:])
-		pos += bytesRead
-		// Skip suffix data
-		pos += entry.SuffixLen
-		// Read data offset from page data
-		actualOffset := int64(binary.LittleEndian.Uint64(leafPage.data[pos:]))
-
-		if actualOffset != newOffset {
-			t.Errorf("Expected offset in page data %d, got %d", newOffset, actualOffset)
+		// Add more entries to the same sub-page
+		err = db.addEntryToLeafSubPage(parentRadixSubPage, 'b', leafSubPage, []byte("entry2"), 2000)
+		if err != nil {
+			t.Fatalf("Failed to add second entry: %v", err)
 		}
 
-		// Verify page is marked as dirty
-		if !leafPage.dirty {
-			t.Error("Page should be marked as dirty after offset update")
+		// Verify we have 2 entries
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Fatalf("Expected 2 entries, got %d", len(subPageInfo.Entries))
 		}
 
-		// Verify suffix wasn't corrupted
-		entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-		if !bytes.Equal(entrySuffix, suffix) {
-			t.Errorf("Suffix was corrupted: expected %v, got %v", suffix, entrySuffix)
+		// Update the first entry's data offset
+		newDataOffset := int64(9999)
+		err = db.updateEntryInLeafSubPage(leafSubPage, 0, newDataOffset)
+		if err != nil {
+			t.Fatalf("Failed to update entry: %v", err)
+		}
+
+		// Verify the entry was updated
+		subPageInfo = leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 2 {
+			t.Fatalf("Expected 2 entries after update, got %d", len(subPageInfo.Entries))
+		}
+
+		// Verify the first entry has the new data offset
+		entry1 := subPageInfo.Entries[0]
+		if entry1.DataOffset != newDataOffset {
+			t.Errorf("Expected updated data offset %d, got %d", newDataOffset, entry1.DataOffset)
+		}
+
+		// Verify the second entry is unchanged
+		entry2 := subPageInfo.Entries[1]
+		if entry2.DataOffset != 2000 {
+			t.Errorf("Expected second entry data offset 2000, got %d", entry2.DataOffset)
 		}
 	})
 
-	t.Run("UpdateMiddleEntryInMultipleEntries", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+	t.Run("UpdateSingleEntry", func(t *testing.T) {
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("single_entry"), 5000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to add entry: %v", err)
 		}
 
-		// Add multiple entries
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("first"), 1000},
-			{[]byte("second"), 2000},
-			{[]byte("third"), 3000},
-		}
-
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry: %v", err)
-			}
-		}
-
-		// Update the middle entry (index 1)
-		newOffset := int64(9999)
-		err = db.updateLeafEntryOffset(leafPage, 1, newOffset)
+		// Update the only entry
+		newDataOffset := int64(7777)
+		err = db.updateEntryInLeafSubPage(leafSubPage, 0, newDataOffset)
 		if err != nil {
-			t.Fatalf("Failed to update middle entry offset: %v", err)
+			t.Fatalf("Failed to update entry: %v", err)
 		}
 
-		// Verify the updated entry
-		if leafPage.Entries[1].DataOffset != newOffset {
-			t.Errorf("Expected updated offset %d, got %d", newOffset, leafPage.Entries[1].DataOffset)
+		// Verify the entry was updated
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Fatalf("Expected 1 entry after update, got %d", len(subPageInfo.Entries))
 		}
 
-		// Verify other entries weren't affected
-		if leafPage.Entries[0].DataOffset != testEntries[0].dataOffset {
-			t.Errorf("First entry offset was affected: expected %d, got %d", testEntries[0].dataOffset, leafPage.Entries[0].DataOffset)
-		}
-		if leafPage.Entries[2].DataOffset != testEntries[2].dataOffset {
-			t.Errorf("Third entry offset was affected: expected %d, got %d", testEntries[2].dataOffset, leafPage.Entries[2].DataOffset)
-		}
-
-		// Verify all suffixes are intact
-		for i, testEntry := range testEntries {
-			entry := leafPage.Entries[i]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, testEntry.suffix) {
-				t.Errorf("Entry %d suffix was corrupted: expected %v, got %v", i, testEntry.suffix, entrySuffix)
-			}
+		entry := subPageInfo.Entries[0]
+		if entry.DataOffset != newDataOffset {
+			t.Errorf("Expected updated data offset %d, got %d", newDataOffset, entry.DataOffset)
 		}
 	})
 
 	t.Run("UpdateInvalidIndex", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		// Add an entry
-		err = db.addLeafEntry(leafPage, []byte("test"), 1000)
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("test_entry"), 6000)
 		if err != nil {
 			t.Fatalf("Failed to add entry: %v", err)
 		}
 
-		// Try to update with invalid index - this should panic or have undefined behavior
-		// Since the function doesn't check bounds, we skip this test or handle it carefully
-		// For now, we'll just document that this is expected behavior
-	})
-
-	t.Run("UpdateEntryWithDifferentSizes", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+		// Try to update an invalid index
+		err = db.updateEntryInLeafSubPage(leafSubPage, 5, 8888)
+		if err == nil {
+			t.Error("Expected error when updating invalid index")
 		}
 
-		// Add entries with different suffix sizes to test complex positioning
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("a"), 1000},                                    // 1 byte
-			{[]byte("medium_size"), 2000},                          // 11 bytes
-			{[]byte("very_long_suffix_with_many_characters"), 3000}, // 34 bytes
-			{[]byte(""), 4000},                                     // 0 bytes
+		// Verify the entry is unchanged
+		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Fatalf("Expected 1 entry to remain, got %d", len(subPageInfo.Entries))
 		}
 
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry: %v", err)
-			}
-		}
-
-		// Update each entry and verify others remain intact
-		for updateIndex := 0; updateIndex < len(testEntries); updateIndex++ {
-			newOffset := int64(5000 + updateIndex*1000)
-			err = db.updateLeafEntryOffset(leafPage, updateIndex, newOffset)
-			if err != nil {
-				t.Fatalf("Failed to update entry %d: %v", updateIndex, err)
-			}
-
-			// Verify the updated entry
-			if leafPage.Entries[updateIndex].DataOffset != newOffset {
-				t.Errorf("Entry %d: expected updated offset %d, got %d", updateIndex, newOffset, leafPage.Entries[updateIndex].DataOffset)
-			}
-
-			// Verify all other entries have correct suffixes and weren't corrupted
-			for i, testEntry := range testEntries {
-				entry := leafPage.Entries[i]
-				entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-				if !bytes.Equal(entrySuffix, testEntry.suffix) {
-					t.Errorf("After updating entry %d, entry %d suffix was corrupted: expected %v, got %v", updateIndex, i, testEntry.suffix, entrySuffix)
-				}
-			}
+		entry := subPageInfo.Entries[0]
+		if entry.DataOffset != 6000 {
+			t.Errorf("Expected original data offset 6000, got %d", entry.DataOffset)
 		}
 	})
 }
 
-// TestRebuildLeafPageData tests the rebuildLeafPageData function for data compaction and reorganization
-func TestRebuildLeafPageData(t *testing.T) {
+// TestUpdateLeafPage tests the updateLeafPage function with the new multi-sub-page format
+func TestUpdateLeafPage(t *testing.T) {
 	// Create a temporary database for testing
 	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_rebuildleafpagedata.db")
-
+	dbPath := filepath.Join(tmpDir, "test_updateleafpage.db")
 	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
@@ -3462,264 +3903,180 @@ func TestRebuildLeafPageData(t *testing.T) {
 	db.beginTransaction()
 	defer db.commitTransaction()
 
-	t.Run("RebuildEmptyPage", func(t *testing.T) {
-		// Create a new empty leaf page
-		leafPage, err := db.allocateLeafPage()
+	t.Run("RemoveSubPageOnly", func(t *testing.T) {
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("test_entry"), 1000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
 		}
 
-		// Store original content size
-		originalSize := leafPage.ContentSize
+		leafPage := leafSubPage.Page
+		subPageIdx := leafSubPage.SubPageIdx
 
-		// Rebuild the page
-		db.rebuildLeafPageData(leafPage)
-
-		// Verify content size remains the same
-		if leafPage.ContentSize != originalSize {
-			t.Errorf("Expected content size %d, got %d", originalSize, leafPage.ContentSize)
+		// Verify sub-page exists
+		if leafPage.SubPages[subPageIdx] == nil {
+			t.Fatal("Sub-page should exist before removal")
 		}
 
-		// Verify no entries
-		if len(leafPage.Entries) != 0 {
-			t.Errorf("Expected 0 entries after rebuild, got %d", len(leafPage.Entries))
+		// Remove the sub-page
+		newSubPageIdx, err := db.updateLeafPage(leafPage, int(subPageIdx), nil, nil)
+		if err != nil {
+			t.Fatalf("Failed to remove sub-page: %v", err)
+		}
+
+		// Should return -1 since no new sub-page was added
+		if newSubPageIdx != -1 {
+			t.Errorf("Expected -1 for no new sub-page, got %d", newSubPageIdx)
+		}
+
+		// Verify sub-page was removed
+		if leafPage.SubPages[subPageIdx] != nil {
+			t.Error("Sub-page should be removed")
 		}
 	})
 
-	t.Run("RebuildWithSingleEntry", func(t *testing.T) {
-		// Create a new leaf page
+	t.Run("AddSubPageOnly", func(t *testing.T) {
+		// Create an empty leaf page
 		leafPage, err := db.allocateLeafPage()
 		if err != nil {
 			t.Fatalf("Failed to allocate leaf page: %v", err)
 		}
 
-		// Add a single entry
-		originalSuffix := []byte("test_suffix")
-		originalOffset := int64(1000)
-		err = db.addLeafEntry(leafPage, originalSuffix, originalOffset)
+		// Create new sub-page data
+		suffix := []byte("new_entry")
+		dataOffset := int64(2000)
+
+		// Create sub-page data buffer
+		suffixLenSize := 1 // For length 9, varint uses 1 byte
+		entrySize := suffixLenSize + len(suffix) + 8
+		subPageData := make([]byte, entrySize)
+		pos := 0
+
+		// Write suffix length (varint)
+		subPageData[pos] = byte(len(suffix))
+		pos++
+
+		// Write suffix
+		copy(subPageData[pos:], suffix)
+		pos += len(suffix)
+
+		// Write data offset
+		binary.LittleEndian.PutUint64(subPageData[pos:], uint64(dataOffset))
+
+		// Create entries
+		newEntries := []LeafEntry{{
+			SuffixOffset: 1, // After varint
+			SuffixLen:    len(suffix),
+			DataOffset:   dataOffset,
+		}}
+
+		// Add new sub-page
+		newSubPageIdx, err := db.updateLeafPage(leafPage, -1, subPageData, newEntries)
 		if err != nil {
-			t.Fatalf("Failed to add entry: %v", err)
+			t.Fatalf("Failed to add sub-page: %v", err)
 		}
 
-		// Store original content size
-		originalSize := leafPage.ContentSize
-
-		// Rebuild the page
-		db.rebuildLeafPageData(leafPage)
-
-		// Verify content size remains the same
-		if leafPage.ContentSize != originalSize {
-			t.Errorf("Expected content size %d, got %d", originalSize, leafPage.ContentSize)
+		// Should return a valid sub-page index
+		if newSubPageIdx < 0 || newSubPageIdx >= 256 {
+			t.Errorf("Expected valid sub-page index (0-255), got %d", newSubPageIdx)
 		}
 
-		// Verify entry is preserved
-		if len(leafPage.Entries) != 1 {
-			t.Errorf("Expected 1 entry after rebuild, got %d", len(leafPage.Entries))
+		// Verify sub-page was added
+		if leafPage.SubPages[newSubPageIdx] == nil {
+			t.Error("Sub-page should be added")
 		}
 
-		entry := leafPage.Entries[0]
-		entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-		if !bytes.Equal(entrySuffix, originalSuffix) {
-			t.Errorf("Expected suffix %v, got %v", originalSuffix, entrySuffix)
+		// Verify sub-page content
+		subPageInfo := leafPage.SubPages[newSubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Errorf("Expected 1 entry in new sub-page, got %d", len(subPageInfo.Entries))
 		}
-		if entry.DataOffset != originalOffset {
-			t.Errorf("Expected data offset %d, got %d", originalOffset, entry.DataOffset)
+
+		entry := subPageInfo.Entries[0]
+		if entry.DataOffset != dataOffset {
+			t.Errorf("Expected data offset %d, got %d", dataOffset, entry.DataOffset)
 		}
 	})
 
-	t.Run("RebuildWithMultipleEntries", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+	t.Run("RemoveAndAddSubPage", func(t *testing.T) {
+		// Create a leaf sub-page with one entry
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("old_entry"), 1000)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to create leaf sub-page: %v", err)
 		}
 
-		// Add multiple entries
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("alpha"), 1000},
-			{[]byte("beta"), 2000},
-			{[]byte("gamma"), 3000},
-			{[]byte("delta"), 4000},
-		}
+		leafPage := leafSubPage.Page
+		oldSubPageIdx := leafSubPage.SubPageIdx
 
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry: %v", err)
-			}
-		}
+		// Create new sub-page data
+		suffix := []byte("new_entry")
+		dataOffset := int64(2000)
 
-		// Store original content size
-		originalSize := leafPage.ContentSize
+		// Create sub-page data buffer
+		suffixLenSize := 1 // For length 9, varint uses 1 byte
+		entrySize := suffixLenSize + len(suffix) + 8
+		subPageData := make([]byte, entrySize)
+		pos := 0
 
-		// Rebuild the page
-		db.rebuildLeafPageData(leafPage)
+		// Write suffix length (varint)
+		subPageData[pos] = byte(len(suffix))
+		pos++
 
-		// Verify content size remains the same
-		if leafPage.ContentSize != originalSize {
-			t.Errorf("Expected content size %d, got %d", originalSize, leafPage.ContentSize)
-		}
+		// Write suffix
+		copy(subPageData[pos:], suffix)
+		pos += len(suffix)
 
-		// Verify all entries are preserved
-		if len(leafPage.Entries) != len(testEntries) {
-			t.Errorf("Expected %d entries after rebuild, got %d", len(testEntries), len(leafPage.Entries))
-		}
+		// Write data offset
+		binary.LittleEndian.PutUint64(subPageData[pos:], uint64(dataOffset))
 
-		// Verify each entry
-		for i, testEntry := range testEntries {
-			entry := leafPage.Entries[i]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, testEntry.suffix) {
-				t.Errorf("Entry %d: expected suffix %v, got %v", i, testEntry.suffix, entrySuffix)
-			}
-			if entry.DataOffset != testEntry.dataOffset {
-				t.Errorf("Entry %d: expected data offset %d, got %d", i, testEntry.dataOffset, entry.DataOffset)
-			}
-		}
-	})
+		// Create entries
+		newEntries := []LeafEntry{{
+			SuffixOffset: 1, // After varint
+			SuffixLen:    len(suffix),
+			DataOffset:   dataOffset,
+		}}
 
-	t.Run("RebuildAfterEntryModification", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
+		// Remove old sub-page and add new one
+		newSubPageIdx, err := db.updateLeafPage(leafPage, int(oldSubPageIdx), subPageData, newEntries)
 		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+			t.Fatalf("Failed to update leaf page: %v", err)
 		}
 
-		// Add multiple entries
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("first"), 1000},
-			{[]byte("second"), 2000},
-			{[]byte("third"), 3000},
+		// Should return a valid sub-page index
+		if newSubPageIdx < 0 || newSubPageIdx >= 256 {
+			t.Errorf("Expected valid sub-page index (0-255), got %d", newSubPageIdx)
 		}
 
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry: %v", err)
-			}
+		// Verify the operation was successful
+		if newSubPageIdx < 0 || newSubPageIdx >= 256 {
+			t.Errorf("Expected valid sub-page index (0-255), got %d", newSubPageIdx)
 		}
 
-		// Manually modify the entries list (simulate what removeLeafEntryAt does)
-		// Remove the middle entry
-		leafPage.Entries = append(leafPage.Entries[:1], leafPage.Entries[2:]...)
-
-		// Rebuild the page data
-		db.rebuildLeafPageData(leafPage)
-
-		// Verify only the remaining entries are present
-		expectedEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("first"), 1000},
-			{[]byte("third"), 3000},
+		// Verify the sub-page exists and has the correct content
+		if leafPage.SubPages[newSubPageIdx] == nil {
+			t.Error("New sub-page should be added")
 		}
 
-		if len(leafPage.Entries) != len(expectedEntries) {
-			t.Errorf("Expected %d entries after rebuild, got %d", len(expectedEntries), len(leafPage.Entries))
+		// Verify new sub-page content
+		subPageInfo := leafPage.SubPages[newSubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Errorf("Expected 1 entry in new sub-page, got %d", len(subPageInfo.Entries))
 		}
 
-		// Verify remaining entries are correct
-		for i, expected := range expectedEntries {
-			entry := leafPage.Entries[i]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, expected.suffix) {
-				t.Errorf("Entry %d: expected suffix %v, got %v", i, expected.suffix, entrySuffix)
-			}
-			if entry.DataOffset != expected.dataOffset {
-				t.Errorf("Entry %d: expected data offset %d, got %d", i, expected.dataOffset, entry.DataOffset)
-			}
+		entry := subPageInfo.Entries[0]
+		if entry.DataOffset != dataOffset {
+			t.Errorf("Expected data offset %d, got %d", dataOffset, entry.DataOffset)
 		}
 
-		// Verify content size was updated to reflect the compacted data
-		expectedSize := LeafHeaderSize
-		for _, entry := range leafPage.Entries {
-			expectedSize += varint.Size(uint64(entry.SuffixLen)) + entry.SuffixLen + 8
-		}
-		if int(leafPage.ContentSize) != expectedSize {
-			t.Errorf("Expected content size %d after compaction, got %d", expectedSize, leafPage.ContentSize)
-		}
-	})
-
-	t.Run("RebuildDataCompaction", func(t *testing.T) {
-		// Create a new leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
-		}
-
-		// Add entries
-		testEntries := []struct {
-			suffix     []byte
-			dataOffset int64
-		}{
-			{[]byte("entry1"), 1000},
-			{[]byte("entry2"), 2000},
-			{[]byte("entry3"), 3000},
-			{[]byte("entry4"), 4000},
-		}
-
-		for _, testEntry := range testEntries {
-			err = db.addLeafEntry(leafPage, testEntry.suffix, testEntry.dataOffset)
-			if err != nil {
-				t.Fatalf("Failed to add entry: %v", err)
-			}
-		}
-
-		// Simulate fragmentation by manually modifying page data (add garbage after entries)
-		// This tests that rebuild properly compacts the data
-
-		// Store original data before "fragmentation"
-		originalEntries := make([]LeafEntry, len(leafPage.Entries))
-		copy(originalEntries, leafPage.Entries)
-
-		// Create some fake fragmentation by writing garbage to unused parts of the page
-		garbageStart := int(leafPage.ContentSize)
-		garbageEnd := garbageStart + 100
-		if garbageEnd < PageSize {
-			for i := garbageStart; i < garbageEnd; i++ {
-				leafPage.data[i] = 0xFF // Fill with garbage
-			}
-		}
-
-		// Rebuild the page
-		db.rebuildLeafPageData(leafPage)
-
-		// Verify all entries are still correct after rebuild
-		if len(leafPage.Entries) != len(testEntries) {
-			t.Errorf("Expected %d entries after rebuild, got %d", len(testEntries), len(leafPage.Entries))
-		}
-
-		for i, testEntry := range testEntries {
-			entry := leafPage.Entries[i]
-			entrySuffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-			if !bytes.Equal(entrySuffix, testEntry.suffix) {
-				t.Errorf("Entry %d: expected suffix %v, got %v", i, testEntry.suffix, entrySuffix)
-			}
-			if entry.DataOffset != testEntry.dataOffset {
-				t.Errorf("Entry %d: expected data offset %d, got %d", i, testEntry.dataOffset, entry.DataOffset)
-			}
-		}
-
-		// Verify that the data is now compact (no garbage between entries)
-		pos := int(LeafHeaderSize)
-		for i, entry := range leafPage.Entries {
-			// Check that entry starts at expected position
-			if entry.SuffixOffset != pos + varint.Size(uint64(entry.SuffixLen)) {
-				t.Errorf("Entry %d suffix offset not compact: expected around %d, got %d", i, pos, entry.SuffixOffset)
-			}
-
-			// Move to next entry position
-			pos += varint.Size(uint64(entry.SuffixLen)) + entry.SuffixLen + 8
+		// Verify the suffix is correct
+		if entry.SuffixLen != len(suffix) {
+			t.Errorf("Expected suffix length %d, got %d", len(suffix), entry.SuffixLen)
 		}
 	})
 }
+
+// Note: TestRebuildLeafPageData was removed because rebuildLeafPageData function no longer exists.
+// The functionality has been replaced by updateLeafPage which is tested in TestUpdateLeafPage.
 
 // ------------------------------------------------------------------------------------------------
 // Radix page tests
@@ -4239,6 +4596,302 @@ func TestGetRadixEntry(t *testing.T) {
 						op, byteValue, expected.nextSubPageIdx, nextSubPageIdx)
 				}
 			}
+		}
+	})
+}
+
+// TestCreatePathForByte tests the createPathForByte function with the new multi-sub-page format
+func TestCreatePathForByte(t *testing.T) {
+	// Create a temporary database for testing
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test_createpathforbyte.db")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Start a transaction
+	db.beginTransaction()
+	defer db.commitTransaction()
+
+	t.Run("CreatePathForEmptySuffix", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data - key where we're at the last byte (empty suffix after this byte)
+		key := []byte("test")
+		keyPos := 3 // Last position, so suffix after this byte is empty
+		dataOffset := int64(1000)
+
+		// Call createPathForByte
+		err = db.createPathForByte(radixSubPage, key, keyPos, dataOffset)
+		if err != nil {
+			t.Fatalf("Failed to create path for byte: %v", err)
+		}
+
+		// Verify a radix entry was created for the byte 't' (key[3])
+		byteValue := key[keyPos]
+		childPageNumber, childSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if childPageNumber == 0 {
+			t.Error("Expected radix entry to be created for the byte")
+		}
+
+		// Verify the child is a radix sub-page with empty suffix offset set
+		childRadixSubPage, err := db.getRadixSubPage(childPageNumber, childSubPageIdx)
+		if err != nil {
+			t.Fatalf("Failed to get child radix sub-page: %v", err)
+		}
+
+		emptySuffixOffset := db.getEmptySuffixOffset(childRadixSubPage)
+		if emptySuffixOffset != dataOffset {
+			t.Errorf("Expected empty suffix offset %d, got %d", dataOffset, emptySuffixOffset)
+		}
+	})
+
+	t.Run("CreatePathForNonEmptySuffix", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data - key where we have remaining suffix after this byte
+		key := []byte("testing")
+		keyPos := 3 // Position 't', so suffix is "ing"
+		dataOffset := int64(2000)
+
+		// Call createPathForByte
+		err = db.createPathForByte(radixSubPage, key, keyPos, dataOffset)
+		if err != nil {
+			t.Fatalf("Failed to create path for byte: %v", err)
+		}
+
+		// Verify a radix entry was created for the byte 't' (key[3])
+		byteValue := key[keyPos]
+		childPageNumber, childSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if childPageNumber == 0 {
+			t.Error("Expected radix entry to be created for the byte")
+		}
+
+		// Verify the child is a leaf sub-page with the suffix "ing"
+		childLeafSubPage, err := db.getLeafSubPage(childPageNumber, childSubPageIdx)
+		if err != nil {
+			t.Fatalf("Failed to get child leaf sub-page: %v", err)
+		}
+
+		// Verify the leaf sub-page has the correct entry
+		subPageInfo := childLeafSubPage.Page.SubPages[childLeafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Fatalf("Expected 1 entry in leaf sub-page, got %d", len(subPageInfo.Entries))
+		}
+
+		entry := subPageInfo.Entries[0]
+		if entry.DataOffset != dataOffset {
+			t.Errorf("Expected data offset %d, got %d", dataOffset, entry.DataOffset)
+		}
+
+		// Verify the suffix is correct
+		expectedSuffix := key[keyPos+1:] // "ing"
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+		suffixOffset := subPageDataStart + entry.SuffixOffset
+		actualSuffix := childLeafSubPage.Page.data[suffixOffset:suffixOffset+entry.SuffixLen]
+		if !bytes.Equal(actualSuffix, expectedSuffix) {
+			t.Errorf("Expected suffix %v, got %v", expectedSuffix, actualSuffix)
+		}
+	})
+
+	t.Run("CreatePathForSingleCharacterSuffix", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data - key where we have a single character suffix
+		key := []byte("ab")
+		keyPos := 0 // Position 'a', so suffix is "b"
+		dataOffset := int64(3000)
+
+		// Call createPathForByte
+		err = db.createPathForByte(radixSubPage, key, keyPos, dataOffset)
+		if err != nil {
+			t.Fatalf("Failed to create path for byte: %v", err)
+		}
+
+		// Verify a radix entry was created for the byte 'a' (key[0])
+		byteValue := key[keyPos]
+		childPageNumber, childSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if childPageNumber == 0 {
+			t.Error("Expected radix entry to be created for the byte")
+		}
+
+		// Verify the child is a leaf sub-page with the suffix "b"
+		childLeafSubPage, err := db.getLeafSubPage(childPageNumber, childSubPageIdx)
+		if err != nil {
+			t.Fatalf("Failed to get child leaf sub-page: %v", err)
+		}
+
+		// Verify the leaf sub-page has the correct entry
+		subPageInfo := childLeafSubPage.Page.SubPages[childLeafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Fatalf("Expected 1 entry in leaf sub-page, got %d", len(subPageInfo.Entries))
+		}
+
+		entry := subPageInfo.Entries[0]
+		if entry.DataOffset != dataOffset {
+			t.Errorf("Expected data offset %d, got %d", dataOffset, entry.DataOffset)
+		}
+
+		// Verify the suffix is "b"
+		expectedSuffix := []byte("b")
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+		suffixOffset := subPageDataStart + entry.SuffixOffset
+		actualSuffix := childLeafSubPage.Page.data[suffixOffset:suffixOffset+entry.SuffixLen]
+		if !bytes.Equal(actualSuffix, expectedSuffix) {
+			t.Errorf("Expected suffix %v, got %v", expectedSuffix, actualSuffix)
+		}
+	})
+
+	t.Run("CreatePathForLongSuffix", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data - key with a long suffix
+		key := []byte("prefix_very_long_suffix_that_should_be_stored_in_leaf")
+		keyPos := 6 // Position '_', so suffix is "very_long_suffix_that_should_be_stored_in_leaf"
+		dataOffset := int64(4000)
+
+		// Call createPathForByte
+		err = db.createPathForByte(radixSubPage, key, keyPos, dataOffset)
+		if err != nil {
+			t.Fatalf("Failed to create path for byte: %v", err)
+		}
+
+		// Verify a radix entry was created for the byte '_' (key[6])
+		byteValue := key[keyPos]
+		childPageNumber, childSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+		if childPageNumber == 0 {
+			t.Error("Expected radix entry to be created for the byte")
+		}
+
+		// Verify the child is a leaf sub-page with the long suffix
+		childLeafSubPage, err := db.getLeafSubPage(childPageNumber, childSubPageIdx)
+		if err != nil {
+			t.Fatalf("Failed to get child leaf sub-page: %v", err)
+		}
+
+		// Verify the leaf sub-page has the correct entry
+		subPageInfo := childLeafSubPage.Page.SubPages[childLeafSubPage.SubPageIdx]
+		if len(subPageInfo.Entries) != 1 {
+			t.Fatalf("Expected 1 entry in leaf sub-page, got %d", len(subPageInfo.Entries))
+		}
+
+		entry := subPageInfo.Entries[0]
+		if entry.DataOffset != dataOffset {
+			t.Errorf("Expected data offset %d, got %d", dataOffset, entry.DataOffset)
+		}
+
+		// Verify the long suffix is correct
+		expectedSuffix := key[keyPos+1:] // "very_long_suffix_that_should_be_stored_in_leaf"
+		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+		suffixOffset := subPageDataStart + entry.SuffixOffset
+		actualSuffix := childLeafSubPage.Page.data[suffixOffset:suffixOffset+entry.SuffixLen]
+		if !bytes.Equal(actualSuffix, expectedSuffix) {
+			t.Errorf("Expected suffix %v, got %v", expectedSuffix, actualSuffix)
+		}
+	})
+
+	t.Run("CreatePathForDifferentByteValues", func(t *testing.T) {
+		// Create a radix sub-page
+		radixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Test data - different byte values
+		testCases := []struct {
+			key       []byte
+			keyPos    int
+			dataOffset int64
+		}{
+			{[]byte("a_suffix"), 0, 5000}, // byte 'a'
+			{[]byte("z_suffix"), 0, 6000}, // byte 'z'
+			{[]byte{0x00, 's', 'u', 'f', 'f', 'i', 'x'}, 0, 7000}, // byte 0x00
+			{[]byte{0xFF, 's', 'u', 'f', 'f', 'i', 'x'}, 0, 8000}, // byte 0xFF
+			{[]byte("A_suffix"), 0, 9000}, // byte 'A' (uppercase)
+		}
+
+		for i, testCase := range testCases {
+			err = db.createPathForByte(radixSubPage, testCase.key, testCase.keyPos, testCase.dataOffset)
+			if err != nil {
+				t.Fatalf("Test case %d: failed to create path for byte: %v", i, err)
+			}
+
+			// Verify the radix entry was created
+			byteValue := testCase.key[testCase.keyPos]
+			childPageNumber, childSubPageIdx := db.getRadixEntry(radixSubPage, byteValue)
+			if childPageNumber == 0 {
+				t.Errorf("Test case %d: expected radix entry to be created for byte %d", i, byteValue)
+			}
+
+			// Verify the child is a leaf sub-page with the correct suffix
+			childLeafSubPage, err := db.getLeafSubPage(childPageNumber, childSubPageIdx)
+			if err != nil {
+				t.Fatalf("Test case %d: failed to get child leaf sub-page: %v", i, err)
+			}
+
+			subPageInfo := childLeafSubPage.Page.SubPages[childLeafSubPage.SubPageIdx]
+			if len(subPageInfo.Entries) != 1 {
+				t.Fatalf("Test case %d: expected 1 entry in leaf sub-page, got %d", i, len(subPageInfo.Entries))
+			}
+
+			entry := subPageInfo.Entries[0]
+			if entry.DataOffset != testCase.dataOffset {
+				t.Errorf("Test case %d: expected data offset %d, got %d", i, testCase.dataOffset, entry.DataOffset)
+			}
+		}
+	})
+
+	t.Run("CreatePathUpdatesParentPointer", func(t *testing.T) {
+		// Create a radix sub-page
+		originalRadixSubPage, err := db.allocateRadixSubPage()
+		if err != nil {
+			t.Fatalf("Failed to allocate radix sub-page: %v", err)
+		}
+
+		// Store the original page number
+		originalPageNumber := originalRadixSubPage.Page.pageNumber
+
+		// Test data
+		key := []byte("test_update")
+		keyPos := 4 // Position '_', so suffix is "update"
+		dataOffset := int64(10000)
+
+		// Call createPathForByte
+		err = db.createPathForByte(originalRadixSubPage, key, keyPos, dataOffset)
+		if err != nil {
+			t.Fatalf("Failed to create path for byte: %v", err)
+		}
+
+		// Verify the function might have updated the page pointer due to cloning
+		// The page number should remain the same, but the page instance might be different
+		if originalRadixSubPage.Page.pageNumber != originalPageNumber {
+			t.Errorf("Expected page number to remain %d, got %d", originalPageNumber, originalRadixSubPage.Page.pageNumber)
+		}
+
+		// Verify the radix entry was still created correctly
+		byteValue := key[keyPos]
+		childPageNumber, _ := db.getRadixEntry(originalRadixSubPage, byteValue)
+		if childPageNumber == 0 {
+			t.Error("Expected radix entry to be created for the byte")
 		}
 	})
 }
@@ -5204,15 +5857,22 @@ func TestWriteLeafPage(t *testing.T) {
 		}
 		defer db.Close()
 
-		// Create a leaf page with some test data
+		// Create a leaf page with some test data using the new sub-page format
 		leafPage := &LeafPage{
 			pageNumber:  2,
 			pageType:    ContentTypeLeaf,
 			data:        make([]byte, PageSize),
 			dirty:       true,
 			ContentSize: 20,
+			SubPages:    make([]*LeafSubPageInfo, 256),
+		}
+
+		// Add a sample sub-page to test with
+		leafPage.SubPages[0] = &LeafSubPageInfo{
+			Offset:  8,
+			Size:    12,
 			Entries: []LeafEntry{
-				{SuffixOffset: 8, SuffixLen: 4, DataOffset: 1000},
+				{SuffixOffset: 0, SuffixLen: 4, DataOffset: 1000},
 			},
 		}
 
@@ -5262,7 +5922,7 @@ func TestWriteLeafPage(t *testing.T) {
 			data:        make([]byte, PageSize),
 			dirty:       true,
 			ContentSize: 8,
-			Entries:     []LeafEntry{},
+			SubPages:    make([]*LeafSubPageInfo, 256),
 		}
 
 		// Write should fail for page number 0
@@ -5293,7 +5953,7 @@ func TestWriteLeafPage(t *testing.T) {
 			data:        make([]byte, PageSize),
 			dirty:       true,
 			ContentSize: uint16(PageSize - 1), // Near maximum
-			Entries:     []LeafEntry{},
+			SubPages:    make([]*LeafSubPageInfo, 256),
 		}
 
 		// Write should succeed
@@ -5470,311 +6130,6 @@ func TestParseRadixPage(t *testing.T) {
 		}
 		if cachedPage.pageType != ContentTypeRadix {
 			t.Error("Expected cached page to be radix type")
-		}
-	})
-}
-
-// TestParseLeafPage tests the parseLeafPage function
-func TestParseLeafPage(t *testing.T) {
-	t.Run("ParseValidLeafPage", func(t *testing.T) {
-		// Create a test database
-		tmpFile := createTempFile(t)
-		defer os.Remove(tmpFile)
-
-		db, err := Open(tmpFile)
-		if err != nil {
-			t.Fatalf("Failed to open database: %v", err)
-		}
-		defer db.Close()
-
-		// Create test data for a leaf page
-		data := make([]byte, PageSize)
-		data[0] = ContentTypeLeaf     // Content type
-		data[1] = 0                   // Unused byte
-		binary.LittleEndian.PutUint16(data[2:4], 16) // ContentSize = header size (8) + one minimal entry (8)
-
-		// Add a simple entry after the header (starting at position 8)
-		pos := 8
-		// Add suffix length (varint: 1 byte for value 3)
-		data[pos] = 3 // suffix length = 3
-		pos++
-		// Add suffix
-		copy(data[pos:pos+3], []byte("key"))
-		pos += 3
-		// Add data offset (8 bytes)
-		binary.LittleEndian.PutUint64(data[pos:pos+8], 1000)
-		pos += 8
-
-		// Calculate and set checksum (checksum field is at position 4-8)
-		binary.BigEndian.PutUint32(data[4:8], 0) // Zero out checksum field
-		checksum := crc32.ChecksumIEEE(data)
-		binary.BigEndian.PutUint32(data[4:8], checksum)
-
-		// Parse the leaf page
-		leafPage, err := db.parseLeafPage(data, 7)
-		if err != nil {
-			t.Fatalf("Failed to parse leaf page: %v", err)
-		}
-
-		// Verify parsed fields
-		if leafPage.pageNumber != 7 {
-			t.Errorf("Expected page number 7, got %d", leafPage.pageNumber)
-		}
-
-		if leafPage.pageType != ContentTypeLeaf {
-			t.Errorf("Expected page type %c, got %c", ContentTypeLeaf, leafPage.pageType)
-		}
-
-		if leafPage.ContentSize != 16 {
-			t.Errorf("Expected ContentSize 16, got %d", leafPage.ContentSize)
-		}
-
-		if len(leafPage.Entries) != 1 {
-			t.Errorf("Expected 1 entry, got %d", len(leafPage.Entries))
-		}
-
-		// Verify the parsed entry
-		entry := leafPage.Entries[0]
-		if entry.SuffixLen != 3 {
-			t.Errorf("Expected suffix length 3, got %d", entry.SuffixLen)
-		}
-
-		if entry.DataOffset != 1000 {
-			t.Errorf("Expected data offset 1000, got %d", entry.DataOffset)
-		}
-
-		// Verify suffix content
-		suffix := leafPage.data[entry.SuffixOffset:entry.SuffixOffset+entry.SuffixLen]
-		if !bytes.Equal(suffix, []byte("key")) {
-			t.Errorf("Expected suffix 'key', got %s", suffix)
-		}
-
-		if leafPage.dirty {
-			t.Error("Expected parsed page to not be dirty")
-		}
-
-		if leafPage.accessTime == 0 {
-			t.Error("Expected access time to be set")
-		}
-	})
-
-	t.Run("ParseLeafPageWrongType", func(t *testing.T) {
-		// Create a test database
-		tmpFile := createTempFile(t)
-		defer os.Remove(tmpFile)
-
-		db, err := Open(tmpFile)
-		if err != nil {
-			t.Fatalf("Failed to open database: %v", err)
-		}
-		defer db.Close()
-
-		// Create test data with wrong content type
-		data := make([]byte, PageSize)
-		data[0] = ContentTypeRadix    // Wrong type for leaf page
-		binary.LittleEndian.PutUint16(data[2:4], 8) // ContentSize
-
-		// Calculate and set checksum
-		binary.BigEndian.PutUint32(data[4:8], 0)
-		checksum := crc32.ChecksumIEEE(data)
-		binary.BigEndian.PutUint32(data[4:8], checksum)
-
-		// Parse should fail
-		_, err = db.parseLeafPage(data, 1)
-		if err == nil {
-			t.Error("Expected error for wrong content type, got nil")
-		}
-		if !strings.Contains(err.Error(), "not a leaf page") {
-			t.Errorf("Expected 'not a leaf page' error, got: %v", err)
-		}
-	})
-
-	t.Run("ParseLeafPageBadChecksum", func(t *testing.T) {
-		// Create a test database
-		tmpFile := createTempFile(t)
-		defer os.Remove(tmpFile)
-
-		db, err := Open(tmpFile)
-		if err != nil {
-			t.Fatalf("Failed to open database: %v", err)
-		}
-		defer db.Close()
-
-		// Create test data with bad checksum
-		data := make([]byte, PageSize)
-		data[0] = ContentTypeLeaf
-		binary.LittleEndian.PutUint16(data[2:4], 8) // ContentSize
-		binary.BigEndian.PutUint32(data[4:8], 0xCAFEBABE) // Wrong checksum
-
-		// Parse should fail
-		_, err = db.parseLeafPage(data, 1)
-		if err == nil {
-			t.Error("Expected error for bad checksum, got nil")
-		}
-		if !strings.Contains(err.Error(), "checksum mismatch") {
-			t.Errorf("Expected 'checksum mismatch' error, got: %v", err)
-		}
-	})
-
-	t.Run("ParseLeafPageEmptyContent", func(t *testing.T) {
-		// Create a test database
-		tmpFile := createTempFile(t)
-		defer os.Remove(tmpFile)
-
-		db, err := Open(tmpFile)
-		if err != nil {
-			t.Fatalf("Failed to open database: %v", err)
-		}
-		defer db.Close()
-
-		// Create test data for empty leaf page (only header)
-		data := make([]byte, PageSize)
-		data[0] = ContentTypeLeaf
-		binary.LittleEndian.PutUint16(data[2:4], LeafHeaderSize) // Only header content
-
-		// Calculate and set checksum
-		binary.BigEndian.PutUint32(data[4:8], 0)
-		checksum := crc32.ChecksumIEEE(data)
-		binary.BigEndian.PutUint32(data[4:8], checksum)
-
-		// Parse should succeed
-		leafPage, err := db.parseLeafPage(data, 1)
-		if err != nil {
-			t.Fatalf("Failed to parse empty leaf page: %v", err)
-		}
-
-		// Verify empty page properties
-		if leafPage.ContentSize != LeafHeaderSize {
-			t.Errorf("Expected ContentSize %d, got %d", LeafHeaderSize, leafPage.ContentSize)
-		}
-
-		if len(leafPage.Entries) != 0 {
-			t.Errorf("Expected 0 entries in empty page, got %d", len(leafPage.Entries))
-		}
-	})
-
-	t.Run("ParseLeafPageMultipleEntries", func(t *testing.T) {
-		// Create a test database
-		tmpFile := createTempFile(t)
-		defer os.Remove(tmpFile)
-
-		db, err := Open(tmpFile)
-		if err != nil {
-			t.Fatalf("Failed to open database: %v", err)
-		}
-		defer db.Close()
-
-		// Create test data for a leaf page with multiple entries
-		data := make([]byte, PageSize)
-		data[0] = ContentTypeLeaf
-
-		pos := LeafHeaderSize
-
-		// Add first entry
-		data[pos] = 4 // suffix length
-		pos++
-		copy(data[pos:pos+4], []byte("key1"))
-		pos += 4
-		binary.LittleEndian.PutUint64(data[pos:pos+8], 2000)
-		pos += 8
-
-		// Add second entry
-		data[pos] = 4 // suffix length
-		pos++
-		copy(data[pos:pos+4], []byte("key2"))
-		pos += 4
-		binary.LittleEndian.PutUint64(data[pos:pos+8], 3000)
-		pos += 8
-
-		// Set content size
-		binary.LittleEndian.PutUint16(data[2:4], uint16(pos))
-
-		// Calculate and set checksum
-		binary.BigEndian.PutUint32(data[4:8], 0)
-		checksum := crc32.ChecksumIEEE(data)
-		binary.BigEndian.PutUint32(data[4:8], checksum)
-
-		// Parse the leaf page
-		leafPage, err := db.parseLeafPage(data, 1)
-		if err != nil {
-			t.Fatalf("Failed to parse leaf page with multiple entries: %v", err)
-		}
-
-		// Verify parsed entries
-		if len(leafPage.Entries) != 2 {
-			t.Errorf("Expected 2 entries, got %d", len(leafPage.Entries))
-		}
-
-		// Verify first entry
-		entry1 := leafPage.Entries[0]
-		if entry1.SuffixLen != 4 {
-			t.Errorf("Expected first entry suffix length 4, got %d", entry1.SuffixLen)
-		}
-		if entry1.DataOffset != 2000 {
-			t.Errorf("Expected first entry data offset 2000, got %d", entry1.DataOffset)
-		}
-		suffix1 := leafPage.data[entry1.SuffixOffset:entry1.SuffixOffset+entry1.SuffixLen]
-		if !bytes.Equal(suffix1, []byte("key1")) {
-			t.Errorf("Expected first entry suffix 'key1', got %s", suffix1)
-		}
-
-		// Verify second entry
-		entry2 := leafPage.Entries[1]
-		if entry2.SuffixLen != 4 {
-			t.Errorf("Expected second entry suffix length 4, got %d", entry2.SuffixLen)
-		}
-		if entry2.DataOffset != 3000 {
-			t.Errorf("Expected second entry data offset 3000, got %d", entry2.DataOffset)
-		}
-		suffix2 := leafPage.data[entry2.SuffixOffset:entry2.SuffixOffset+entry2.SuffixLen]
-		if !bytes.Equal(suffix2, []byte("key2")) {
-			t.Errorf("Expected second entry suffix 'key2', got %s", suffix2)
-		}
-	})
-
-	t.Run("ParseLeafPageAddsToCache", func(t *testing.T) {
-		// Create a test database
-		tmpFile := createTempFile(t)
-		defer os.Remove(tmpFile)
-
-		db, err := Open(tmpFile)
-		if err != nil {
-			t.Fatalf("Failed to open database: %v", err)
-		}
-		defer db.Close()
-
-		// Get initial cache count
-		initialCacheCount := db.totalCachePages.Load()
-
-		// Create valid test data
-		data := make([]byte, PageSize)
-		data[0] = ContentTypeLeaf
-		binary.LittleEndian.PutUint16(data[2:4], LeafHeaderSize)
-
-		// Calculate and set checksum
-		binary.BigEndian.PutUint32(data[4:8], 0)
-		checksum := crc32.ChecksumIEEE(data)
-		binary.BigEndian.PutUint32(data[4:8], checksum)
-
-		// Parse the page
-		_, err = db.parseLeafPage(data, 25)
-		if err != nil {
-			t.Fatalf("Failed to parse leaf page: %v", err)
-		}
-
-		// Verify page was added to cache
-		newCacheCount := db.totalCachePages.Load()
-		if newCacheCount <= initialCacheCount {
-			t.Error("Expected cache count to increase after parsing page")
-		}
-
-		// Verify we can get the page from cache
-		cachedPage, exists := db.getFromCache(25)
-		if !exists {
-			t.Error("Expected page to be in cache")
-		}
-		if cachedPage.pageType != ContentTypeLeaf {
-			t.Error("Expected cached page to be leaf type")
 		}
 	})
 }
@@ -6074,7 +6429,7 @@ func TestCloneRadixPage(t *testing.T) {
 	}
 }
 
-// TestCloneLeafPage tests the cloneLeafPage function
+// TestCloneLeafPage tests the cloneLeafPage function with the new multi-sub-page format
 func TestCloneLeafPage(t *testing.T) {
 	// Create a temporary database for testing
 	tmpDir := t.TempDir()
@@ -6090,17 +6445,25 @@ func TestCloneLeafPage(t *testing.T) {
 	db.beginTransaction()
 	defer db.commitTransaction()
 
-	// Create a leaf page with some data
+	// Create a leaf page with some data using the new format
 	originalPage, err := db.allocateLeafPage()
 	if err != nil {
 		t.Fatalf("Failed to allocate leaf page: %v", err)
 	}
 
-	// Add some entries to the page
-	err = db.addLeafEntry(originalPage, []byte("test_suffix"), 1000)
+	// Add some sub-pages with entries to the page using the new format
+	leafSubPage1, err := db.addEntryToNewLeafSubPage([]byte("test_suffix_1"), 1000)
 	if err != nil {
-		t.Fatalf("Failed to add leaf entry: %v", err)
+		t.Fatalf("Failed to add first leaf sub-page: %v", err)
 	}
+
+	_, err = db.addEntryToNewLeafSubPage([]byte("test_suffix_2"), 2000)
+	if err != nil {
+		t.Fatalf("Failed to add second leaf sub-page: %v", err)
+	}
+
+	// Use the page from one of the sub-pages as our original page
+	originalPage = leafSubPage1.Page
 
 	// Set some test values
 	originalPage.ContentSize = 100
@@ -6153,9 +6516,26 @@ func TestCloneLeafPage(t *testing.T) {
 		t.Errorf("ContentSize not copied: expected %d, got %d", originalPage.ContentSize, clonedPage.ContentSize)
 	}
 
-	// Verify entries are copied
-	if len(clonedPage.Entries) != len(originalPage.Entries) {
-		t.Errorf("Entries not copied correctly: expected %d entries, got %d", len(originalPage.Entries), len(clonedPage.Entries))
+	// Verify SubPages array is properly initialized
+	if len(clonedPage.SubPages) != 256 {
+		t.Errorf("SubPages array not properly initialized: expected 256 slots, got %d", len(clonedPage.SubPages))
+	}
+
+	// Count non-nil sub-pages in both original and cloned pages
+	originalSubPageCount := 0
+	clonedSubPageCount := 0
+	for i := 0; i < 256; i++ {
+		if originalPage.SubPages[i] != nil {
+			originalSubPageCount++
+		}
+		if clonedPage.SubPages[i] != nil {
+			clonedSubPageCount++
+		}
+	}
+
+	// Verify sub-pages are copied
+	if clonedSubPageCount != originalSubPageCount {
+		t.Errorf("Sub-pages not copied correctly: expected %d sub-pages, got %d", originalSubPageCount, clonedSubPageCount)
 	}
 
 	// Verify data is copied (deep copy)
@@ -6183,26 +6563,73 @@ func TestCloneLeafPage(t *testing.T) {
 		t.Error("Original page should be linked from cloned page")
 	}
 
-	// Check that entry data is correctly copied
-	if len(originalPage.Entries) > 0 && len(clonedPage.Entries) > 0 {
-		originalEntry := originalPage.Entries[0]
-		clonedEntry := clonedPage.Entries[0]
+	// Check that sub-page data is correctly copied
+	for i := 0; i < 256; i++ {
+		originalSubPage := originalPage.SubPages[i]
+		clonedSubPage := clonedPage.SubPages[i]
 
-		// Verify entry data offset
-		if clonedEntry.DataOffset != originalEntry.DataOffset {
-			t.Errorf("Entry DataOffset not copied: expected %d, got %d", originalEntry.DataOffset, clonedEntry.DataOffset)
+		// Both should be nil or both should be non-nil
+		if (originalSubPage == nil) != (clonedSubPage == nil) {
+			t.Errorf("Sub-page %d mismatch: original is nil=%v, cloned is nil=%v", i, originalSubPage == nil, clonedSubPage == nil)
+			continue
 		}
 
-		// Verify entry suffix length
-		if clonedEntry.SuffixLen != originalEntry.SuffixLen {
-			t.Errorf("Entry SuffixLen not copied: expected %d, got %d", originalEntry.SuffixLen, clonedEntry.SuffixLen)
-		}
+		if originalSubPage != nil && clonedSubPage != nil {
+			// Verify sub-page metadata is copied
+			if clonedSubPage.Offset != originalSubPage.Offset {
+				t.Errorf("Sub-page %d offset not copied: expected %d, got %d", i, originalSubPage.Offset, clonedSubPage.Offset)
+			}
 
-		// Verify suffix content is correctly copied
-		originalSuffix := originalPage.data[originalEntry.SuffixOffset:originalEntry.SuffixOffset+originalEntry.SuffixLen]
-		clonedSuffix := clonedPage.data[clonedEntry.SuffixOffset:clonedEntry.SuffixOffset+clonedEntry.SuffixLen]
-		if !bytes.Equal(clonedSuffix, originalSuffix) {
-			t.Errorf("Entry suffix not copied correctly: expected %v, got %v", originalSuffix, clonedSuffix)
+			if clonedSubPage.Size != originalSubPage.Size {
+				t.Errorf("Sub-page %d size not copied: expected %d, got %d", i, originalSubPage.Size, clonedSubPage.Size)
+			}
+
+			// Verify entries are copied
+			if len(clonedSubPage.Entries) != len(originalSubPage.Entries) {
+				t.Errorf("Sub-page %d entries not copied correctly: expected %d entries, got %d", i, len(originalSubPage.Entries), len(clonedSubPage.Entries))
+			}
+
+			// Verify entry details are copied
+			for j, originalEntry := range originalSubPage.Entries {
+				if j < len(clonedSubPage.Entries) {
+					clonedEntry := clonedSubPage.Entries[j]
+
+					if clonedEntry.DataOffset != originalEntry.DataOffset {
+						t.Errorf("Sub-page %d entry %d DataOffset not copied: expected %d, got %d", i, j, originalEntry.DataOffset, clonedEntry.DataOffset)
+					}
+
+					if clonedEntry.SuffixLen != originalEntry.SuffixLen {
+						t.Errorf("Sub-page %d entry %d SuffixLen not copied: expected %d, got %d", i, j, originalEntry.SuffixLen, clonedEntry.SuffixLen)
+					}
+
+					if clonedEntry.SuffixOffset != originalEntry.SuffixOffset {
+						t.Errorf("Sub-page %d entry %d SuffixOffset not copied: expected %d, got %d", i, j, originalEntry.SuffixOffset, clonedEntry.SuffixOffset)
+					}
+				}
+			}
+		}
+	}
+
+	// Verify that sub-page data content is correctly copied in the page data
+	for i := 0; i < 256; i++ {
+		originalSubPage := originalPage.SubPages[i]
+		clonedSubPage := clonedPage.SubPages[i]
+
+		if originalSubPage != nil && clonedSubPage != nil {
+			for _, entry := range originalSubPage.Entries {
+				// Read suffix from both pages
+				originalStart := int(originalSubPage.Offset) + 3 + entry.SuffixOffset
+				originalEnd := originalStart + entry.SuffixLen
+				clonedStart := int(clonedSubPage.Offset) + 3 + entry.SuffixOffset
+				clonedEnd := clonedStart + entry.SuffixLen
+
+				originalSuffix := originalPage.data[originalStart:originalEnd]
+				clonedSuffix := clonedPage.data[clonedStart:clonedEnd]
+
+				if !bytes.Equal(clonedSuffix, originalSuffix) {
+					t.Errorf("Sub-page %d entry suffix not copied correctly: expected %v, got %v", i, originalSuffix, clonedSuffix)
+				}
+			}
 		}
 	}
 }

@@ -3868,6 +3868,11 @@ func (db *DB) removeEntryFromLeafSubPage(subPage *LeafSubPage, entryIdx int) err
 	}
 	subPageInfo := leafPage.SubPages[subPageIdx]
 
+	// Validate the entry index
+	if entryIdx < 0 || entryIdx >= len(subPageInfo.Entries) {
+		return fmt.Errorf("entry index %d out of bounds (0-%d)", entryIdx, len(subPageInfo.Entries)-1)
+	}
+
 	// Create a new entries list without this entry
 	newEntries := make([]LeafEntry, 0, len(subPageInfo.Entries)-1)
 	newEntries = append(newEntries, subPageInfo.Entries[:entryIdx]...)
@@ -3942,6 +3947,11 @@ func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryIdx int, dataO
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
 	subPageInfo := leafPage.SubPages[subPageIdx]
+
+	// Validate the entry index
+	if entryIdx < 0 || entryIdx >= len(subPageInfo.Entries) {
+		return fmt.Errorf("entry index %d out of bounds (0-%d)", entryIdx, len(subPageInfo.Entries)-1)
+	}
 
 	// Create a new entries list with the updated entry
 	newEntries := make([]LeafEntry, len(subPageInfo.Entries))
