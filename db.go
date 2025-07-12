@@ -657,6 +657,11 @@ func (db *DB) Close() error {
 	}
 
 	if !db.readOnly {
+		// If there's an open transaction, rollback before closing
+		if db.inTransaction {
+			db.rollbackTransaction()
+		}
+
 		// If using worker thread mode
 		if db.commitMode == WorkerThread {
 			// Signal the worker thread to flush the index to disk, even if
