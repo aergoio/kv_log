@@ -3439,7 +3439,11 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 	currentPageNum := db.freeLeafPagesHead
 	var prevPage *LeafPage = nil
 
+	debugPrint("Allocating leaf page with enough space: %d bytes\n", spaceNeeded)
+
 	for currentPageNum > 0 {
+		debugPrint("Checking page %d\n", currentPageNum)
+
 		// Get the current page
 		leafPage, err := db.getLeafPage(currentPageNum)
 		if err != nil {
@@ -3468,6 +3472,7 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 				subPageID++
 			}
 			if subPageID == 255 && leafPage.SubPages[subPageID] != nil {
+				debugPrint("No available sub-page IDs, removing page %d from free list\n", leafPage.pageNumber)
 				// No available sub-page IDs, remove this page from the free list and continue to next page
 				nextPageNum := leafPage.NextFreePage
 				if err := db.removeFromFreeLeafPagesList(leafPage, prevPage); err != nil {
@@ -3491,6 +3496,7 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 			// If this page will be full after we use this slot, remove it from the free list
 			if freeSpaceAfter < PageSize/10 || usedSlots >= 255 {
 				// Remove this page from the free list
+				debugPrint("Removing page %d from free list\n", leafPage.pageNumber)
 				if err := db.removeFromFreeLeafPagesList(leafPage, prevPage); err != nil {
 					return nil, fmt.Errorf("failed to remove page from free list: %w", err)
 				}
@@ -3506,6 +3512,7 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 		// Check if it should be removed from the free list (less than 10% free space)
 		if freeSpace < PageSize/10 {
 			// Remove this page from the free list
+			debugPrint("Removing page %d from free list\n", leafPage.pageNumber)
 			nextPageNum := leafPage.NextFreePage
 			if err := db.removeFromFreeLeafPagesList(leafPage, prevPage); err != nil {
 				return nil, fmt.Errorf("failed to remove page from free list: %w", err)
@@ -3525,6 +3532,7 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate new leaf page: %w", err)
 	}
+	debugPrint("Allocated new leaf page %d\n", newLeafPage.pageNumber)
 
 	// Add the new page to the free list since it will have free space after allocation
 	db.addToFreeLeafPagesList(newLeafPage)

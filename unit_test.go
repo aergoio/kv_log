@@ -6633,3 +6633,235 @@ func TestCloneLeafPage(t *testing.T) {
 		}
 	}
 }
+
+func TestMoveSubPageToNewLeafPage(t *testing.T) {
+	// Create a temporary database file
+	dbPath := createTempFile(t)
+	defer os.Remove(dbPath)
+
+	// Open the database
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// Create a leaf page with some existing entries
+	leafPage, err := db.allocateLeafPage()
+	if err != nil {
+		t.Fatalf("Failed to allocate leaf page: %v", err)
+	}
+
+	// Create test data for the existing entries
+	existingEntries := []struct {
+		suffix     []byte
+		dataOffset int64
+	}{
+		{[]byte("entry1"), 1000},
+		{[]byte("entry2"), 2000},
+		{[]byte("entry3"), 3000},
+	}
+
+	// Build the sub-page data manually
+	subPageData := make([]byte, 0, 1000)
+	var leafEntries []LeafEntry
+
+	for _, entry := range existingEntries {
+		// Write suffix length (varint)
+		suffixLenBytes := make([]byte, 10)
+		suffixLenSize := varint.Write(suffixLenBytes, uint64(len(entry.suffix)))
+
+		// Calculate the offset for this entry within the sub-page data
+		suffixOffset := len(subPageData) + suffixLenSize
+
+		// Add the entry to our tracking
+		leafEntries = append(leafEntries, LeafEntry{
+			SuffixOffset: suffixOffset,
+			SuffixLen:    len(entry.suffix),
+			DataOffset:   entry.dataOffset,
+		})
+
+		// Add suffix length to sub-page data
+		subPageData = append(subPageData, suffixLenBytes[:suffixLenSize]...)
+
+		// Add suffix to sub-page data
+		subPageData = append(subPageData, entry.suffix...)
+
+		// Add data offset (8 bytes)
+		offsetBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(offsetBytes, uint64(entry.dataOffset))
+		subPageData = append(subPageData, offsetBytes...)
+	}
+
+	// Add the sub-page to the leaf page
+	subPageIdx := uint8(0)
+	offset := LeafHeaderSize
+
+	// Write sub-page header
+	leafPage.data[offset] = subPageIdx // Sub-page ID
+	binary.LittleEndian.PutUint16(leafPage.data[offset+1:offset+3], uint16(len(subPageData))) // Size
+
+	// Write sub-page data
+	copy(leafPage.data[offset+3:], subPageData)
+
+	// Update leaf page metadata
+	totalSubPageSize := LeafSubPageHeaderSize + len(subPageData)
+	leafPage.ContentSize = uint16(LeafHeaderSize + totalSubPageSize)
+
+	// Initialize SubPages array if needed
+	if leafPage.SubPages == nil {
+		leafPage.SubPages = make([]*LeafSubPageInfo, 256)
+	}
+
+	// Create the sub-page info
+	leafPage.SubPages[subPageIdx] = &LeafSubPageInfo{
+		Offset:  uint16(offset),
+		Size:    uint16(len(subPageData)),
+		Entries: leafEntries,
+	}
+
+	// Mark the page as dirty
+	db.markPageDirty(leafPage)
+
+	// Create a LeafSubPage struct
+	originalSubPage := &LeafSubPage{
+		Page:       leafPage,
+		SubPageIdx: subPageIdx,
+	}
+
+	// Store original page number for verification
+	originalPageNumber := leafPage.pageNumber
+
+	// Test data for the new entry that will trigger the move
+	newSuffix := []byte("new_entry_that_will_trigger_move")
+	newDataOffset := int64(4000)
+
+	// Get the original sub-page info for verification
+	originalSubPageInfo := leafPage.SubPages[subPageIdx]
+	originalEntryCount := len(originalSubPageInfo.Entries)
+
+	// Call the function under test
+	err = db.moveSubPageToNewLeafPage(originalSubPage, newSuffix, newDataOffset)
+	if err != nil {
+		t.Fatalf("moveSubPageToNewLeafPage failed: %v", err)
+	}
+
+	// Verify that the sub-page now points to a different page
+	if originalSubPage.Page.pageNumber == originalPageNumber {
+		t.Error("Expected sub-page to be moved to a new page, but it's still on the original page")
+	}
+
+	// Verify that the new page has the correct structure
+	newPage := originalSubPage.Page
+	newSubPageIdx := originalSubPage.SubPageIdx
+
+	// Check that the new page has the sub-page
+	if newPage.SubPages == nil || newPage.SubPages[newSubPageIdx] == nil {
+		t.Fatal("New page should have the moved sub-page")
+	}
+
+	newSubPageInfo := newPage.SubPages[newSubPageIdx]
+
+	// Verify that the new sub-page has all the original entries plus the new one
+	expectedEntryCount := originalEntryCount + 1
+	if len(newSubPageInfo.Entries) != expectedEntryCount {
+		t.Errorf("Expected %d entries in moved sub-page, got %d", expectedEntryCount, len(newSubPageInfo.Entries))
+	}
+
+	// Verify that the new entry is present
+	foundNewEntry := false
+	for _, entry := range newSubPageInfo.Entries {
+		if entry.DataOffset == newDataOffset {
+			foundNewEntry = true
+
+			// Verify the suffix matches
+			subPageDataStart := int(newSubPageInfo.Offset) + 3 // Skip header
+			suffixStart := subPageDataStart + entry.SuffixOffset
+			actualSuffix := newPage.data[suffixStart:suffixStart+entry.SuffixLen]
+
+			if !bytes.Equal(actualSuffix, newSuffix) {
+				t.Errorf("Expected new entry suffix %s, got %s", string(newSuffix), string(actualSuffix))
+			}
+			break
+		}
+	}
+
+	if !foundNewEntry {
+		t.Error("New entry not found in moved sub-page")
+	}
+
+	// Verify that all original entries are still present
+	for _, originalEntry := range existingEntries {
+		found := false
+		for _, entry := range newSubPageInfo.Entries {
+			if entry.DataOffset == originalEntry.dataOffset {
+				found = true
+
+				// Verify the suffix matches
+				subPageDataStart := int(newSubPageInfo.Offset) + 3 // Skip header
+				suffixStart := subPageDataStart + entry.SuffixOffset
+				actualSuffix := newPage.data[suffixStart:suffixStart+entry.SuffixLen]
+
+				if !bytes.Equal(actualSuffix, originalEntry.suffix) {
+					t.Errorf("Expected original entry suffix %s, got %s", string(originalEntry.suffix), string(actualSuffix))
+				}
+				break
+			}
+		}
+
+		if !found {
+			t.Errorf("Original entry with suffix %s not found in moved sub-page", string(originalEntry.suffix))
+		}
+	}
+
+	// Verify that the original page no longer has the sub-page
+	originalPage, err := db.getLeafPage(originalPageNumber)
+	if err != nil {
+		t.Fatalf("Failed to get original page: %v", err)
+	}
+
+	if originalPage.SubPages != nil && originalPage.SubPages[subPageIdx] != nil {
+		t.Error("Original page should no longer have the moved sub-page")
+	}
+
+	// Verify that the new page is marked as dirty
+	if !newPage.dirty {
+		t.Error("New page should be marked as dirty")
+	}
+
+	// Verify that the new page has reasonable content size
+	if newPage.ContentSize <= LeafHeaderSize {
+		t.Errorf("New page content size should be greater than header size (%d), got %d", LeafHeaderSize, newPage.ContentSize)
+	}
+
+	// Verify that the new page is in the free list (it should have been added)
+	// We can't directly test this without accessing internal state, but we can verify
+	// that the page has reasonable free space
+	freeSpace := PageSize - int(newPage.ContentSize)
+	if freeSpace < PageSize/10 {
+		t.Logf("New page has limited free space: %d bytes", freeSpace)
+	}
+
+	// Test error case: try to move a sub-page that doesn't exist
+	invalidSubPage := &LeafSubPage{
+		Page:       newPage,
+		SubPageIdx: 255, // Invalid index
+	}
+
+	err = db.moveSubPageToNewLeafPage(invalidSubPage, []byte("test"), 5000)
+	if err == nil {
+		t.Error("Expected error when moving non-existent sub-page, but got nil")
+	}
+
+	if !strings.Contains(err.Error(), "sub-page with index 255 not found") {
+		t.Errorf("Expected specific error message for non-existent sub-page, got: %v", err)
+	}
+
+	t.Logf("Successfully tested moveSubPageToNewLeafPage:")
+	t.Logf("  - Original page: %d", originalPageNumber)
+	t.Logf("  - New page: %d", newPage.pageNumber)
+	t.Logf("  - Original entries: %d", originalEntryCount)
+	t.Logf("  - Final entries: %d", len(newSubPageInfo.Entries))
+	t.Logf("  - New page content size: %d", newPage.ContentSize)
+	t.Logf("  - New page free space: %d", freeSpace)
+}

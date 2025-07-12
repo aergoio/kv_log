@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"path/filepath"
 )
 
 func TestDatabaseBasicOperations(t *testing.T) {
@@ -3636,7 +3637,7 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 
 	// Sequential operations that should trigger background worker
 	numTransactions := 5
-	keysPerTransaction := 10
+	keysPerTransaction := 1000
 
 	for txId := 0; txId < numTransactions; txId++ {
 		t.Logf("Starting transaction %d", txId)
@@ -3649,7 +3650,7 @@ func TestBackgroundWorkerWithTransactions(t *testing.T) {
 		// Insert keys that should trigger background worker due to low thresholds
 		for i := 0; i < keysPerTransaction; i++ {
 			key := fmt.Sprintf("tx%d_key%d_with_long_suffix_to_consume_space", txId, i)
-			value := fmt.Sprintf("tx%d_value%d_with_very_long_content_to_make_pages_fill_up_quickly", txId, i)
+			value := fmt.Sprintf("tx%d_value%d_with_long_content_to_consume_space", txId, i)
 
 			err = tx.Set([]byte(key), []byte(value))
 			if err != nil {
@@ -4386,4 +4387,173 @@ func TestLastIndexedOffsetUpdate(t *testing.T) {
 	}
 
 	t.Log("TestLastIndexedOffsetUpdate completed successfully")
+}
+
+// TestFreeListCycle tests for cycles in the free pages linked list
+func TestFreeListCycle(t *testing.T) {
+	// Create a temporary database
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+
+	db, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	keySize := 33
+	valueSize := 750
+	numItems := 100000
+
+	// Pregenerate all keys and values
+	keys := make([][]byte, numItems)
+	values := make([][]byte, numItems)
+
+	for i := 0; i < numItems; i++ {
+		keys[i] = generateDeterministicBytes(i, keySize)
+		values[i] = generateDeterministicBytes(i+23456789, valueSize)
+	}
+
+	// Set using a transaction to trigger the problematic code path
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("Failed to begin transaction: %v", err)
+	}
+
+	// Insert entries one by one - this should trigger the cycle
+	for i := 0; i < numItems; i++ {
+		if i%5000 == 0 {
+			t.Logf("Setting entry %d", i)
+		}
+
+		err := tx.Set(keys[i], values[i])
+		if err != nil {
+			t.Fatalf("Failed to set entry %d: %v", i, err)
+		}
+	}
+
+	// Commit the transaction
+	err = tx.Commit()
+	if err != nil {
+		t.Fatalf("Failed to commit transaction: %v", err)
+	}
+
+	// Verify that all entries can be retrieved
+	for i := 0; i < numItems; i++ {
+		value, err := db.Get(keys[i])
+		if err != nil {
+			t.Fatalf("Failed to get entry %d: %v", i, err)
+		}
+		if !bytes.Equal(value, values[i]) {
+			t.Fatalf("Value mismatch for entry %d", i)
+		}
+	}
+
+	t.Logf("Successfully inserted and retrieved %d entries", numItems)
+
+	// Prepare transaction test data - multiple transactions with multiple items each
+	txNumTransactions := 1000
+	txItemsPerTx := 10
+
+	// Pre-generate all keys and values for transactions
+	txAllKeys := make([][][]byte, txNumTransactions)
+	txAllValues := make([][][]byte, txNumTransactions)
+
+	for txNum := 0; txNum < txNumTransactions; txNum++ {
+		txAllKeys[txNum] = make([][]byte, txItemsPerTx)
+		txAllValues[txNum] = make([][]byte, txItemsPerTx)
+
+		for i := 0; i < txItemsPerTx; i++ {
+			txAllKeys[txNum][i] = generateDeterministicBytes(numItems+txNum*txItemsPerTx+i, keySize)
+			txAllValues[txNum][i] = generateDeterministicBytes(numItems+txNum*txItemsPerTx+i+87654321, valueSize)
+		}
+	}
+
+	t.Logf("Testing %d transactions with %d items each...", txNumTransactions, txItemsPerTx)
+
+	for txNum := 0; txNum < txNumTransactions; txNum++ {
+		// Create and execute transaction
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatalf("Failed to begin transaction %d: %v", txNum, err)
+		}
+
+		for i := 0; i < txItemsPerTx; i++ {
+			err := tx.Set(txAllKeys[txNum][i], txAllValues[txNum][i])
+			if err != nil {
+				t.Fatalf("Failed to set entry %d in transaction %d: %v", i, txNum, err)
+			}
+		}
+
+		err = tx.Commit()
+		if err != nil {
+			t.Fatalf("Failed to commit transaction %d: %v", txNum, err)
+		}
+
+		// Verify a few values from the transaction
+		if txNum%100 == 0 {
+			t.Logf("Verifying transaction %d", txNum)
+			for i := 0; i < txItemsPerTx; i += 3 {
+				value, err := db.Get(txAllKeys[txNum][i])
+				if err != nil {
+					t.Fatalf("Failed to get entry %d from transaction %d: %v", i, txNum, err)
+				}
+				if !bytes.Equal(value, txAllValues[txNum][i]) {
+					t.Fatalf("Value mismatch for entry %d in transaction %d", i, txNum)
+				}
+			}
+		}
+	}
+
+	totalEntries := numItems + txNumTransactions*txItemsPerTx
+	t.Logf("Successfully completed %d transactions, total entries: %d", txNumTransactions, totalEntries)
+
+	db.Close()
+
+	db, err = Open(dbPath)
+	if err != nil {
+		t.Fatalf("Failed to open database: %v", err)
+	}
+
+	// Verify that the database is still working
+	for i := 0; i < numItems; i++ {
+		value, err := db.Get(keys[i])
+		if err != nil {
+			t.Fatalf("Failed to get entry %d: %v", i, err)
+		}
+		if !bytes.Equal(value, values[i]) {
+			t.Fatalf("Value mismatch for entry %d", i)
+		}
+	}
+
+	t.Logf("Successfully opened database and retrieved %d entries", numItems)
+
+	db.Close()
+
+	os.Remove(dbPath)
+	os.Remove(dbPath + "-index")
+	os.Remove(dbPath + "-wal")
+}
+
+// Generate deterministic bytes based on seed and size
+func generateDeterministicBytes(seed int, size int) []byte {
+	bytes := make([]byte, size)
+
+	// Use a simple deterministic algorithm
+	a := uint32(1103515245)
+	c := uint32(12345)
+	m := uint32(1<<31 - 1)
+
+	x := uint32(seed)
+
+	for i := 0; i < size; i++ {
+		// Linear congruential generator
+		x = (a*x + c) % m
+		bytes[i] = byte(x % 256)
+	}
+
+	return bytes
 }
