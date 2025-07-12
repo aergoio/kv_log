@@ -1588,11 +1588,30 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 		db.indexFileSize = PageSize
 	}
 
-	// Create a temporary Page struct for the root page
+	// Create a Page struct for the root page
 	headerPage := &Page{
 		pageNumber: 0,
 		data:       data,
 	}
+
+	// Set the transaction sequence number
+	db.seqMutex.Lock()
+	if db.inTransaction {
+		headerPage.txnSequence = db.txnSequence - 1
+	} else {
+		headerPage.txnSequence = db.txnSequence
+	}
+	db.seqMutex.Unlock()
+
+	// Update the access time
+	db.accessCounter++
+	headerPage.accessTime = db.accessCounter
+
+	// Mark the page as dirty
+	db.markPageDirty(headerPage)
+
+	// Add to cache so it can be found during WAL checkpoint
+	db.addToCache(headerPage)
 
 	// Write the entire root page to disk
 	if err := db.writeIndexPage(headerPage); err != nil {
@@ -1815,7 +1834,7 @@ func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 	}
 
 	// Update the access time
-	db.accessCounter++   // TODO: not sure if this is correct for page 0
+	db.accessCounter++
 	headerPage.accessTime = db.accessCounter
 
 	// Add to cache
