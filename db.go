@@ -4494,6 +4494,24 @@ func (db *DB) addToFreeRadixPagesList(radixPage *RadixPage) {
 	db.freeRadixPagesHead = radixPage.pageNumber
 }
 
+// isPageInFreeLeafPagesList checks if a page is already in the free leaf pages list
+func (db *DB) isPageInFreeLeafPagesList(pageNumber uint32) bool {
+	currentPageNum := db.freeLeafPagesHead
+	for currentPageNum > 0 {
+		if currentPageNum == pageNumber {
+			return true
+		}
+		// Get the current page to check its NextFreePage pointer
+		leafPage, err := db.getLeafPage(currentPageNum)
+		if err != nil {
+			// If we can't read the page, assume it's not in the list
+			break
+		}
+		currentPageNum = leafPage.NextFreePage
+	}
+	return false
+}
+
 // addToFreeLeafPagesList adds a leaf page with free space to the list
 func (db *DB) addToFreeLeafPagesList(leafPage *LeafPage) {
 	// Only add if the page has free space (less than 90% full)
@@ -4502,8 +4520,8 @@ func (db *DB) addToFreeLeafPagesList(leafPage *LeafPage) {
 		return
 	}
 
-	// Don't add if it's already the head of the list
-	if db.freeLeafPagesHead == leafPage.pageNumber {
+	// Don't add if it's already in the list
+	if db.isPageInFreeLeafPagesList(leafPage.pageNumber) {
 		return
 	}
 
