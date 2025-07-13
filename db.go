@@ -124,7 +124,6 @@ type DB struct {
 	pageCache      [1024]cacheBucket // Page cache for all page types
 	totalCachePages atomic.Int64     // Total number of pages in cache (including previous versions)
 	freeRadixPagesHead uint32 // Page number of the head of linked list of radix pages with available sub-pages
-	freeLeafSpaceArray []FreeSpaceEntry // Array of leaf pages with free space, sorted by free space (descending)
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
@@ -185,6 +184,8 @@ type Page struct {
 	// Fields for LeafPage
 	ContentSize  int                // Total size of content on this page
 	SubPages     []*LeafSubPageInfo // Information about sub-pages in this leaf page (nil entries for unused IDs)
+	// Fields for HeaderPage (only used when pageNumber == 0)
+	freeLeafSpaceArray []FreeSpaceEntry // Array of leaf pages with free space, sorted by free space (descending)
 }
 
 // RadixPage is an alias for Page
@@ -384,7 +385,6 @@ func Open(path string, options ...Options) (*DB, error) {
 		checkpointThreshold: checkpointThreshold,
 		workerChannel:      make(chan string, 10), // Buffer size of 10 for commands
 		pendingCommands:    make(map[string]bool), // Initialize the pending commands map
-		freeLeafSpaceArray: make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries), // Initialize the free space array
 	}
 
 	// Initialize each bucket's map
@@ -1606,31 +1606,7 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 			db.freeRadixPagesHead = radixPage.pageNumber
 		}
 
-		// Parse the free leaf space array
-		// Array count is stored at offset 28 (2 bytes)
-		arrayCount := int(binary.LittleEndian.Uint16(header[28:30]))
-
-		// Initialize the array with the correct capacity
-		db.freeLeafSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
-
-		// Parse each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
-		for i := 0; i < arrayCount && i < MaxFreeSpaceEntries; i++ {
-			offset := 30 + (i * 6)
-			if offset+6 > len(header) {
-				break // Avoid reading beyond header bounds
-			}
-
-			pageNumber := binary.LittleEndian.Uint32(header[offset:offset+4])
-			freeSpace := binary.LittleEndian.Uint16(header[offset+4:offset+6])
-
-			// Only add valid entries
-			if pageNumber > 0 {
-				db.freeLeafSpaceArray = append(db.freeLeafSpaceArray, FreeSpaceEntry{
-					PageNumber: pageNumber,
-					FreeSpace:  freeSpace,
-				})
-			}
-		}
+		// The array of leaf pages with free space is parsed in parseHeaderPage
 	}
 
 	return nil
@@ -1643,39 +1619,45 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 		return nil
 	}
 
-	// The offset of the last indexed content in the main file
-	lastIndexedOffset := int64(PageSize)
-	if !isInit {
-		lastIndexedOffset = db.flushFileSize
+	// Handle initialization separately for clarity
+	if isInit {
+		return db.initializeIndexHeader()
 	}
 
-	// The page number of the next free radix page
-	nextFreeRadixPageNumber := uint32(0)
-	if !isInit && db.freeRadixPagesHead > 0 {
-		nextFreeRadixPageNumber = db.freeRadixPagesHead
+	// Check which sequence number to use
+	var maxReadSeq int64
+	db.seqMutex.Lock()
+	if db.inTransaction {
+		maxReadSeq = db.flushSequence
+	} else {
+		maxReadSeq = db.txnSequence
+	}
+	db.seqMutex.Unlock()
+
+	// Get the header page from cache
+	headerPage, err := db.getPage(0, maxReadSeq)
+	if err != nil {
+		return fmt.Errorf("failed to get header page: %w", err)
 	}
 
-	// Allocate a buffer for the entire page
-	data := make([]byte, PageSize)
+	data := headerPage.data
 
-	// Write the 6-byte magic string
-	copy(data[0:6], IndexFileMagicString)
-
-	// Write the 2-byte version
-	copy(data[6:8], VersionString)
-
-	// Write the 8-byte database ID
-	binary.LittleEndian.PutUint64(data[8:16], db.databaseID)
+	// Update the header fields
+	lastIndexedOffset := db.flushFileSize
 
 	// Set last indexed offset (8 bytes)
 	binary.LittleEndian.PutUint64(data[16:24], uint64(lastIndexedOffset))
 
 	// Set free radix pages head pointer (4 bytes)
+	nextFreeRadixPageNumber := uint32(0)
+	if db.freeRadixPagesHead > 0 {
+		nextFreeRadixPageNumber = db.freeRadixPagesHead
+	}
 	binary.LittleEndian.PutUint32(data[24:28], nextFreeRadixPageNumber)
 
 	// Serialize the free leaf space array
 	// Array count at offset 28 (2 bytes)
-	arrayCount := int(len(db.freeLeafSpaceArray))
+	arrayCount := len(headerPage.freeLeafSpaceArray)
 	if arrayCount > MaxFreeSpaceEntries {
 		arrayCount = MaxFreeSpaceEntries
 	}
@@ -1688,30 +1670,57 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 			break // Avoid writing beyond page bounds
 		}
 
-		entry := db.freeLeafSpaceArray[i]
+		entry := headerPage.freeLeafSpaceArray[i]
 		binary.LittleEndian.PutUint32(data[offset:offset+4], entry.PageNumber)
 		binary.LittleEndian.PutUint16(data[offset+4:offset+6], entry.FreeSpace)
 	}
 
-	// If this is the first time we're writing the header, set the file size to PageSize
-	if isInit {
-		db.indexFileSize = PageSize
+	// Write the page to disk
+	if err := db.writeIndexPage(headerPage); err != nil {
+		return fmt.Errorf("failed to write index file header page: %w", err)
 	}
 
-	// Create a Page struct for the root page
+	// Update the in-memory offset
+	db.lastIndexedOffset = lastIndexedOffset
+
+	return nil
+}
+
+// initializeIndexHeader creates and writes the initial index header
+func (db *DB) initializeIndexHeader() error {
+	// Allocate a buffer for the entire page
+	data := make([]byte, PageSize)
+
+	// Write the 6-byte magic string
+	copy(data[0:6], IndexFileMagicString)
+
+	// Write the 2-byte version
+	copy(data[6:8], VersionString)
+
+	// Write the 8-byte database ID
+	binary.LittleEndian.PutUint64(data[8:16], db.databaseID)
+
+	// Set initial last indexed offset (8 bytes)
+	binary.LittleEndian.PutUint64(data[16:24], uint64(PageSize))
+
+	// Set free radix pages head pointer (4 bytes)
+	binary.LittleEndian.PutUint32(data[24:28], 0)
+
+	// Initialize empty free leaf space array
+	binary.LittleEndian.PutUint16(data[28:30], 0)
+
+	// Set the file size to PageSize
+	db.indexFileSize = PageSize
+
+	// Create a Page struct for the header page
 	headerPage := &Page{
-		pageNumber: 0,
-		data:       data,
+		pageNumber:         0,
+		data:               data,
+		freeLeafSpaceArray: make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries),
 	}
 
 	// Set the transaction sequence number
-	db.seqMutex.Lock()
-	if db.inTransaction {
-		headerPage.txnSequence = db.txnSequence - 1
-	} else {
-		headerPage.txnSequence = db.txnSequence
-	}
-	db.seqMutex.Unlock()
+	headerPage.txnSequence = db.txnSequence
 
 	// Update the access time
 	db.accessCounter++
@@ -1720,16 +1729,16 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	// Mark the page as dirty
 	db.markPageDirty(headerPage)
 
-	// Add to cache so it can be found during WAL checkpoint
+	// Add to cache
 	db.addToCache(headerPage)
 
-	// Write the entire root page to disk
+	// Write the page to disk
 	if err := db.writeIndexPage(headerPage); err != nil {
-		return fmt.Errorf("failed to write index file root page: %w", err)
+		return fmt.Errorf("failed to write initial index file header page: %w", err)
 	}
 
-	// Update the in-memory offset
-	db.lastIndexedOffset = lastIndexedOffset
+	// Set the last indexed offset
+	db.lastIndexedOffset = PageSize
 
 	return nil
 }
@@ -1937,10 +1946,38 @@ func (db *DB) readContent(offset int64) (*Content, error) {
 
 func (db *DB) parseHeaderPage(data []byte) (*Page, error) {
 
-	// Just store the data on the cache
+	// Parse the free leaf space array
+	// Array count is stored at offset 28 (2 bytes)
+	arrayCount := int(binary.LittleEndian.Uint16(data[28:30]))
+
+	// Initialize the array with the correct capacity
+	freeLeafSpaceArray := make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+
+	// Parse each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
+	for i := 0; i < arrayCount && i < MaxFreeSpaceEntries; i++ {
+		offset := 30 + (i * 6)
+		if offset+6 > len(data) {
+			break // Avoid reading beyond header bounds
+		}
+
+		pageNumber := binary.LittleEndian.Uint32(data[offset:offset+4])
+		freeSpace := binary.LittleEndian.Uint16(data[offset+4:offset+6])
+
+		// Only add valid entries
+		if pageNumber > 0 {
+			freeLeafSpaceArray = append(freeLeafSpaceArray, FreeSpaceEntry{
+				PageNumber: pageNumber,
+				FreeSpace:  freeSpace,
+			})
+		}
+	}
+
+	// Create the header page
 	headerPage := &Page{
 		pageNumber: 0,
 		data:       data,
+		freeLeafSpaceArray: freeLeafSpaceArray,
+		txnSequence: db.txnSequence,
 	}
 
 	// Update the access time
@@ -2208,26 +2245,25 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 // first read 1 byte to check the page type
 // then read the page data
 func (db *DB) readPage(pageNumber uint32) (*Page, error) {
+	// Read the page data
 	data, err := db.readFromIndexFile(pageNumber)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read page: %w", err)
 	}
 
+	// Get the page type
 	contentType := data[0]
 
-	// Based on the page type, read the full page
-	switch contentType {
-	case ContentTypeRadix:
-		// Read the radix page
+	// Parse the page based on the page type (or page number for header page)
+	if contentType == ContentTypeRadix {
 		return db.parseRadixPage(data, pageNumber)
-
-	case ContentTypeLeaf:
-		// Read the leaf page
+	} else if contentType == ContentTypeLeaf {
 		return db.parseLeafPage(data, pageNumber)
-
-	default:
-		return nil, fmt.Errorf("unknown page type: %c", contentType)
+	} else if pageNumber == 0 {
+		return db.parseHeaderPage(data)
 	}
+
+	return nil, fmt.Errorf("unknown page type: %c", contentType)
 }
 
 // writeIndexPage writes an index page to either the WAL file or the index file
@@ -2685,6 +2721,11 @@ func (db *DB) clonePage(page *Page) (*Page, error) {
 		newPage, err = db.cloneLeafPage(page)
 		if err != nil {
 			return nil, fmt.Errorf("failed to clone leaf page: %w", err)
+		}
+	} else if page.pageNumber == 0 {
+		newPage, err = db.cloneHeaderPage(page)
+		if err != nil {
+			return nil, fmt.Errorf("failed to clone header page: %w", err)
 		}
 	} else {
 		return nil, fmt.Errorf("unknown page type: %c", page.pageType)
@@ -3558,6 +3599,7 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 	// Add the new page to the free list since it will have free space after allocation
 	db.addToFreeLeafPagesList(newLeafPage)
 
+	// Use sub-page ID 0 for the first sub-page in a new leaf page
 	return &LeafSubPage{
 		Page:       newLeafPage,
 		SubPageIdx: 0,
@@ -3623,6 +3665,34 @@ func (db *DB) cloneLeafPage(page *LeafPage) (*LeafPage, error) {
 				Entries: entries,
 			}
 		}
+	}
+
+	// Add to cache
+	db.addToCache(newPage)
+
+	return newPage, nil
+}
+
+// cloneHeaderPage clones the header page
+func (db *DB) cloneHeaderPage(page *Page) (*Page, error) {
+	// Create a new page
+	newPage := &Page{
+		pageNumber:   page.pageNumber,
+		pageType:     page.pageType,
+		data:         make([]byte, PageSize),
+		dirty:        page.dirty,
+		isWAL:        false,
+		accessTime:   page.accessTime,
+		txnSequence:  page.txnSequence,
+	}
+
+	// Copy the data
+	copy(newPage.data, page.data)
+
+	// Deep copy the free leaf space array if it exists
+	if page.freeLeafSpaceArray != nil {
+		newPage.freeLeafSpaceArray = make([]FreeSpaceEntry, len(page.freeLeafSpaceArray))
+		copy(newPage.freeLeafSpaceArray, page.freeLeafSpaceArray)
 	}
 
 	// Add to cache
@@ -4576,11 +4646,32 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage) {
 
 	debugPrint("Adding page %d to free space array with %d bytes of free space\n", leafPage.pageNumber, freeSpace)
 
+	// Get the header page
+	headerPage, err := db.getPage(0)
+	if err != nil {
+		debugPrint("Failed to get header page: %v\n", err)
+		return
+	}
+
+	// Get a writable version of the header page
+	headerPage, err = db.getWritablePage(headerPage)
+	if err != nil {
+		debugPrint("Failed to get writable header page: %v\n", err)
+		return
+	}
+
+	// Initialize the array if needed
+	if headerPage.freeLeafSpaceArray == nil {
+		headerPage.freeLeafSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+	}
+
 	// Look for existing entry
-	for i, entry := range db.freeLeafSpaceArray {
+	for i, entry := range headerPage.freeLeafSpaceArray {
 		if entry.PageNumber == leafPage.pageNumber {
 			// Update existing entry
-			db.freeLeafSpaceArray[i].FreeSpace = uint16(freeSpace)
+			headerPage.freeLeafSpaceArray[i].FreeSpace = uint16(freeSpace)
+			// Mark the header page as dirty
+			db.markPageDirty(headerPage)
 			return
 		}
 	}
@@ -4592,12 +4683,12 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage) {
 	}
 
 	// If array is full, remove the entry with least free space
-	if len(db.freeLeafSpaceArray) >= MaxFreeSpaceEntries {
+	if len(headerPage.freeLeafSpaceArray) >= MaxFreeSpaceEntries {
 		// Find the entry with minimum free space by iterating through the array
 		minFreeSpace := uint16(PageSize) // Start with max possible value
 		minIndex := -1
 
-		for i, entry := range db.freeLeafSpaceArray {
+		for i, entry := range headerPage.freeLeafSpaceArray {
 			if entry.FreeSpace < minFreeSpace {
 				minFreeSpace = entry.FreeSpace
 				minIndex = i
@@ -4607,7 +4698,9 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage) {
 		// Only add if new entry has more free space than the minimum found
 		if uint16(freeSpace) > minFreeSpace {
 			// Replace the entry with the new entry
-			db.freeLeafSpaceArray[minIndex] = newEntry
+			headerPage.freeLeafSpaceArray[minIndex] = newEntry
+			// Mark the header page as dirty
+			db.markPageDirty(headerPage)
 			return
 		} else {
 			// Don't add this entry
@@ -4616,23 +4709,48 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage) {
 	}
 
 	// Add the new entry
-	db.freeLeafSpaceArray = append(db.freeLeafSpaceArray, newEntry)
+	headerPage.freeLeafSpaceArray = append(headerPage.freeLeafSpaceArray, newEntry)
+
+	// Mark the header page as dirty
+	db.markPageDirty(headerPage)
 }
 
 // removeFromFreeSpaceArray removes a leaf page from the free space array
 func (db *DB) removeFromFreeSpaceArray(pageNumber uint32) {
 	debugPrint("Removing page %d from free space array\n", pageNumber)
-	arrayLen := len(db.freeLeafSpaceArray)
 
-	for i, entry := range db.freeLeafSpaceArray {
+	// Get the header page
+	headerPage, err := db.getPage(0)
+	if err != nil {
+		debugPrint("Failed to get header page: %v\n", err)
+		return
+	}
+
+	// If the array is empty, nothing to do
+	if headerPage.freeLeafSpaceArray == nil || len(headerPage.freeLeafSpaceArray) == 0 {
+		return
+	}
+
+	// Get a writable version of the header page
+	headerPage, err = db.getWritablePage(headerPage)
+	if err != nil {
+		debugPrint("Failed to get writable header page: %v\n", err)
+		return
+	}
+
+	arrayLen := len(headerPage.freeLeafSpaceArray)
+
+	for i, entry := range headerPage.freeLeafSpaceArray {
 		if entry.PageNumber == pageNumber {
 			// Replace this entry with the last entry (to avoid memory move)
 			if i < arrayLen-1 {
 				// Copy the last element to this position
-				db.freeLeafSpaceArray[i] = db.freeLeafSpaceArray[arrayLen-1]
+				headerPage.freeLeafSpaceArray[i] = headerPage.freeLeafSpaceArray[arrayLen-1]
 			}
 			// Shrink the array
-			db.freeLeafSpaceArray = db.freeLeafSpaceArray[:arrayLen-1]
+			headerPage.freeLeafSpaceArray = headerPage.freeLeafSpaceArray[:arrayLen-1]
+			// Mark the header page as dirty
+			db.markPageDirty(headerPage)
 			return
 		}
 	}
@@ -4643,13 +4761,25 @@ func (db *DB) removeFromFreeSpaceArray(pageNumber uint32) {
 func (db *DB) findLeafPageWithSpace(spaceNeeded int) (uint32, int) {
 	debugPrint("Finding leaf page with space: %d\n", spaceNeeded)
 
+	// Get the header page
+	headerPage, err := db.getPage(0)
+	if err != nil {
+		debugPrint("Failed to get header page: %v\n", err)
+		return 0, 0
+	}
+
+	// If the array is empty, nothing to do
+	if headerPage.freeLeafSpaceArray == nil || len(headerPage.freeLeafSpaceArray) == 0 {
+		return 0, 0
+	}
+
 	// Optimization: iterate forward for better cache locality
 	// Find the best fit (page with just enough space)
 	bestFitPageNumber := uint32(0)
 	bestFitSpace := PageSize + 1 // Start with a value larger than any possible free space
 
 	// First pass: look for a page with exactly enough space or slightly more
-	for _, entry := range db.freeLeafSpaceArray {
+	for _, entry := range headerPage.freeLeafSpaceArray {
 		entrySpace := int(entry.FreeSpace)
 		// If this is a better fit than what we've found so far
 		if entrySpace >= spaceNeeded && entrySpace < bestFitSpace {
@@ -4677,10 +4807,31 @@ func (db *DB) updateFreeSpaceArray(pageNumber uint32, newFreeSpace int) {
 		return
 	}
 
+	// Get the header page
+	headerPage, err := db.getPage(0)
+	if err != nil {
+		debugPrint("Failed to get header page: %v\n", err)
+		return
+	}
+
+	// If the array is empty, nothing to do
+	if headerPage.freeLeafSpaceArray == nil || len(headerPage.freeLeafSpaceArray) == 0 {
+		return
+	}
+
+	// Get a writable version of the header page
+	headerPage, err = db.getWritablePage(headerPage)
+	if err != nil {
+		debugPrint("Failed to get writable header page: %v\n", err)
+		return
+	}
+
 	// Find the entry and update it
-	for i, entry := range db.freeLeafSpaceArray {
+	for i, entry := range headerPage.freeLeafSpaceArray {
 		if entry.PageNumber == pageNumber {
-			db.freeLeafSpaceArray[i].FreeSpace = uint16(newFreeSpace)
+			headerPage.freeLeafSpaceArray[i].FreeSpace = uint16(newFreeSpace)
+			// Mark the header page as dirty
+			db.markPageDirty(headerPage)
 			return
 		}
 	}
