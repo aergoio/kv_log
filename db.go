@@ -89,6 +89,17 @@ const (
 	SyncOff = 0 // Don't sync after writes
 )
 
+// Free space tracking
+const (
+	MaxFreeSpaceEntries = 500 // Maximum number of free space entries in the array
+)
+
+// FreeSpaceEntry represents an entry in the free space array
+type FreeSpaceEntry struct {
+	PageNumber uint32 // Page number of the leaf page
+	FreeSpace  uint16 // Amount of free space in bytes
+}
+
 // cacheBucket represents a bucket in the page cache with its own mutex
 type cacheBucket struct {
     mutex sync.RWMutex
@@ -113,7 +124,7 @@ type DB struct {
 	pageCache      [1024]cacheBucket // Page cache for all page types
 	totalCachePages atomic.Int64     // Total number of pages in cache (including previous versions)
 	freeRadixPagesHead uint32 // Page number of the head of linked list of radix pages with available sub-pages
-	freeLeafPagesHead  uint32 // Page number of the head of linked list of leaf pages with available space
+	freeLeafSpaceArray []FreeSpaceEntry // Array of leaf pages with free space, sorted by free space (descending)
 	lastIndexedOffset int64 // Track the offset of the last indexed content in the main file
 	writeMode      string // Current write mode
 	nextWriteMode  string // Next write mode to apply
@@ -373,6 +384,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		checkpointThreshold: checkpointThreshold,
 		workerChannel:      make(chan string, 10), // Buffer size of 10 for commands
 		pendingCommands:    make(map[string]bool), // Initialize the pending commands map
+		freeLeafSpaceArray: make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries), // Initialize the free space array
 	}
 
 	// Initialize each bucket's map
@@ -1584,8 +1596,6 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 
 		// Parse the free radix pages head pointer
 		freeRadixPageNum := binary.LittleEndian.Uint32(header[24:28])
-		// Parse the free leaf pages head pointer
-		freeLeafPageNum := binary.LittleEndian.Uint32(header[28:32])
 
 		// If we have a valid free radix page pointer
 		if freeRadixPageNum > 0 {
@@ -1596,13 +1606,30 @@ func (db *DB) readIndexFileHeader(finalRead bool) error {
 			db.freeRadixPagesHead = radixPage.pageNumber
 		}
 
-		// If we have a valid free leaf page pointer
-		if freeLeafPageNum > 0 {
-			leafPage, err := db.getLeafPage(freeLeafPageNum)
-			if err != nil {
-				return fmt.Errorf("failed to get leaf page: %w", err)
+		// Parse the free leaf space array
+		// Array count is stored at offset 28 (2 bytes)
+		arrayCount := int(binary.LittleEndian.Uint16(header[28:30]))
+
+		// Initialize the array with the correct capacity
+		db.freeLeafSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+
+		// Parse each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
+		for i := 0; i < arrayCount && i < MaxFreeSpaceEntries; i++ {
+			offset := 30 + (i * 6)
+			if offset+6 > len(header) {
+				break // Avoid reading beyond header bounds
 			}
-			db.freeLeafPagesHead = leafPage.pageNumber
+
+			pageNumber := binary.LittleEndian.Uint32(header[offset:offset+4])
+			freeSpace := binary.LittleEndian.Uint16(header[offset+4:offset+6])
+
+			// Only add valid entries
+			if pageNumber > 0 {
+				db.freeLeafSpaceArray = append(db.freeLeafSpaceArray, FreeSpaceEntry{
+					PageNumber: pageNumber,
+					FreeSpace:  freeSpace,
+				})
+			}
 		}
 	}
 
@@ -1628,12 +1655,6 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 		nextFreeRadixPageNumber = db.freeRadixPagesHead
 	}
 
-	// The page number of the next free leaf page
-	nextFreeLeafPageNumber := uint32(0)
-	if !isInit && db.freeLeafPagesHead > 0 {
-		nextFreeLeafPageNumber = db.freeLeafPagesHead
-	}
-
 	// Allocate a buffer for the entire page
 	data := make([]byte, PageSize)
 
@@ -1652,8 +1673,25 @@ func (db *DB) writeIndexHeader(isInit bool) error {
 	// Set free radix pages head pointer (4 bytes)
 	binary.LittleEndian.PutUint32(data[24:28], nextFreeRadixPageNumber)
 
-	// Set free leaf pages head pointer (4 bytes)
-	binary.LittleEndian.PutUint32(data[28:32], nextFreeLeafPageNumber)
+	// Serialize the free leaf space array
+	// Array count at offset 28 (2 bytes)
+	arrayCount := int(len(db.freeLeafSpaceArray))
+	if arrayCount > MaxFreeSpaceEntries {
+		arrayCount = MaxFreeSpaceEntries
+	}
+	binary.LittleEndian.PutUint16(data[28:30], uint16(arrayCount))
+
+	// Serialize each entry (6 bytes each: 4 bytes page number + 2 bytes free space)
+	for i := 0; i < arrayCount; i++ {
+		offset := 30 + (i * 6)
+		if offset+6 > len(data) {
+			break // Avoid writing beyond page bounds
+		}
+
+		entry := db.freeLeafSpaceArray[i]
+		binary.LittleEndian.PutUint32(data[offset:offset+4], entry.PageNumber)
+		binary.LittleEndian.PutUint16(data[offset+4:offset+6], entry.FreeSpace)
+	}
 
 	// If this is the first time we're writing the header, set the file size to PageSize
 	if isInit {
@@ -3435,96 +3473,79 @@ func (db *DB) allocateLeafPage() (*LeafPage, error) {
 
 // allocateLeafPageWithSpace returns a leaf sub-page with available space, either from the free list or creates a new one
 func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
-	// Traverse the free list to find a page with enough space
-	currentPageNum := db.freeLeafPagesHead
-	var prevPage *LeafPage = nil
-
 	debugPrint("Allocating leaf page with enough space: %d bytes\n", spaceNeeded)
 
-	for currentPageNum > 0 {
-		debugPrint("Checking page %d\n", currentPageNum)
+	// Find a page with enough space
+	pageNumber, freeSpace := db.findLeafPageWithSpace(spaceNeeded)
 
-		// Get the current page
-		leafPage, err := db.getLeafPage(currentPageNum)
+	if pageNumber > 0 {
+		debugPrint("Found page %d with %d bytes free space\n", pageNumber, freeSpace)
+
+		// Get the page
+		leafPage, err := db.getLeafPage(pageNumber)
 		if err != nil {
-			return nil, fmt.Errorf("failed to get leaf page %d: %w", currentPageNum, err)
+			// Page not found, remove from array and try again
+			db.removeFromFreeSpaceArray(pageNumber)
+			return db.allocateLeafPageWithSpace(spaceNeeded)
 		}
 
-		// Check if this page has enough space
-		freeSpace := PageSize - int(leafPage.ContentSize)
-		if freeSpace >= spaceNeeded {
-			// Found a page with enough space, proceed with allocation
-
-			// Get a writable version of the page
-			leafPage, err = db.getWritablePage(leafPage)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get writable page: %w", err)
-			}
-
-			// Find the first available sub-page ID
-			var subPageID uint8 = 0
-			// Initialize SubPages array if not already done
-			if leafPage.SubPages == nil {
-				leafPage.SubPages = make([]*LeafSubPageInfo, 256)
-			}
-			// Find first available slot
-			for subPageID < 255 && leafPage.SubPages[subPageID] != nil {
-				subPageID++
-			}
-			if subPageID == 255 && leafPage.SubPages[subPageID] != nil {
-				debugPrint("No available sub-page IDs, removing page %d from free list\n", leafPage.pageNumber)
-				// No available sub-page IDs, remove this page from the free list and continue to next page
-				nextPageNum := leafPage.NextFreePage
-				if err := db.removeFromFreeLeafPagesList(leafPage, prevPage); err != nil {
-					return nil, fmt.Errorf("failed to remove full page from free list: %w", err)
-				}
-				currentPageNum = nextPageNum
-				continue
-			}
-
-			// Count how many sub-page slots are currently used (continue from the last found slot)
-			usedSlots := int(subPageID) + 1
-			for i := usedSlots; i < 256; i++ {
-				if leafPage.SubPages[i] != nil {
-					usedSlots++
-				}
-			}
-
-			// Calculate the free space after adding the content
-			freeSpaceAfter := freeSpace - spaceNeeded
-
-			// If this page will be full after we use this slot, remove it from the free list
-			if freeSpaceAfter < PageSize/10 || usedSlots >= 255 {
-				// Remove this page from the free list
-				debugPrint("Removing page %d from free list\n", leafPage.pageNumber)
-				if err := db.removeFromFreeLeafPagesList(leafPage, prevPage); err != nil {
-					return nil, fmt.Errorf("failed to remove page from free list: %w", err)
-				}
-			}
-
-			return &LeafSubPage{
-				Page:       leafPage,
-				SubPageIdx: subPageID,
-			}, nil
+		// Get a writable version of the page
+		leafPage, err = db.getWritablePage(leafPage)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get writable page: %w", err)
 		}
 
-		// This page doesn't have enough space for the current allocation
-		// Check if it should be removed from the free list (less than 10% free space)
-		if freeSpace < PageSize/10 {
-			// Remove this page from the free list
-			debugPrint("Removing page %d from free list\n", leafPage.pageNumber)
-			nextPageNum := leafPage.NextFreePage
-			if err := db.removeFromFreeLeafPagesList(leafPage, prevPage); err != nil {
-				return nil, fmt.Errorf("failed to remove page from free list: %w", err)
-			}
+		// Get the current free space directly from the page
+		freeSpace = PageSize - leafPage.ContentSize
+		if freeSpace < spaceNeeded {
+			debugPrint("Page %d has %d bytes free space, but %d bytes are needed\n", leafPage.pageNumber, freeSpace, spaceNeeded)
+			// Remove the page from the free list
+			db.updateFreeSpaceArray(leafPage.pageNumber, freeSpace)
+			return db.allocateLeafPageWithSpace(spaceNeeded)
+		}
 
-			// Move to the next page (don't update prevPage since we removed currentPageNum)
-			currentPageNum = nextPageNum
+		// Find the first available sub-page ID
+		var subPageID uint8 = 0
+		// Initialize SubPages array if not already done
+		if leafPage.SubPages == nil {
+			leafPage.SubPages = make([]*LeafSubPageInfo, 256)
+		}
+		// Find first available slot
+		for subPageID < 255 && leafPage.SubPages[subPageID] != nil {
+			subPageID++
+		}
+		if subPageID == 255 && leafPage.SubPages[subPageID] != nil {
+			debugPrint("No available sub-page IDs, removing page %d from free array\n", leafPage.pageNumber)
+			// No available sub-page IDs, remove this page from the free array and try again
+			db.removeFromFreeSpaceArray(leafPage.pageNumber)
+			return db.allocateLeafPageWithSpace(spaceNeeded)
+		}
+
+		// Count how many sub-page slots are currently used (continue from the last found slot)
+		usedSlots := int(subPageID) + 1
+		for i := usedSlots; i < 256; i++ {
+			if leafPage.SubPages[i] != nil {
+				usedSlots++
+			}
+		}
+
+		// Calculate the free space after adding the content
+		freeSpaceAfter := freeSpace - spaceNeeded
+
+		// if the free slace is less than 10% of the page size or there is no more available slots
+		if freeSpaceAfter < PageSize/10 || usedSlots == 256 {
+			// Remove the page from the free list
+			db.removeFromFreeSpaceArray(leafPage.pageNumber)
 		} else {
-			// Keep this page in the free list, move to the next page
-			prevPage = leafPage
-			currentPageNum = leafPage.NextFreePage
+			// Update the free space array with the new free space amount
+			// This will automatically remove the page if free space is too low
+			db.updateFreeSpaceArray(leafPage.pageNumber, freeSpaceAfter)
 		}
+
+		return &LeafSubPage{
+			Page:       leafPage,
+			SubPageIdx: subPageID,
+		}, nil
 	}
 
 	// No suitable page found in the free list, allocate a new one
@@ -4526,78 +4547,127 @@ func (db *DB) addToFreeRadixPagesList(radixPage *RadixPage) {
 	db.freeRadixPagesHead = radixPage.pageNumber
 }
 
-// isPageInFreeLeafPagesList checks if a page is already in the free leaf pages list
-func (db *DB) isPageInFreeLeafPagesList(pageNumber uint32) bool {
-	currentPageNum := db.freeLeafPagesHead
-	for currentPageNum > 0 {
-		if currentPageNum == pageNumber {
-			return true
-		}
-		// Get the current page to check its NextFreePage pointer
-		leafPage, err := db.getLeafPage(currentPageNum)
-		if err != nil {
-			// If we can't read the page, assume it's not in the list
-			break
-		}
-		currentPageNum = leafPage.NextFreePage
-	}
-	return false
-}
-
-// addToFreeLeafPagesList adds a leaf page with free space to the list
+// addToFreeLeafPagesList adds a leaf page with free space to the array
 func (db *DB) addToFreeLeafPagesList(leafPage *LeafPage) {
-	// Only add if the page has free space (less than 90% full)
-	freeSpace := PageSize - int(leafPage.ContentSize)
-	if freeSpace < PageSize/10 {
-		return
-	}
-
-	// Don't add if it's already in the list
-	if db.isPageInFreeLeafPagesList(leafPage.pageNumber) {
-		return
-	}
-
-	// Link this page to the current head
-	if db.freeLeafPagesHead > 0 {
-		leafPage.NextFreePage = db.freeLeafPagesHead
-	} else {
-		leafPage.NextFreePage = 0
-	}
-
-	// Mark the page as dirty
-	db.markPageDirty(leafPage)
-
-	// Make it the new head
-	db.freeLeafPagesHead = leafPage.pageNumber
+	db.addToFreeSpaceArray(leafPage)
 }
 
-// removeFromFreeLeafPagesList removes a leaf page from the free list
-// If prevPage is nil, the page to remove is the head of the list
-// If prevPage is provided, it should be the page that points to the page being removed
-func (db *DB) removeFromFreeLeafPagesList(leafPage *LeafPage, prevPage *LeafPage) error {
-	// If this page is the head of the list, update the head
-	if prevPage == nil {
-		db.freeLeafPagesHead = leafPage.NextFreePage
-		leafPage.NextFreePage = 0
-		db.markPageDirty(leafPage)
-		return nil
+// ------------------------------------------------------------------------------------------------
+// Free space array management
+// ------------------------------------------------------------------------------------------------
+
+// addToFreeSpaceArray adds or updates a leaf page in the free space array
+func (db *DB) addToFreeSpaceArray(leafPage *LeafPage) {
+	// Calculate free space
+	freeSpace := PageSize - leafPage.ContentSize
+
+	if leafPage.ContentSize > PageSize {
+		debugPrint("PANIC_CONDITION_MET: Page %d has content size %d which is greater than PageSize %d\n", leafPage.pageNumber, leafPage.ContentSize, PageSize)
+		// Panic to capture the stack trace
+		panic(fmt.Sprintf("Page %d has content size greater than page size: %d", leafPage.pageNumber, leafPage.ContentSize))
 	}
 
-	// Get writable version of previous page
-	prevPage, err := db.getWritablePage(prevPage)
-	if err != nil {
-		return fmt.Errorf("failed to get writable previous page: %w", err)
+	// Only add if the page has reasonable free space (at least 10% of page size)
+	if freeSpace < PageSize/10 {
+		// Remove from array if it exists
+		//db.removeFromFreeSpaceArray(leafPage.pageNumber)
+		return
 	}
 
-	// Update the previous page to skip the page we're removing
-	prevPage.NextFreePage = leafPage.NextFreePage
-	db.markPageDirty(prevPage)
+	debugPrint("Adding page %d to free space array with %d bytes of free space\n", leafPage.pageNumber, freeSpace)
 
-	// Clear the NextFreePage field of the removed page
-	leafPage.NextFreePage = 0
-	db.markPageDirty(leafPage)
+	// Look for existing entry
+	for i, entry := range db.freeLeafSpaceArray {
+		if entry.PageNumber == leafPage.pageNumber {
+			// Update existing entry
+			db.freeLeafSpaceArray[i].FreeSpace = uint16(freeSpace)
+			// Re-sort the array to maintain order (descending by free space)
+			db.sortFreeSpaceArray()
+			return
+		}
+	}
 
-	return nil
+	// Add new entry
+	newEntry := FreeSpaceEntry{
+		PageNumber: leafPage.pageNumber,
+		FreeSpace:  uint16(freeSpace),
+	}
+
+	// If array is full, remove the entry with least free space
+	if len(db.freeLeafSpaceArray) >= MaxFreeSpaceEntries {
+		// Find the entry with minimum free space (should be at the end since array is sorted)
+		minFreeSpace := db.freeLeafSpaceArray[len(db.freeLeafSpaceArray)-1].FreeSpace
+
+		// Only add if new entry has more free space than the minimum
+		if uint16(freeSpace) > minFreeSpace {
+			// Remove the last entry (least free space)
+			db.freeLeafSpaceArray = db.freeLeafSpaceArray[:len(db.freeLeafSpaceArray)-1]
+		} else {
+			// Don't add this entry
+			return
+		}
+	}
+
+	// Add the new entry
+	db.freeLeafSpaceArray = append(db.freeLeafSpaceArray, newEntry)
+
+	// Sort the array to maintain descending order by free space
+	db.sortFreeSpaceArray()
+}
+
+// removeFromFreeSpaceArray removes a leaf page from the free space array
+func (db *DB) removeFromFreeSpaceArray(pageNumber uint32) {
+	debugPrint("Removing page %d from free space array\n", pageNumber)
+	for i, entry := range db.freeLeafSpaceArray {
+		if entry.PageNumber == pageNumber {
+			// Remove this entry by shifting remaining entries
+			copy(db.freeLeafSpaceArray[i:], db.freeLeafSpaceArray[i+1:])
+			db.freeLeafSpaceArray = db.freeLeafSpaceArray[:len(db.freeLeafSpaceArray)-1]
+			return
+		}
+	}
+}
+
+// sortFreeSpaceArray sorts the free space array in descending order by free space
+func (db *DB) sortFreeSpaceArray() {
+	debugPrint("Sorting free space array\n")
+	sort.Slice(db.freeLeafSpaceArray, func(i, j int) bool {
+		return db.freeLeafSpaceArray[i].FreeSpace > db.freeLeafSpaceArray[j].FreeSpace
+	})
+}
+
+// findLeafPageWithSpace finds a leaf page with at least the specified amount of free space
+// Returns the page number and the amount of free space, or 0 if no suitable page is found
+func (db *DB) findLeafPageWithSpace(spaceNeeded int) (uint32, int) {
+	debugPrint("Finding leaf page with space: %d\n", spaceNeeded)
+	// Search for a page with just enough space (not necessarily the one with most space)
+	// We iterate from the end (least free space) to find the best fit
+	for i := len(db.freeLeafSpaceArray) - 1; i >= 0; i-- {
+		entry := db.freeLeafSpaceArray[i]
+		if int(entry.FreeSpace) >= spaceNeeded {
+			return entry.PageNumber, int(entry.FreeSpace)
+		}
+	}
+	return 0, 0
+}
+
+// updateFreeSpaceArray updates the free space for a specific page in the array
+func (db *DB) updateFreeSpaceArray(pageNumber uint32, newFreeSpace int) {
+	debugPrint("Updating free space array for page %d to %d\n", pageNumber, newFreeSpace)
+	// If free space is too low, remove the entry
+	if newFreeSpace < PageSize/10 {
+		db.removeFromFreeSpaceArray(pageNumber)
+		return
+	}
+	// Find the entry and update it
+	for i, entry := range db.freeLeafSpaceArray {
+		if entry.PageNumber == pageNumber {
+			db.freeLeafSpaceArray[i].FreeSpace = uint16(newFreeSpace)
+			// Re-sort to maintain order
+			db.sortFreeSpaceArray()
+			return
+		}
+	}
 }
 
 // ------------------------------------------------------------------------------------------------
