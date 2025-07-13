@@ -2827,7 +2827,7 @@ func TestPageCacheAfterLeafOperations(t *testing.T) {
 	}
 
 	// Add the page to the free list so addEntryToNewLeafSubPage can use it
-	db.addToFreeLeafPagesList(leafPage)
+	db.addToFreeLeafPagesList(leafPage, 0)
 
 	t.Logf("Test allocated leaf page %d and added to free list", pageNumber)
 
