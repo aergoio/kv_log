@@ -3078,7 +3078,7 @@ func TestParseLeafSubPages(t *testing.T) {
 		offset := int(LeafHeaderSize)
 		leafPage.data[offset] = 0 // Sub-page ID
 		binary.LittleEndian.PutUint16(leafPage.data[offset+1:], 1000) // Size larger than available space
-		leafPage.ContentSize = uint16(offset + 10) // Small content size
+		leafPage.ContentSize = offset + 10 // Small content size
 
 		// Try to parse - should fail
 		err = db.parseLeafSubPages(leafPage)
@@ -5952,7 +5952,7 @@ func TestWriteLeafPage(t *testing.T) {
 			pageType:    ContentTypeLeaf,
 			data:        make([]byte, PageSize),
 			dirty:       true,
-			ContentSize: uint16(PageSize - 1), // Near maximum
+			ContentSize: PageSize - 1, // Near maximum
 			SubPages:    make([]*LeafSubPageInfo, 256),
 		}
 
@@ -6706,7 +6706,7 @@ func TestMoveSubPageToNewLeafPage(t *testing.T) {
 
 	// Update leaf page metadata
 	totalSubPageSize := LeafSubPageHeaderSize + len(subPageData)
-	leafPage.ContentSize = uint16(LeafHeaderSize + totalSubPageSize)
+	leafPage.ContentSize = LeafHeaderSize + totalSubPageSize
 
 	// Initialize SubPages array if needed
 	if leafPage.SubPages == nil {

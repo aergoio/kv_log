@@ -2868,7 +2868,7 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 	keySuffix := "_some-long-suffix-here-to-consume-a-lot-of-space-and-fill-up-the-leaf-sub-page-quickly"
 
 	// Helper function to get page information for a key
-	getPageInfo := func(key []byte) (uint32, byte, uint8, uint16, int, error) {
+	getPageInfo := func(key []byte) (uint32, byte, uint8, int, int, error) {
 		// Navigate to the page containing this key
 		rootSubPage, err := db.getRootRadixSubPage()
 		if err != nil {
@@ -3147,7 +3147,7 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 	keySuffix := "_with_some_additional_content_to_make_entries_larger-user_profile_data_very_long_common_here_"
 
 	// Helper function to get page information for a key
-	getPageInfo := func(key []byte) (uint32, byte, uint8, uint16, int, error) {
+	getPageInfo := func(key []byte) (uint32, byte, uint8, int, int, error) {
 		// Navigate to the page containing this key
 		rootSubPage, err := db.getRootRadixSubPage()
 		if err != nil {

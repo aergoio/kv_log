@@ -172,7 +172,7 @@ type Page struct {
 	SubPagesUsed uint8  // Number of sub-pages used
 	NextFreePage uint32 // Pointer to the next radix page with free sub-pages (0 if none)
 	// Fields for LeafPage
-	ContentSize  uint16             // Total size of content on this page
+	ContentSize  int                // Total size of content on this page
 	SubPages     []*LeafSubPageInfo // Information about sub-pages in this leaf page (nil entries for unused IDs)
 }
 
@@ -2018,7 +2018,7 @@ func (db *DB) parseLeafPage(data []byte, pageNumber uint32) (*LeafPage, error) {
 	}
 
 	// Get content size
-	contentSize := binary.LittleEndian.Uint16(data[2:4])
+	contentSize := int(binary.LittleEndian.Uint16(data[2:4]))
 
 	// Create structured leaf page
 	leafPage := &LeafPage{
@@ -2048,7 +2048,7 @@ func (db *DB) parseLeafPage(data []byte, pageNumber uint32) (*LeafPage, error) {
 // parseLeafSubPages parses the sub-pages in a leaf page
 func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 	// Start at header size
-	pos := int(LeafHeaderSize)
+	pos := LeafHeaderSize
 
 	// If there are no sub-pages, nothing to do
 	if leafPage.ContentSize == LeafHeaderSize {
@@ -2059,7 +2059,7 @@ func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 	leafPage.SubPages = make([]*LeafSubPageInfo, 256)
 
 	// Read each sub-page until we reach the content size
-	for pos < int(leafPage.ContentSize) {
+	for pos < leafPage.ContentSize {
 		// Read sub-page ID (this is the index where we'll store this sub-page)
 		subPageID := leafPage.data[pos]
 		pos++
@@ -2072,7 +2072,7 @@ func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 		subPageEnd := pos + int(subPageSize)
 
 		// Ensure we don't read past the content size
-		if subPageEnd > int(leafPage.ContentSize) {
+		if subPageEnd > leafPage.ContentSize {
 			return fmt.Errorf("sub-page end %d exceeds content size %d", subPageEnd, leafPage.ContentSize)
 		}
 
@@ -2141,7 +2141,7 @@ func (db *DB) writeLeafPage(leafPage *LeafPage) error {
 	leafPage.data[0] = ContentTypeLeaf  // Type identifier
 
 	// Write content size
-	binary.LittleEndian.PutUint16(leafPage.data[2:4], leafPage.ContentSize)
+	binary.LittleEndian.PutUint16(leafPage.data[2:4], uint16(leafPage.ContentSize))
 
 	// Calculate CRC32 checksum for the page data (excluding the checksum field itself)
 	// Zero out the checksum field before calculating
@@ -3661,7 +3661,7 @@ func (db *DB) parseLeafEntries(leafPage *LeafPage) ([]LeafEntry, error) {
 	pos := int(LeafHeaderSize)
 
 	// Read entries until we reach content size
-	for pos < int(leafPage.ContentSize) {
+	for pos < leafPage.ContentSize {
 		// Read suffix length
 		suffixLen64, bytesRead := varint.Read(leafPage.data[pos:])
 		if bytesRead == 0 {
@@ -3728,14 +3728,14 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	subPageID := leafSubPage.SubPageIdx
 
 	// Check if there's enough space in the leaf page
-	if int(leafPage.ContentSize) + totalSubPageSize > PageSize {
+	if leafPage.ContentSize + totalSubPageSize > PageSize {
 		return nil, fmt.Errorf("sub-page too large to fit in a leaf page")
 	}
 
 	// Step 4: Insert the sub-page into the leaf page
 
 	// Calculate the offset where the sub-page will be placed
-	offset := int(leafPage.ContentSize)
+	offset := leafPage.ContentSize
 
 	// Write the sub-page header at the calculated offset
 	leafPage.data[offset] = subPageID                                              // Sub-page ID   (1 byte)
@@ -3747,7 +3747,7 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	// Step 5: Update the leaf page metadata
 
 	// Update the content size
-	leafPage.ContentSize = uint16(offset + totalSubPageSize)
+	leafPage.ContentSize = offset + totalSubPageSize
 
 	// Create the LeafSubPageInfo and add it to the leaf page
 	leafEntry := LeafEntry{
@@ -4075,7 +4075,7 @@ func (db *DB) updateLeafPage(leafPage *LeafPage, removeSubPageIdx int, newSubPag
 		leafPage.SubPages[removeSubPageIdx] = nil
 
 		// Update content size
-		leafPage.ContentSize -= uint16(removedSize)
+		leafPage.ContentSize -= removedSize
 	}
 
 	// Add new sub-page if provided
@@ -4084,7 +4084,7 @@ func (db *DB) updateLeafPage(leafPage *LeafPage, removeSubPageIdx int, newSubPag
 		totalSubPageSize := LeafSubPageHeaderSize + int(subPageSize)
 
 		// Check if there's enough space
-		if int(leafPage.ContentSize) + totalSubPageSize > PageSize {
+		if leafPage.ContentSize + totalSubPageSize > PageSize {
 			return -1, fmt.Errorf("not enough space in leaf page for new sub-page")
 		}
 
@@ -4126,7 +4126,7 @@ func (db *DB) updateLeafPage(leafPage *LeafPage, removeSubPageIdx int, newSubPag
 		}
 
 		// Update content size
-		leafPage.ContentSize += uint16(totalSubPageSize)
+		leafPage.ContentSize += totalSubPageSize
 	}
 
 	// Mark the page as dirty
@@ -4468,7 +4468,7 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	copy(newLeafPage.data[offset+3:], newSubPageData)
 
 	// Update the new leaf page metadata
-	newLeafPage.ContentSize = uint16(int(newLeafPage.ContentSize) + totalSubPageSize)
+	newLeafPage.ContentSize += totalSubPageSize
 
 	// Create the LeafSubPageInfo and add it to the new leaf page
 	newLeafPage.SubPages[newSubPageID] = &LeafSubPageInfo{
