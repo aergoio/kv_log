@@ -3839,7 +3839,7 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	// Step 5: Update the leaf page metadata
 
 	// Update the content size
-	leafPage.ContentSize = offset + totalSubPageSize
+	leafPage.ContentSize += totalSubPageSize
 
 	// Create the LeafSubPageInfo and add it to the leaf page
 	leafEntry := LeafEntry{
@@ -3861,7 +3861,7 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	db.markPageDirty(leafPage)
 
 	// Add the leaf page to the free list if it has reasonable free space
-	db.addToFreeLeafPagesList(leafPage, 0)
+	//db.addToFreeLeafPagesList(leafPage, 0)
 
 	// Step 6: Return the LeafSubPage reference
 	return &LeafSubPage{
@@ -4573,7 +4573,7 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	db.markPageDirty(newLeafPage)
 
 	// Add the new leaf page to the free list if it has reasonable free space
-	db.addToFreeLeafPagesList(newLeafPage, 0)
+	//db.addToFreeLeafPagesList(newLeafPage, 0)
 
 	// Remove the sub-page from the original leaf page
 	_, err = db.updateLeafPage(leafPage, int(subPageIdx), nil, nil)
