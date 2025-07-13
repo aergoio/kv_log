@@ -4605,12 +4605,10 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage) {
 		}
 
 		// Only add if new entry has more free space than the minimum found
-		if uint16(freeSpace) > minFreeSpace && minIndex >= 0 {
-			// Replace the entry with minimum free space with the last entry
-			arrayLen := len(db.freeLeafSpaceArray)
-			db.freeLeafSpaceArray[minIndex] = db.freeLeafSpaceArray[arrayLen-1]
-			// Shrink the array
-			db.freeLeafSpaceArray = db.freeLeafSpaceArray[:arrayLen-1]
+		if uint16(freeSpace) > minFreeSpace {
+			// Replace the entry with the new entry
+			db.freeLeafSpaceArray[minIndex] = newEntry
+			return
 		} else {
 			// Don't add this entry
 			return
