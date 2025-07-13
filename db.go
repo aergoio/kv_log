@@ -4581,8 +4581,6 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage) {
 		if entry.PageNumber == leafPage.pageNumber {
 			// Update existing entry
 			db.freeLeafSpaceArray[i].FreeSpace = uint16(freeSpace)
-			// Re-sort the array to maintain order (descending by free space)
-			db.sortFreeSpaceArray()
 			return
 		}
 	}
@@ -4595,13 +4593,24 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage) {
 
 	// If array is full, remove the entry with least free space
 	if len(db.freeLeafSpaceArray) >= MaxFreeSpaceEntries {
-		// Find the entry with minimum free space (should be at the end since array is sorted)
-		minFreeSpace := db.freeLeafSpaceArray[len(db.freeLeafSpaceArray)-1].FreeSpace
+		// Find the entry with minimum free space by iterating through the array
+		minFreeSpace := uint16(PageSize) // Start with max possible value
+		minIndex := -1
 
-		// Only add if new entry has more free space than the minimum
-		if uint16(freeSpace) > minFreeSpace {
-			// Remove the last entry (least free space)
-			db.freeLeafSpaceArray = db.freeLeafSpaceArray[:len(db.freeLeafSpaceArray)-1]
+		for i, entry := range db.freeLeafSpaceArray {
+			if entry.FreeSpace < minFreeSpace {
+				minFreeSpace = entry.FreeSpace
+				minIndex = i
+			}
+		}
+
+		// Only add if new entry has more free space than the minimum found
+		if uint16(freeSpace) > minFreeSpace && minIndex >= 0 {
+			// Replace the entry with minimum free space with the last entry
+			arrayLen := len(db.freeLeafSpaceArray)
+			db.freeLeafSpaceArray[minIndex] = db.freeLeafSpaceArray[arrayLen-1]
+			// Shrink the array
+			db.freeLeafSpaceArray = db.freeLeafSpaceArray[:arrayLen-1]
 		} else {
 			// Don't add this entry
 			return
@@ -4610,61 +4619,70 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage) {
 
 	// Add the new entry
 	db.freeLeafSpaceArray = append(db.freeLeafSpaceArray, newEntry)
-
-	// Sort the array to maintain descending order by free space
-	db.sortFreeSpaceArray()
 }
 
 // removeFromFreeSpaceArray removes a leaf page from the free space array
 func (db *DB) removeFromFreeSpaceArray(pageNumber uint32) {
 	debugPrint("Removing page %d from free space array\n", pageNumber)
+	arrayLen := len(db.freeLeafSpaceArray)
+
 	for i, entry := range db.freeLeafSpaceArray {
 		if entry.PageNumber == pageNumber {
-			// Remove this entry by shifting remaining entries
-			copy(db.freeLeafSpaceArray[i:], db.freeLeafSpaceArray[i+1:])
-			db.freeLeafSpaceArray = db.freeLeafSpaceArray[:len(db.freeLeafSpaceArray)-1]
+			// Replace this entry with the last entry (to avoid memory move)
+			if i < arrayLen-1 {
+				// Copy the last element to this position
+				db.freeLeafSpaceArray[i] = db.freeLeafSpaceArray[arrayLen-1]
+			}
+			// Shrink the array
+			db.freeLeafSpaceArray = db.freeLeafSpaceArray[:arrayLen-1]
 			return
 		}
 	}
-}
-
-// sortFreeSpaceArray sorts the free space array in descending order by free space
-func (db *DB) sortFreeSpaceArray() {
-	debugPrint("Sorting free space array\n")
-	sort.Slice(db.freeLeafSpaceArray, func(i, j int) bool {
-		return db.freeLeafSpaceArray[i].FreeSpace > db.freeLeafSpaceArray[j].FreeSpace
-	})
 }
 
 // findLeafPageWithSpace finds a leaf page with at least the specified amount of free space
 // Returns the page number and the amount of free space, or 0 if no suitable page is found
 func (db *DB) findLeafPageWithSpace(spaceNeeded int) (uint32, int) {
 	debugPrint("Finding leaf page with space: %d\n", spaceNeeded)
-	// Search for a page with just enough space (not necessarily the one with most space)
-	// We iterate from the end (least free space) to find the best fit
-	for i := len(db.freeLeafSpaceArray) - 1; i >= 0; i-- {
-		entry := db.freeLeafSpaceArray[i]
-		if int(entry.FreeSpace) >= spaceNeeded {
-			return entry.PageNumber, int(entry.FreeSpace)
+
+	// Optimization: iterate forward for better cache locality
+	// Find the best fit (page with just enough space)
+	bestFitPageNumber := uint32(0)
+	bestFitSpace := PageSize + 1 // Start with a value larger than any possible free space
+
+	// First pass: look for a page with exactly enough space or slightly more
+	for _, entry := range db.freeLeafSpaceArray {
+		entrySpace := int(entry.FreeSpace)
+		// If this is a better fit than what we've found so far
+		if entrySpace >= spaceNeeded && entrySpace < bestFitSpace {
+			bestFitPageNumber = entry.PageNumber
+			bestFitSpace = entrySpace
 		}
 	}
+
+	// If we found any page with enough space, return it
+	if bestFitPageNumber > 0 {
+		return bestFitPageNumber, bestFitSpace
+	}
+
+	// No page found with enough space
 	return 0, 0
 }
 
 // updateFreeSpaceArray updates the free space for a specific page in the array
 func (db *DB) updateFreeSpaceArray(pageNumber uint32, newFreeSpace int) {
 	debugPrint("Updating free space array for page %d to %d\n", pageNumber, newFreeSpace)
-	// If free space is too low, remove the entry
+
+	// If free space is too low, just remove the entry
 	if newFreeSpace < PageSize/10 {
 		db.removeFromFreeSpaceArray(pageNumber)
 		return
 	}
+
 	// Find the entry and update it
 	for i, entry := range db.freeLeafSpaceArray {
 		if entry.PageNumber == pageNumber {
 			db.freeLeafSpaceArray[i].FreeSpace = uint16(newFreeSpace)
-			// Re-sort to maintain order
-			db.sortFreeSpaceArray()
 			return
 		}
 	}
