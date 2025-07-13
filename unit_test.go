@@ -6646,6 +6646,9 @@ func TestMoveSubPageToNewLeafPage(t *testing.T) {
 	}
 	defer db.Close()
 
+	db.beginTransaction()
+	defer db.commitTransaction()
+
 	// Create a leaf page with some existing entries
 	leafPage, err := db.allocateLeafPage()
 	if err != nil {

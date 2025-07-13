@@ -149,6 +149,7 @@ type DB struct {
 	pendingCommands map[string]bool // Map to track pending worker commands
 	originalLockType int // Original lock type before transaction
 	lockAcquiredForTransaction bool // Whether lock was acquired for transaction
+	headerPageForTransaction *Page // Pointer to the header page for transaction
 
 	// Add a condition variable for transaction waiting
 	transactionCond *sync.Cond
@@ -2529,6 +2530,32 @@ func (db *DB) beginTransaction() {
 
 	db.seqMutex.Unlock()
 
+
+	// Get the header page
+	headerPage, err := db.getPage(0)
+	if err != nil {
+		debugPrint("Failed to get header page: %v\n", err)
+		return
+	}
+
+	// Get a writable version of the header page
+	headerPage, err = db.getWritablePage(headerPage)
+	if err != nil {
+		debugPrint("Failed to get writable header page: %v\n", err)
+		return
+	}
+
+	// Initialize the array if needed
+	if headerPage.freeLeafSpaceArray == nil {
+		headerPage.freeLeafSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
+	}
+
+	// Mark the header page as dirty
+	db.markPageDirty(headerPage)
+
+	// Store the header page for transaction
+	db.headerPageForTransaction = headerPage
+
 	debugPrint("Beginning transaction %d\n", db.txnSequence)
 }
 
@@ -4649,31 +4676,13 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 	debugPrint("Adding page %d to free space array with %d bytes of free space\n", leafPage.pageNumber, freeSpace)
 
 	// Get the header page
-	headerPage, err := db.getPage(0)
-	if err != nil {
-		debugPrint("Failed to get header page: %v\n", err)
-		return
-	}
-
-	// Get a writable version of the header page
-	headerPage, err = db.getWritablePage(headerPage)
-	if err != nil {
-		debugPrint("Failed to get writable header page: %v\n", err)
-		return
-	}
-
-	// Initialize the array if needed
-	if headerPage.freeLeafSpaceArray == nil {
-		headerPage.freeLeafSpaceArray = make([]FreeSpaceEntry, 0, MaxFreeSpaceEntries)
-	}
+	headerPage := db.headerPageForTransaction
 
 	// Look for existing entry
 	for i, entry := range headerPage.freeLeafSpaceArray {
 		if entry.PageNumber == leafPage.pageNumber {
 			// Update existing entry
 			headerPage.freeLeafSpaceArray[i].FreeSpace = uint16(freeSpace)
-			// Mark the header page as dirty
-			db.markPageDirty(headerPage)
 			return
 		}
 	}
@@ -4701,8 +4710,6 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 		if uint16(freeSpace) > minFreeSpace {
 			// Replace the entry with the new entry
 			headerPage.freeLeafSpaceArray[minIndex] = newEntry
-			// Mark the header page as dirty
-			db.markPageDirty(headerPage)
 			return
 		} else {
 			// Don't add this entry
@@ -4712,9 +4719,6 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 
 	// Add the new entry
 	headerPage.freeLeafSpaceArray = append(headerPage.freeLeafSpaceArray, newEntry)
-
-	// Mark the header page as dirty
-	db.markPageDirty(headerPage)
 }
 
 // removeFromFreeSpaceArray removes a leaf page from the free space array
@@ -4722,40 +4726,16 @@ func (db *DB) removeFromFreeSpaceArray(position int, pageNumber uint32) {
 	debugPrint("Removing page %d from free space array\n", pageNumber)
 
 	// Get the header page
-	headerPage, err := db.getPage(0)
-	if err != nil {
-		debugPrint("Failed to get header page: %v\n", err)
-		return
-	}
-
-	// If the array is empty, nothing to do
-	if headerPage.freeLeafSpaceArray == nil || len(headerPage.freeLeafSpaceArray) == 0 {
-		return
-	}
-
-	// Get a writable version of the header page
-	headerPage, err = db.getWritablePage(headerPage)
-	if err != nil {
-		debugPrint("Failed to get writable header page: %v\n", err)
-		return
-	}
-
-	arrayLen := len(headerPage.freeLeafSpaceArray)
-
-	// Check if the position is valid
-	if position < 0 || position >= arrayLen {
-		return
-	}
+	headerPage := db.headerPageForTransaction
 
 	// Replace this entry with the last entry (to avoid memory move)
-
-	// Copy the last element to this position
-	headerPage.freeLeafSpaceArray[position] = headerPage.freeLeafSpaceArray[arrayLen-1]
-	// Shrink the array
-	headerPage.freeLeafSpaceArray = headerPage.freeLeafSpaceArray[:arrayLen-1]
-
-	// Mark the header page as dirty
-	db.markPageDirty(headerPage)
+	arrayLen := len(headerPage.freeLeafSpaceArray)
+	if position >= 0 && position < arrayLen {
+		// Copy the last element to this position
+		headerPage.freeLeafSpaceArray[position] = headerPage.freeLeafSpaceArray[arrayLen-1]
+		// Shrink the array
+		headerPage.freeLeafSpaceArray = headerPage.freeLeafSpaceArray[:arrayLen-1]
+	}
 }
 
 // findLeafPageWithSpace finds a leaf page with at least the specified amount of free space
@@ -4764,16 +4744,7 @@ func (db *DB) findLeafPageWithSpace(spaceNeeded int) (uint32, int, int) {
 	debugPrint("Finding leaf page with space: %d\n", spaceNeeded)
 
 	// Get the header page
-	headerPage, err := db.getPage(0)
-	if err != nil {
-		debugPrint("Failed to get header page: %v\n", err)
-		return 0, 0, 0
-	}
-
-	// If the array is empty, nothing to do
-	if headerPage.freeLeafSpaceArray == nil || len(headerPage.freeLeafSpaceArray) == 0 {
-		return 0, 0, 0
-	}
+	headerPage := db.headerPageForTransaction
 
 	// Optimization: iterate forward for better cache locality
 	// Find the best fit (page with just enough space)
@@ -4812,28 +4783,10 @@ func (db *DB) updateFreeSpaceArray(position int, pageNumber uint32, newFreeSpace
 	}
 
 	// Get the header page
-	headerPage, err := db.getPage(0)
-	if err != nil {
-		debugPrint("Failed to get header page: %v\n", err)
-		return
-	}
-
-	// If the array is empty, nothing to do
-	if headerPage.freeLeafSpaceArray == nil || len(headerPage.freeLeafSpaceArray) == 0 {
-		return
-	}
-
-	// Get a writable version of the header page
-	headerPage, err = db.getWritablePage(headerPage)
-	if err != nil {
-		debugPrint("Failed to get writable header page: %v\n", err)
-		return
-	}
+	headerPage := db.headerPageForTransaction
 
 	// Update the entry
 	headerPage.freeLeafSpaceArray[position].FreeSpace = uint16(newFreeSpace)
-	// Mark the header page as dirty
-	db.markPageDirty(headerPage)
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4882,7 +4835,31 @@ func (db *DB) recoverUnindexedContent() error {
 	}
 
 	// Initialize the transaction sequence
-	db.txnSequence = 1
+	db.beginTransaction()
+
+	// Reindex the content
+	err = db.reindexContent(lastIndexedOffset)
+
+	if err != nil {
+		db.rollbackTransaction()
+		return fmt.Errorf("failed to reindex content: %w", err)
+	}
+
+	// Commit the transaction
+	db.commitTransaction()
+
+	if !db.readOnly {
+		// Flush the index pages to disk
+		if err := db.flushIndexToDisk(); err != nil {
+			return fmt.Errorf("failed to flush index to disk: %w", err)
+		}
+	}
+
+	debugPrint("Recovery complete, reindexed content up to offset %d\n", db.mainFileSize)
+	return nil
+}
+
+func (db *DB) reindexContent(lastIndexedOffset int64) error {
 
 	// Get the root radix sub-page
 	rootSubPage, err := db.getRootRadixSubPage()
@@ -4917,14 +4894,6 @@ func (db *DB) recoverUnindexedContent() error {
 		currentOffset += int64(len(content.data))
 	}
 
-	if !db.readOnly {
-		// Flush the index pages to disk
-		if err := db.flushIndexToDisk(); err != nil {
-			return fmt.Errorf("failed to flush index to disk: %w", err)
-		}
-	}
-
-	debugPrint("Recovery complete, reindexed content up to offset %d\n", db.mainFileSize)
 	return nil
 }
 
