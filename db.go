@@ -51,6 +51,8 @@ const (
 
 	// Leaf sub-page header size
 	LeafSubPageHeaderSize = 3 // SubPageID(1) + SubPageSize(2)
+	// Minimum free space in bytes required to add a leaf page to the free space array
+	MIN_FREE_SPACE = 64
 )
 
 // Content types
@@ -3622,8 +3624,8 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 		// Calculate the free space after adding the content
 		freeSpaceAfter := freeSpace - spaceNeeded
 
-		// if the free slace is less than 10% of the page size or there is no more available slots
-		if freeSpaceAfter < PageSize/10 || usedSlots == 256 {
+		// if the free space is less than MIN_FREE_SPACE or there are no more available slots
+		if freeSpaceAfter < MIN_FREE_SPACE || usedSlots == 256 {
 			// Remove the page from the free list
 			db.removeFromFreeSpaceArray(position, leafPage.pageNumber)
 		} else {
@@ -4534,8 +4536,8 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 		panic(fmt.Sprintf("Page %d has content size greater than page size: %d", leafPage.pageNumber, leafPage.ContentSize))
 	}
 
-	// Only add if the page has reasonable free space (at least 10% of page size)
-	if freeSpace < PageSize/10 {
+	// Only add if the page has reasonable free space (at least MIN_FREE_SPACE bytes)
+	if freeSpace < MIN_FREE_SPACE {
 		return
 	}
 
@@ -4643,7 +4645,7 @@ func (db *DB) updateFreeSpaceArray(position int, pageNumber uint32, newFreeSpace
 	debugPrint("Updating free space array for page %d to %d\n", pageNumber, newFreeSpace)
 
 	// If free space is too low, just remove the entry
-	if newFreeSpace < PageSize/10 {
+	if newFreeSpace < MIN_FREE_SPACE {
 		db.removeFromFreeSpaceArray(position, pageNumber)
 		return
 	}
