@@ -3790,32 +3790,14 @@ func (db *DB) getRadixSubPage(pageNumber uint32, subPageIdx uint8, maxReadSeq ..
 
 // addEntryToNewLeafSubPage creates a new sub-page, adds an entry to it, then search for a leaf page with enough space to insert the sub-page into
 func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSubPage, error) {
-	// Step 1: Create a new leaf sub-page data buffer and serialize the entry
 
-	// Create a buffer for the sub-page data (without the 3-byte header)
+	// Step 1: Compute the space requirements for the new sub-page
 	suffixLenSize := varint.Size(uint64(len(suffix)))
 	entrySize := suffixLenSize + len(suffix) + 8 // suffix length + suffix + data offset
-
-	subPageData := make([]byte, entrySize)
-	pos := 0
-
-	// Write suffix length
-	suffixLenWritten := varint.Write(subPageData[pos:], uint64(len(suffix)))
-	pos += suffixLenWritten
-
-	copy(subPageData[pos:], suffix)
-	pos += len(suffix)
-
-	binary.LittleEndian.PutUint64(subPageData[pos:], uint64(dataOffset))
-	pos += 8
-
-	// Step 2: Calculate the total size of this sub-page (including header)
-	subPageSize := uint16(len(subPageData)) // Size of the data (excluding the 3-byte header)
+	subPageSize := uint16(entrySize) // Size of the data (excluding the 3-byte header)
 	totalSubPageSize := LeafSubPageHeaderSize + int(subPageSize) // 3 bytes header + data
 
-	// Step 3: Try to find a leaf page with enough space, or create a new one
-
-	// Allocate a leaf sub-page with enough space
+	// Step 2: Allocate a leaf page with enough space
 	leafSubPage, err := db.allocateLeafPageWithSpace(totalSubPageSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate leaf sub-page: %w", err)
@@ -3824,25 +3806,34 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	leafPage := leafSubPage.Page
 	subPageID := leafSubPage.SubPageIdx
 
-	// Check if there's enough space in the leaf page
+	// Verify there's enough space (this should always be true after allocateLeafPageWithSpace)
 	if leafPage.ContentSize + totalSubPageSize > PageSize {
 		return nil, fmt.Errorf("sub-page too large to fit in a leaf page")
 	}
 
-	// Step 4: Insert the sub-page into the leaf page
-
+	// Step 3: Write data directly into the leaf page
 	// Calculate the offset where the sub-page will be placed
 	offset := leafPage.ContentSize
 
-	// Write the sub-page header at the calculated offset
+	// Write the sub-page header directly to the leaf page
 	leafPage.data[offset] = subPageID                                              // Sub-page ID   (1 byte)
 	binary.LittleEndian.PutUint16(leafPage.data[offset+1:offset+3], subPageSize)   // Sub-page size (2 bytes)
 
-	// Write the sub-page data after the header
-	copy(leafPage.data[offset+3:], subPageData)
+	// Write the entry data directly after the header
+	dataPos := offset + 3
 
-	// Step 5: Update the leaf page metadata
+	// Write suffix length directly
+	suffixLenWritten := varint.Write(leafPage.data[dataPos:], uint64(len(suffix)))
+	dataPos += suffixLenWritten
 
+	// Write suffix directly
+	copy(leafPage.data[dataPos:], suffix)
+	dataPos += len(suffix)
+
+	// Write data offset directly
+	binary.LittleEndian.PutUint64(leafPage.data[dataPos:], uint64(dataOffset))
+
+	// Step 4: Update the leaf page metadata
 	// Update the content size
 	leafPage.ContentSize += totalSubPageSize
 
@@ -3858,10 +3849,7 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	// Mark the page as dirty
 	db.markPageDirty(leafPage)
 
-	// Add the leaf page to the free list if it has reasonable free space
-	//db.addToFreeLeafPagesList(leafPage, 0)
-
-	// Step 6: Return the LeafSubPage reference
+	// Step 5: Return the LeafSubPage reference
 	return &LeafSubPage{
 		Page:       leafPage,
 		SubPageIdx: subPageID,
