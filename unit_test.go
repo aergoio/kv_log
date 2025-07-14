@@ -4044,11 +4044,12 @@ func TestUpdateEntryInLeafSubPage(t *testing.T) {
 		}
 	})
 }
-// TestUpdateLeafPage tests the updateLeafPage function with the new multi-sub-page format
-func TestUpdateLeafPage(t *testing.T) {
+
+// TestRemoveSubPageFromLeafPage tests the removeSubPageFromLeafPage function
+func TestRemoveSubPageFromLeafPage(t *testing.T) {
 	// Create a temporary database for testing
 	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test_updateleafpage.db")
+	dbPath := filepath.Join(tmpDir, "test_removesubpage.db")
 	db, err := Open(dbPath)
 	if err != nil {
 		t.Fatalf("Failed to open database: %v", err)
@@ -4059,7 +4060,7 @@ func TestUpdateLeafPage(t *testing.T) {
 	db.beginTransaction()
 	defer db.commitTransaction()
 
-	t.Run("RemoveSubPageOnly", func(t *testing.T) {
+	t.Run("RemoveSingleSubPage", func(t *testing.T) {
 		// Create a leaf sub-page with one entry
 		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("test_entry"), 1000)
 		if err != nil {
@@ -4068,164 +4069,102 @@ func TestUpdateLeafPage(t *testing.T) {
 
 		leafPage := leafSubPage.Page
 		subPageIdx := leafSubPage.SubPageIdx
+		originalContentSize := leafPage.ContentSize
 
 		// Verify sub-page exists
 		if leafPage.SubPages[subPageIdx] == nil {
 			t.Fatal("Sub-page should exist before removal")
 		}
 
-		// Remove the sub-page
-		newSubPageIdx, err := db.updateLeafPage(leafPage, int(subPageIdx), nil)
-		if err != nil {
-			t.Fatalf("Failed to remove sub-page: %v", err)
-		}
+		// Store the sub-page info before removal
+		subPageInfo := leafPage.SubPages[subPageIdx]
+		expectedRemovedSize := LeafSubPageHeaderSize + int(subPageInfo.Size)
 
-		// Should return -1 since no new sub-page was added
-		if newSubPageIdx != -1 {
-			t.Errorf("Expected -1 for no new sub-page, got %d", newSubPageIdx)
-		}
+		// Remove the sub-page
+		db.removeSubPageFromLeafPage(leafPage, subPageIdx)
 
 		// Verify sub-page was removed
 		if leafPage.SubPages[subPageIdx] != nil {
 			t.Error("Sub-page should be removed")
 		}
-	})
 
-	t.Run("AddSubPageOnly", func(t *testing.T) {
-		// Create an empty leaf page
-		leafPage, err := db.allocateLeafPage()
-		if err != nil {
-			t.Fatalf("Failed to allocate leaf page: %v", err)
+		// Verify content size was updated correctly
+		expectedNewContentSize := originalContentSize - expectedRemovedSize
+		if leafPage.ContentSize != expectedNewContentSize {
+			t.Errorf("Expected content size %d, got %d", expectedNewContentSize, leafPage.ContentSize)
 		}
 
-		// Create new sub-page data
-		suffix := []byte("new_entry")
-		dataOffset := int64(2000)
-
-		// Create sub-page data buffer
-		suffixLenSize := 1 // For length 9, varint uses 1 byte
-		entrySize := suffixLenSize + len(suffix) + 8
-		subPageData := make([]byte, entrySize)
-		pos := 0
-
-		// Write suffix length (varint)
-		subPageData[pos] = byte(len(suffix))
-		pos++
-
-		// Write suffix
-		copy(subPageData[pos:], suffix)
-		pos += len(suffix)
-
-		// Write data offset
-		binary.LittleEndian.PutUint64(subPageData[pos:], uint64(dataOffset))
-
-		// Add new sub-page
-		newSubPageIdx, err := db.updateLeafPage(leafPage, -1, subPageData)
-		if err != nil {
-			t.Fatalf("Failed to add sub-page: %v", err)
-		}
-
-		// Should return a valid sub-page index
-		if newSubPageIdx < 0 || newSubPageIdx >= 256 {
-			t.Errorf("Expected valid sub-page index (0-255), got %d", newSubPageIdx)
-		}
-
-		// Verify sub-page was added
-		if leafPage.SubPages[newSubPageIdx] == nil {
-			t.Error("Sub-page should be added")
-		}
-
-		// Verify sub-page content
-		entryCount := countSubPageEntries(db, leafPage, uint8(newSubPageIdx))
-		if entryCount != 1 {
-			t.Errorf("Expected 1 entry in new sub-page, got %d", entryCount)
-		}
-
-		entryDataOffset, _, found := getSubPageEntry(db, leafPage, uint8(newSubPageIdx), 0)
-		if !found {
-			t.Fatalf("Expected to find entry at index 0")
-		}
-		if entryDataOffset != dataOffset {
-			t.Errorf("Expected data offset %d, got %d", dataOffset, entryDataOffset)
+		// Verify page is marked as dirty
+		if !leafPage.dirty {
+			t.Error("Leaf page should be marked as dirty after sub-page removal")
 		}
 	})
 
-	t.Run("RemoveAndAddSubPage", func(t *testing.T) {
-		// Create a leaf sub-page with one entry
-		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("old_entry"), 1000)
+	t.Run("RemoveFromMultipleSubPages", func(t *testing.T) {
+		// Create multiple sub-pages
+		leafSubPage1, err := db.addEntryToNewLeafSubPage([]byte("entry1"), 1001)
+		if err != nil {
+			t.Fatalf("Failed to create first leaf sub-page: %v", err)
+		}
+
+		leafPage := leafSubPage1.Page
+
+		// Add a second entry to create another sub-page on the same page
+		leafSubPage2, err := db.addEntryToNewLeafSubPage([]byte("entry2"), 1002)
+		if err != nil {
+			t.Fatalf("Failed to create second leaf sub-page: %v", err)
+		}
+
+		// Verify both sub-pages are on the same page (this might not always be the case,
+		// but for this test we'll check if they are)
+		if leafSubPage2.Page.pageNumber == leafPage.pageNumber {
+			subPageIdx1 := leafSubPage1.SubPageIdx
+			subPageIdx2 := leafSubPage2.SubPageIdx
+
+			// Store original offsets
+			originalOffset2 := leafPage.SubPages[subPageIdx2].Offset
+
+			// Remove the first sub-page
+			db.removeSubPageFromLeafPage(leafPage, subPageIdx1)
+
+			// Verify first sub-page was removed
+			if leafPage.SubPages[subPageIdx1] != nil {
+				t.Error("First sub-page should be removed")
+			}
+
+			// Verify second sub-page still exists
+			if leafPage.SubPages[subPageIdx2] == nil {
+				t.Error("Second sub-page should still exist")
+			}
+
+			// Verify second sub-page offset was updated (should be shifted down)
+			newOffset2 := leafPage.SubPages[subPageIdx2].Offset
+			if newOffset2 >= originalOffset2 {
+				t.Error("Second sub-page offset should be shifted down after first sub-page removal")
+			}
+		}
+	})
+
+	t.Run("RemoveNonExistentSubPage", func(t *testing.T) {
+		// Create a leaf page
+		leafSubPage, err := db.addEntryToNewLeafSubPage([]byte("test_entry"), 1003)
 		if err != nil {
 			t.Fatalf("Failed to create leaf sub-page: %v", err)
 		}
 
 		leafPage := leafSubPage.Page
-		oldSubPageIdx := leafSubPage.SubPageIdx
+		originalContentSize := leafPage.ContentSize
 
-		// Create new sub-page data
-		suffix := []byte("new_entry")
-		dataOffset := int64(2000)
+		// Try to remove a non-existent sub-page (should not crash or change anything)
+		nonExistentIdx := uint8(200) // Use a high index that's unlikely to exist
+		db.removeSubPageFromLeafPage(leafPage, nonExistentIdx)
 
-		// Create sub-page data buffer
-		suffixLenSize := 1 // For length 9, varint uses 1 byte
-		entrySize := suffixLenSize + len(suffix) + 8
-		subPageData := make([]byte, entrySize)
-		pos := 0
-
-		// Write suffix length (varint)
-		subPageData[pos] = byte(len(suffix))
-		pos++
-
-		// Write suffix
-		copy(subPageData[pos:], suffix)
-		pos += len(suffix)
-
-		// Write data offset
-		binary.LittleEndian.PutUint64(subPageData[pos:], uint64(dataOffset))
-
-		// Remove old sub-page and add new one
-		newSubPageIdx, err := db.updateLeafPage(leafPage, int(oldSubPageIdx), subPageData)
-		if err != nil {
-			t.Fatalf("Failed to update leaf page: %v", err)
-		}
-
-		// Should return a valid sub-page index
-		if newSubPageIdx < 0 || newSubPageIdx >= 256 {
-			t.Errorf("Expected valid sub-page index (0-255), got %d", newSubPageIdx)
-		}
-
-		// Verify the operation was successful
-		if newSubPageIdx < 0 || newSubPageIdx >= 256 {
-			t.Errorf("Expected valid sub-page index (0-255), got %d", newSubPageIdx)
-		}
-
-		// Verify the sub-page exists and has the correct content
-		if leafPage.SubPages[newSubPageIdx] == nil {
-			t.Error("New sub-page should be added")
-		}
-
-		// Verify new sub-page content
-		entryCount := countSubPageEntries(db, leafPage, uint8(newSubPageIdx))
-		if entryCount != 1 {
-			t.Errorf("Expected 1 entry in new sub-page, got %d", entryCount)
-		}
-
-		entryDataOffset, _, found := getSubPageEntry(db, leafPage, uint8(newSubPageIdx), 0)
-		if !found {
-			t.Fatalf("Expected to find entry at index 0")
-		}
-		if entryDataOffset != dataOffset {
-			t.Errorf("Expected data offset %d, got %d", dataOffset, entryDataOffset)
-		}
-
-		// Verify the suffix is correct
-		_, entrySuffix, _ := getSubPageEntry(db, leafPage, uint8(newSubPageIdx), 0)
-		if len(entrySuffix) != len(suffix) {
-			t.Errorf("Expected suffix length %d, got %d", len(suffix), len(entrySuffix))
+		// Verify content size didn't change
+		if leafPage.ContentSize != originalContentSize {
+			t.Error("Content size should not change when removing non-existent sub-page")
 		}
 	})
 }
-
-// Note: TestRebuildLeafPageData was removed because rebuildLeafPageData function no longer exists.
-// The functionality has been replaced by updateLeafPage which is tested in TestUpdateLeafPage.
 
 // ------------------------------------------------------------------------------------------------
 // Radix page tests
