@@ -4546,12 +4546,22 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 	// Get the header page
 	headerPage := db.headerPageForTransaction
 
-	// Look for existing entry
+	// Find the entry with minimum free space by iterating through the array
+	minFreeSpace := uint16(PageSize) // Start with max possible value
+	minIndex := -1
+
+	// Iterate through the array
 	for i, entry := range headerPage.freeLeafSpaceArray {
+		// Look for existing entry
 		if entry.PageNumber == leafPage.pageNumber {
-			// Update existing entry
+			// If found, update existing entry
 			headerPage.freeLeafSpaceArray[i].FreeSpace = uint16(freeSpace)
 			return
+		}
+		// Find the entry with minimum free space
+		if entry.FreeSpace < minFreeSpace {
+			minFreeSpace = entry.FreeSpace
+			minIndex = i
 		}
 	}
 
@@ -4563,17 +4573,6 @@ func (db *DB) addToFreeSpaceArray(leafPage *LeafPage, freeSpace int) {
 
 	// If array is full, remove the entry with least free space
 	if len(headerPage.freeLeafSpaceArray) >= MaxFreeSpaceEntries {
-		// Find the entry with minimum free space by iterating through the array
-		minFreeSpace := uint16(PageSize) // Start with max possible value
-		minIndex := -1
-
-		for i, entry := range headerPage.freeLeafSpaceArray {
-			if entry.FreeSpace < minFreeSpace {
-				minFreeSpace = entry.FreeSpace
-				minIndex = i
-			}
-		}
-
 		// Only add if new entry has more free space than the minimum found
 		if uint16(freeSpace) > minFreeSpace {
 			// Replace the entry with the new entry
