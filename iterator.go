@@ -359,7 +359,7 @@ func (it *Iterator) loadAndSortLeafEntries(pos *radixIterPos) bool {
 
 	// Load entries from the specific sub-page - construct keys from prefix + suffix
 	subPageInfo := leafPage.SubPages[pos.subPageIdx]
-	if subPageInfo != nil {
+	if subPageInfo.Offset != 0 {
 		// Iterate through entries in the sub-page
 		it.db.iterateLeafSubPageEntries(leafPage, pos.subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
 			// Get the suffix from the leaf page data

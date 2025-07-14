@@ -1652,7 +1652,7 @@ func TestAddEntryToNewLeafSubPage(t *testing.T) {
 			t.Fatalf("SubPages array too small for index %d", leafSubPage.SubPageIdx)
 		}
 		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
-		if subPageInfo == nil {
+		if subPageInfo.Offset == 0 {
 			t.Fatal("Expected sub-page info to exist")
 		}
 
@@ -1799,7 +1799,7 @@ func TestAddEntryToNewLeafSubPage(t *testing.T) {
 		// Verify sub-page count - should have at least 1 sub-page
 		subPageCount := 0
 		for _, subPage := range leafPage.SubPages {
-			if subPage != nil {
+			if subPage.Offset != 0 {
 				subPageCount++
 			}
 		}
@@ -1880,7 +1880,7 @@ func TestAddEntryToNewLeafSubPage(t *testing.T) {
 			for _, subPage := range leafSubPages {
 				if subPage.Page.pageNumber == pageNum {
 					for _, sp := range subPage.Page.SubPages {
-						if sp != nil {
+						if sp.Offset != 0 {
 							totalSubPageCount++
 						}
 					}
@@ -1982,7 +1982,7 @@ func TestSetOnLeafSubPage(t *testing.T) {
 
 		// Verify the entry was added/updated
 		subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
-		if subPageInfo == nil {
+		if subPageInfo.Offset == 0 {
 			t.Fatal("Expected sub-page info to exist")
 		}
 
@@ -3015,7 +3015,7 @@ func TestPageCacheAfterLeafOperations(t *testing.T) {
 	for pageNum, page := range pageSet {
 		subPageCountForPage := 0
 		for i, subPage := range page.SubPages {
-			if subPage != nil {
+			if subPage.Offset != 0 {
 				subPageCountForPage++
 				totalSubPageCount++
 
@@ -3101,7 +3101,7 @@ func TestParseLeafSubPages(t *testing.T) {
 		// Count non-nil sub-pages
 		subPageCount := 0
 		for _, subPage := range leafPage.SubPages {
-			if subPage != nil {
+			if subPage.Offset != 0 {
 				subPageCount++
 			}
 		}
@@ -3120,7 +3120,7 @@ func TestParseLeafSubPages(t *testing.T) {
 		leafPage := leafSubPage.Page
 
 		// Clear sub-pages and re-parse to test parsing
-		leafPage.SubPages = nil
+		leafPage.SubPages = make([]LeafSubPageInfo, 256)
 		err = db.parseLeafSubPages(leafPage)
 		if err != nil {
 			t.Fatalf("Failed to parse leaf sub-pages: %v", err)
@@ -3133,9 +3133,9 @@ func TestParseLeafSubPages(t *testing.T) {
 
 		// Should have one non-nil sub-page
 		subPageCount := 0
-		var parsedSubPage *LeafSubPageInfo
+		var parsedSubPage LeafSubPageInfo
 		for _, subPage := range leafPage.SubPages {
-			if subPage != nil {
+			if subPage.Offset != 0 {
 				subPageCount++
 				parsedSubPage = subPage
 			}
@@ -3145,8 +3145,8 @@ func TestParseLeafSubPages(t *testing.T) {
 		}
 
 		// Verify the parsed sub-page
-		if parsedSubPage == nil {
-			t.Fatal("Expected non-nil parsed sub-page")
+		if parsedSubPage.Offset == 0 {
+			t.Fatal("Expected non-empty parsed sub-page")
 		}
 
 		entryCount := countSubPageEntries(db, leafPage, leafSubPage.SubPageIdx)
@@ -3206,7 +3206,7 @@ func TestParseLeafSubPages(t *testing.T) {
 		leafPage := leafSubPage1.Page
 
 		// Clear sub-pages and re-parse to test parsing
-		leafPage.SubPages = nil
+		leafPage.SubPages = make([]LeafSubPageInfo, 256)
 		err = db.parseLeafSubPages(leafPage)
 		if err != nil {
 			t.Fatalf("Failed to parse multiple leaf sub-pages: %v", err)
@@ -3215,7 +3215,7 @@ func TestParseLeafSubPages(t *testing.T) {
 		// Count non-nil sub-pages
 		subPageCount := 0
 		for _, subPage := range leafPage.SubPages {
-			if subPage != nil {
+			if subPage.Offset != 0 {
 				subPageCount++
 			}
 		}
@@ -3227,7 +3227,7 @@ func TestParseLeafSubPages(t *testing.T) {
 
 		// Verify each non-nil sub-page has valid entries
 		for i, subPage := range leafPage.SubPages {
-			if subPage != nil {
+			if subPage.Offset != 0 {
 				entryCount := countSubPageEntries(db, leafPage, uint8(i))
 				if entryCount == 0 {
 					t.Errorf("Sub-page %d has no entries", i)
@@ -3307,7 +3307,7 @@ func TestParseLeafPage(t *testing.T) {
 		// Count non-nil sub-pages
 		subPageCount := 0
 		for _, subPage := range parsedPage.SubPages {
-			if subPage != nil {
+			if subPage.Offset != 0 {
 				subPageCount++
 			}
 		}
@@ -3316,15 +3316,15 @@ func TestParseLeafPage(t *testing.T) {
 		}
 
 		// Verify the parsed sub-page has entries
-		var foundSubPage *LeafSubPageInfo
+		var hasFoundSubPage bool
 		for _, subPage := range parsedPage.SubPages {
-			if subPage != nil {
-				foundSubPage = subPage
+			if subPage.Offset != 0 {
+				hasFoundSubPage = true
 				break
 			}
 		}
 
-		if foundSubPage == nil {
+		if !hasFoundSubPage {
 			t.Fatal("Expected to find at least one sub-page")
 		}
 
@@ -3416,7 +3416,7 @@ func TestParseLeafPage(t *testing.T) {
 		// Count non-nil sub-pages
 		subPageCount := 0
 		for _, subPage := range leafPage.SubPages {
-			if subPage != nil {
+			if subPage.Offset != 0 {
 				subPageCount++
 			}
 		}
@@ -3592,7 +3592,7 @@ func TestRemoveEntryFromLeafSubPage(t *testing.T) {
 		}
 
 		// Verify the sub-page is still present but has zero size
-		if leafSubPage.Page.SubPages[leafSubPage.SubPageIdx] == nil {
+		if leafSubPage.Page.SubPages[leafSubPage.SubPageIdx].Offset == 0 {
 			t.Error("Sub-page should not be removed when last entry is deleted")
 		} else if leafSubPage.Page.SubPages[leafSubPage.SubPageIdx].Size != 0 {
 			t.Errorf("Expected sub-page size to be 0, got %d", leafSubPage.Page.SubPages[leafSubPage.SubPageIdx].Size)
@@ -4079,19 +4079,19 @@ func TestRemoveSubPageFromLeafPage(t *testing.T) {
 		originalContentSize := leafPage.ContentSize
 
 		// Verify sub-page exists
-		if leafPage.SubPages[subPageIdx] == nil {
+		if leafPage.SubPages[subPageIdx].Offset == 0 {
 			t.Fatal("Sub-page should exist before removal")
 		}
 
 		// Store the sub-page info before removal
-		subPageInfo := leafPage.SubPages[subPageIdx]
+		subPageInfo := &leafPage.SubPages[subPageIdx]
 		expectedRemovedSize := LeafSubPageHeaderSize + int(subPageInfo.Size)
 
 		// Remove the sub-page
 		db.removeSubPageFromLeafPage(leafPage, subPageIdx)
 
 		// Verify sub-page was removed
-		if leafPage.SubPages[subPageIdx] != nil {
+		if leafPage.SubPages[subPageIdx].Offset != 0 {
 			t.Error("Sub-page should be removed")
 		}
 
@@ -4135,12 +4135,12 @@ func TestRemoveSubPageFromLeafPage(t *testing.T) {
 			db.removeSubPageFromLeafPage(leafPage, subPageIdx1)
 
 			// Verify first sub-page was removed
-			if leafPage.SubPages[subPageIdx1] != nil {
+			if leafPage.SubPages[subPageIdx1].Offset != 0 {
 				t.Error("First sub-page should be removed")
 			}
 
 			// Verify second sub-page still exists
-			if leafPage.SubPages[subPageIdx2] == nil {
+			if leafPage.SubPages[subPageIdx2].Offset == 0 {
 				t.Error("Second sub-page should still exist")
 			}
 
@@ -5968,11 +5968,11 @@ func TestWriteLeafPage(t *testing.T) {
 			data:        make([]byte, PageSize),
 			dirty:       true,
 			ContentSize: 20,
-			SubPages:    make([]*LeafSubPageInfo, 256),
+			SubPages:    make([]LeafSubPageInfo, 256),
 		}
 
 		// Add a sample sub-page to test with
-		leafPage.SubPages[0] = &LeafSubPageInfo{
+		leafPage.SubPages[0] = LeafSubPageInfo{
 			Offset:  8,
 			Size:    12,
 		}
@@ -6050,7 +6050,7 @@ func TestWriteLeafPage(t *testing.T) {
 			data:        make([]byte, PageSize),
 			dirty:       true,
 			ContentSize: 8,
-			SubPages:    make([]*LeafSubPageInfo, 256),
+			SubPages:    make([]LeafSubPageInfo, 256),
 		}
 
 		// Write should fail for page number 0
@@ -6081,7 +6081,7 @@ func TestWriteLeafPage(t *testing.T) {
 			data:        make([]byte, PageSize),
 			dirty:       true,
 			ContentSize: PageSize - 1, // Near maximum
-			SubPages:    make([]*LeafSubPageInfo, 256),
+			SubPages:    make([]LeafSubPageInfo, 256),
 		}
 
 		// Write should succeed
@@ -6653,10 +6653,10 @@ func TestCloneLeafPage(t *testing.T) {
 	originalSubPageCount := 0
 	clonedSubPageCount := 0
 	for i := 0; i < 256; i++ {
-		if originalPage.SubPages[i] != nil {
+		if originalPage.SubPages[i].Offset != 0 {
 			originalSubPageCount++
 		}
-		if clonedPage.SubPages[i] != nil {
+		if clonedPage.SubPages[i].Offset != 0 {
 			clonedSubPageCount++
 		}
 	}
@@ -6696,13 +6696,15 @@ func TestCloneLeafPage(t *testing.T) {
 		originalSubPage := originalPage.SubPages[i]
 		clonedSubPage := clonedPage.SubPages[i]
 
-		// Both should be nil or both should be non-nil
-		if (originalSubPage == nil) != (clonedSubPage == nil) {
-			t.Errorf("Sub-page %d mismatch: original is nil=%v, cloned is nil=%v", i, originalSubPage == nil, clonedSubPage == nil)
+		// Both should be empty or both should be non-empty
+		originalEmpty := originalSubPage.Offset == 0
+		clonedEmpty := clonedSubPage.Offset == 0
+		if originalEmpty != clonedEmpty {
+			t.Errorf("Sub-page %d mismatch: original is empty=%v, cloned is empty=%v", i, originalEmpty, clonedEmpty)
 			continue
 		}
 
-		if originalSubPage != nil && clonedSubPage != nil {
+		if !originalEmpty && !clonedEmpty {
 			// Verify sub-page metadata is copied
 			if clonedSubPage.Offset != originalSubPage.Offset {
 				t.Errorf("Sub-page %d offset not copied: expected %d, got %d", i, originalSubPage.Offset, clonedSubPage.Offset)
@@ -6818,11 +6820,11 @@ func TestMoveSubPageToNewLeafPage(t *testing.T) {
 
 	// Initialize SubPages array if needed
 	if leafPage.SubPages == nil {
-		leafPage.SubPages = make([]*LeafSubPageInfo, 256)
+		leafPage.SubPages = make([]LeafSubPageInfo, 256)
 	}
 
 	// Create the sub-page info
-	leafPage.SubPages[subPageIdx] = &LeafSubPageInfo{
+	leafPage.SubPages[subPageIdx] = LeafSubPageInfo{
 		Offset:  uint16(offset),
 		Size:    uint16(len(subPageData)),
 	}
@@ -6862,7 +6864,7 @@ func TestMoveSubPageToNewLeafPage(t *testing.T) {
 	newSubPageIdx := originalSubPage.SubPageIdx
 
 	// Check that the new page has the sub-page
-	if newPage.SubPages == nil || newPage.SubPages[newSubPageIdx] == nil {
+	if newPage.SubPages == nil || newPage.SubPages[newSubPageIdx].Offset == 0 {
 		t.Fatal("New page should have the moved sub-page")
 	}
 
@@ -6909,7 +6911,7 @@ func TestMoveSubPageToNewLeafPage(t *testing.T) {
 		t.Fatalf("Failed to get original page: %v", err)
 	}
 
-	if originalPage.SubPages != nil && originalPage.SubPages[subPageIdx] != nil {
+	if originalPage.SubPages != nil && originalPage.SubPages[subPageIdx].Offset != 0 {
 		t.Error("Original page should no longer have the moved sub-page")
 	}
 

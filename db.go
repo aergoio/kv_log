@@ -186,7 +186,7 @@ type Page struct {
 	NextFreePage uint32 // Pointer to the next radix page with free sub-pages (0 if none)
 	// Fields for LeafPage
 	ContentSize  int                // Total size of content on this page
-	SubPages     []*LeafSubPageInfo // Information about sub-pages in this leaf page (nil entries for unused IDs)
+	SubPages     []LeafSubPageInfo  // Information about sub-pages in this leaf page (allocated only for leaf pages)
 	// Fields for HeaderPage (only used when pageNumber == 0)
 	freeLeafSpaceArray []FreeSpaceEntry // Array of leaf pages with free space, sorted by free space (descending)
 }
@@ -1032,7 +1032,7 @@ func (db *DB) setOnLeafSubPage(parentSubPage *RadixSubPage, subPage *LeafSubPage
 	suffix := key[keyPos+1:]
 
 	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
 
@@ -1269,8 +1269,8 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 			suffix := key[keyPos+1:]
 
 			// Get the sub-page info
-			subPageInfo := leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
-			if subPageInfo == nil {
+			subPageInfo := &leafSubPage.Page.SubPages[leafSubPage.SubPageIdx]
+			if subPageInfo.Offset == 0 {
 				return nil, fmt.Errorf("sub-page with index %d not found", leafSubPage.SubPageIdx)
 			}
 
@@ -2089,7 +2089,7 @@ func (db *DB) parseLeafPage(data []byte, pageNumber uint32) (*LeafPage, error) {
 		data:        data,
 		dirty:       false,
 		ContentSize: contentSize,
-		SubPages:    make([]*LeafSubPageInfo, 256),
+		SubPages:    make([]LeafSubPageInfo, 256),
 	}
 
 	// Parse sub-page offsets and entries
@@ -2117,8 +2117,8 @@ func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 		return nil
 	}
 
-	// Create array with 256 entries to handle any sub-page ID (0-255)
-	leafPage.SubPages = make([]*LeafSubPageInfo, 256)
+	// Create slice with 256 entries to handle any sub-page ID (0-255)
+	leafPage.SubPages = make([]LeafSubPageInfo, 256)
 
 	// Read each sub-page until we reach the content size
 	for pos < leafPage.ContentSize {
@@ -2139,7 +2139,7 @@ func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 		}
 
 		// Create and store the sub-page info at the index corresponding to its ID
-		leafPage.SubPages[subPageID] = &LeafSubPageInfo{
+		leafPage.SubPages[subPageID] = LeafSubPageInfo{
 			Offset:  uint16(pos - 3), // Include the header in the offset
 			Size:    subPageSize,
 		}
@@ -2156,10 +2156,10 @@ func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 // Returns true to continue or false to stop
 func (db *DB) iterateLeafSubPageEntries(leafPage *LeafPage, subPageIdx uint8, callback func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool) error {
 	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := leafPage.SubPages[subPageIdx]
+	subPageInfo := &leafPage.SubPages[subPageIdx]
 
 	// Calculate the start and end positions for this sub-page's data
 	subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
@@ -3538,7 +3538,7 @@ func (db *DB) allocateLeafPage() (*LeafPage, error) {
 		data:        data,
 		dirty:       false,
 		ContentSize: LeafHeaderSize,
-		SubPages:    make([]*LeafSubPageInfo, 256),
+		SubPages:    make([]LeafSubPageInfo, 256),
 	}
 
 	// Update the access time
@@ -3591,15 +3591,11 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 
 		// Find the first available sub-page ID
 		var subPageID uint8 = 0
-		// Initialize SubPages array if not already done
-		if leafPage.SubPages == nil {
-			leafPage.SubPages = make([]*LeafSubPageInfo, 256)
-		}
 		// Find first available slot
-		for subPageID < 255 && leafPage.SubPages[subPageID] != nil {
+		for subPageID < 255 && leafPage.SubPages[subPageID].Offset != 0 {
 			subPageID++
 		}
-		if subPageID == 255 && leafPage.SubPages[subPageID] != nil {
+		if subPageID == 255 && leafPage.SubPages[subPageID].Offset != 0 {
 			debugPrint("No available sub-page IDs, removing page %d from free array\n", leafPage.pageNumber)
 			// No available sub-page IDs, remove this page from the free array and try again
 			db.removeFromFreeSpaceArray(position, leafPage.pageNumber)
@@ -3609,7 +3605,7 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 		// Count how many sub-page slots are currently used (continue from the last found slot)
 		usedSlots := int(subPageID) + 1
 		for i := usedSlots; i < 256; i++ {
-			if leafPage.SubPages[i] != nil {
+			if leafPage.SubPages[i].Offset != 0 {
 				usedSlots++
 			}
 		}
@@ -3687,23 +3683,14 @@ func (db *DB) cloneLeafPage(page *LeafPage) (*LeafPage, error) {
 		accessTime:   page.accessTime,
 		txnSequence:  page.txnSequence,
 		ContentSize:  page.ContentSize,
-		SubPages:     make([]*LeafSubPageInfo, 256),
+		SubPages:     make([]LeafSubPageInfo, 256),
 	}
 
 	// Copy the data
 	copy(newPage.data, page.data)
 
-	// Deep copy the sub-pages (without entries, since we parse them on-demand)
-	for i := 0; i < 256; i++ {
-		if page.SubPages[i] != nil {
-			subPage := page.SubPages[i]
-			// Store the sub-page without entries
-			newPage.SubPages[i] = &LeafSubPageInfo{
-				Offset:  subPage.Offset,
-				Size:    subPage.Size,
-			}
-		}
-	}
+	// Copy the slice of sub-pages
+	copy(newPage.SubPages, page.SubPages)
 
 	// Add to cache
 	db.addToCache(newPage)
@@ -3748,7 +3735,7 @@ func (db *DB) getLeafSubPage(pageNumber uint32, subPageIdx uint8, maxReadSeq ...
 	}
 
 	// Check if the sub-page exists
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
 		return nil, fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
 
@@ -3837,7 +3824,7 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	}
 
 	// Store the sub-page at the index corresponding to its ID
-	leafPage.SubPages[subPageID] = &subPageInfo
+	leafPage.SubPages[subPageID] = subPageInfo
 
 	// Mark the page as dirty
 	db.markPageDirty(leafPage)
@@ -3863,10 +3850,10 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 	subPage.Page = leafPage
 
 	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := leafPage.SubPages[subPageIdx]
+	subPageInfo := &leafPage.SubPages[subPageIdx]
 
 	// Calculate the size needed for the new entry
 	suffixLenSize := varint.Size(uint64(len(suffix)))
@@ -3935,7 +3922,7 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 
 	// Update offsets for sub-pages that come after this one
 	for i := 0; i < len(leafPage.SubPages); i++ {
-		if leafPage.SubPages[i] != nil && leafPage.SubPages[i].Offset > subPageInfo.Offset {
+		if leafPage.SubPages[i].Offset != 0 && leafPage.SubPages[i].Offset > subPageInfo.Offset {
 			leafPage.SubPages[i].Offset += uint16(newEntrySize)
 		}
 	}
@@ -3964,10 +3951,10 @@ func (db *DB) removeEntryFromLeafSubPage(subPage *LeafSubPage, entryOffset int, 
 
 	// Get the sub-page info
 	subPageIdx := subPage.SubPageIdx
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := leafPage.SubPages[subPageIdx]
+	subPageInfo := &leafPage.SubPages[subPageIdx]
 
 	// Calculate positions (entryOffset is already relative to leaf page data)
 	entryEnd := entryOffset + entrySize
@@ -3987,7 +3974,7 @@ func (db *DB) removeEntryFromLeafSubPage(subPage *LeafSubPage, entryOffset int, 
 
 	// Update offsets for sub-pages that come after this one
 	for i := 0; i < len(leafPage.SubPages); i++ {
-		if leafPage.SubPages[i] != nil && leafPage.SubPages[i].Offset > uint16(entryOffset) {
+		if leafPage.SubPages[i].Offset != 0 && leafPage.SubPages[i].Offset > uint16(entryOffset) {
 			leafPage.SubPages[i].Offset -= uint16(entrySize)
 		}
 	}
@@ -4207,7 +4194,7 @@ func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix [
 	debugPrint("Converting leaf sub-page %d on page %d to radix sub-page\n", subPageIdx, leafPage.pageNumber)
 
 	// Check if the sub-page exists
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
 
@@ -4274,10 +4261,10 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	debugPrint("Moving leaf sub-page %d from page %d to new leaf page\n", subPageIdx, leafPage.pageNumber)
 
 	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := leafPage.SubPages[subPageIdx]
+	subPageInfo := &leafPage.SubPages[subPageIdx]
 
 	// Step 1: Compute the total new space needed
 	suffixLenSize := varint.Size(uint64(len(newSuffix)))
@@ -4324,7 +4311,7 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	newLeafPage.ContentSize += totalSubPageSize
 
 	// Create the LeafSubPageInfo and add it to the new leaf page
-	newLeafPage.SubPages[newSubPageID] = &LeafSubPageInfo{
+	newLeafPage.SubPages[newSubPageID] = LeafSubPageInfo{
 		Offset:  uint16(offset),
 		Size:    uint16(newSubPageSize),
 	}
@@ -4345,10 +4332,10 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 // removeSubPageFromLeafPage removes a sub-page from a leaf page
 func (db *DB) removeSubPageFromLeafPage(leafPage *LeafPage, subPageIdx uint8) {
 	// Get the sub-page info
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx].Offset == 0 {
 		return // Sub-page doesn't exist, nothing to remove
 	}
-	subPageInfo := leafPage.SubPages[subPageIdx]
+	subPageInfo := &leafPage.SubPages[subPageIdx]
 
 	// Calculate the sub-page boundaries
 	subPageStart := int(subPageInfo.Offset)
@@ -4362,13 +4349,13 @@ func (db *DB) removeSubPageFromLeafPage(leafPage *LeafPage, subPageIdx uint8) {
 
 	// Update offsets for sub-pages that come after this one
 	for i := 0; i < len(leafPage.SubPages); i++ {
-		if leafPage.SubPages[i] != nil && leafPage.SubPages[i].Offset > subPageInfo.Offset {
+		if leafPage.SubPages[i].Offset != 0 && leafPage.SubPages[i].Offset > subPageInfo.Offset {
 			leafPage.SubPages[i].Offset -= uint16(subPageSize)
 		}
 	}
 
-	// Remove the sub-page from the array
-	leafPage.SubPages[subPageIdx] = nil
+	// Remove the sub-page from the array by clearing its offset
+	leafPage.SubPages[subPageIdx] = LeafSubPageInfo{}
 
 	// Update content size
 	leafPage.ContentSize -= subPageSize
