@@ -13,6 +13,13 @@ import (
 	"strings"
 )
 
+// LeafEntry represents an entry in a leaf page
+type LeafEntry struct {
+	SuffixOffset int    // Offset in the data buffer where the suffix starts
+	SuffixLen    int    // Length of the suffix
+	DataOffset   int64  // Offset in the main file where the data starts
+}
+
 // createTempFile creates a temporary database file for testing
 func createTempFile(t *testing.T) string {
 	tmpDir := t.TempDir()

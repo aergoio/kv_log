@@ -215,13 +215,6 @@ type LeafSubPageInfo struct {
 	Size    uint16      // Size of the sub-page data (excluding header)
 }
 
-// LeafEntry represents an entry in a leaf page
-type LeafEntry struct {
-	SuffixOffset int    // Offset in the data buffer where the suffix starts
-	SuffixLen    int    // Length of the suffix
-	DataOffset   int64  // Offset in the main file where the data starts
-}
-
 // Options represents configuration options for the database
 type Options map[string]interface{}
 
