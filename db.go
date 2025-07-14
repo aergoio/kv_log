@@ -4409,34 +4409,13 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	}
 	subPageInfo := leafPage.SubPages[subPageIdx]
 
-	// Calculate the size needed for the new entry
+	// Step 1: Compute the total new space needed
 	suffixLenSize := varint.Size(uint64(len(newSuffix)))
 	newEntrySize := suffixLenSize + len(newSuffix) + 8
-
-	// Calculate the total size needed for the updated sub-page
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
-
-	// Create the new sub-page data buffer with all existing entries plus the new one
-	newSubPageData := make([]byte, newSubPageSize)
-	pos := 0
-
-	// Copy existing entries from the original sub-page
-	originalStart := int(subPageInfo.Offset) + 3 // Skip header
-	copy(newSubPageData[pos:], leafPage.data[originalStart:originalStart+int(subPageInfo.Size)])
-	pos += int(subPageInfo.Size)
-
-	// Add the new entry
-	suffixLenWritten := varint.Write(newSubPageData[pos:], uint64(len(newSuffix)))
-	pos += suffixLenWritten
-
-	copy(newSubPageData[pos:], newSuffix)
-	pos += len(newSuffix)
-
-	binary.LittleEndian.PutUint64(newSubPageData[pos:], uint64(newDataOffset))
-	pos += 8
-
-	// Allocate a leaf page with enough space for this sub-page
 	totalSubPageSize := LeafSubPageHeaderSize + newSubPageSize
+
+	// Step 2: Get leaf page with enough space
 	newLeafSubPage, err := db.allocateLeafPageWithSpace(totalSubPageSize)
 	if err != nil {
 		return fmt.Errorf("failed to allocate new leaf sub-page: %w", err)
@@ -4445,15 +4424,31 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	newLeafPage := newLeafSubPage.Page
 	newSubPageID := newLeafSubPage.SubPageIdx
 
+	// Step 3: Copy sub-page directly from page A to page B (at the end)
 	// Calculate the offset where the sub-page will be placed in the new leaf page
 	offset := int(newLeafPage.ContentSize)
 
-	// Write the sub-page header at the calculated offset
+	// Write the sub-page header directly to the new leaf page
 	newLeafPage.data[offset] = newSubPageID // Sub-page ID
 	binary.LittleEndian.PutUint16(newLeafPage.data[offset+1:offset+3], uint16(newSubPageSize))
 
-	// Write the sub-page data after the header
-	copy(newLeafPage.data[offset+3:], newSubPageData)
+	// Copy existing entries directly from the original sub-page to the new page
+	originalStart := int(subPageInfo.Offset) + 3 // Skip header
+	dataPos := offset + 3 // Skip new header
+	copy(newLeafPage.data[dataPos:], leafPage.data[originalStart:originalStart+int(subPageInfo.Size)])
+	dataPos += int(subPageInfo.Size)
+
+	// Step 4: Serialize the new entry directly in the new page
+	// Write suffix length directly
+	suffixLenWritten := varint.Write(newLeafPage.data[dataPos:], uint64(len(newSuffix)))
+	dataPos += suffixLenWritten
+
+	// Write suffix directly
+	copy(newLeafPage.data[dataPos:], newSuffix)
+	dataPos += len(newSuffix)
+
+	// Write data offset directly
+	binary.LittleEndian.PutUint64(newLeafPage.data[dataPos:], uint64(newDataOffset))
 
 	// Update the new leaf page metadata
 	newLeafPage.ContentSize += totalSubPageSize
@@ -4466,9 +4461,6 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 
 	// Mark the new page as dirty
 	db.markPageDirty(newLeafPage)
-
-	// Add the new leaf page to the free list if it has reasonable free space
-	//db.addToFreeLeafPagesList(newLeafPage, 0)
 
 	// Remove the sub-page from the original leaf page
 	_, err = db.updateLeafPage(leafPage, int(subPageIdx), nil)
