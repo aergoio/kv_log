@@ -3888,14 +3888,7 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
 
 	// Check if there's enough space in the current page for the updated sub-page
-	totalSpaceNeeded := LeafHeaderSize + LeafSubPageHeaderSize + newSubPageSize
-	for i := range leafPage.SubPages {
-		if leafPage.SubPages[i] != nil && uint8(i) != subPageIdx {
-			totalSpaceNeeded += LeafSubPageHeaderSize + int(leafPage.SubPages[i].Size)
-		}
-	}
-
-	if totalSpaceNeeded > PageSize {
+	if leafPage.ContentSize + newSubPageSize > PageSize {
 		// Current leaf page doesn't have enough space for the expanded sub-page
 		// Check if the sub-page (with new entry) can fit in a new empty leaf page
 		subPageWithHeaderSize := LeafSubPageHeaderSize + newSubPageSize
