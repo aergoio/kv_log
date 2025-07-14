@@ -2810,23 +2810,35 @@ func printPageTraversalInfo(db *DB, key []byte) {
 			suffix := key[keyPos+1:]
 			fmt.Printf("  Looking for suffix: '%s' (bytes: %v)\n", string(suffix), suffix)
 			totalEntries := 0
-			for _, subPageInfo := range leafPage.SubPages {
+			for subPageIdx, subPageInfo := range leafPage.SubPages {
 				if subPageInfo != nil {
-					totalEntries += len(subPageInfo.Entries)
+					entryCount := 0
+					db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
+						entryCount++
+						return true
+					})
+					totalEntries += entryCount
 				}
 			}
 			fmt.Printf("  Leaf page has %d entries across sub-pages:\n", totalEntries)
 
 			for subPageIdx, subPageInfo := range leafPage.SubPages {
 				if subPageInfo != nil {
-					fmt.Printf("    Sub-page %d has %d entries:\n", subPageIdx, len(subPageInfo.Entries))
-					for i, entry := range subPageInfo.Entries {
-						subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
-						suffixOffset := subPageDataStart + entry.SuffixOffset
-						entrySuffix := leafPage.data[suffixOffset:suffixOffset+entry.SuffixLen]
+					entryCount := 0
+					db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
+						entryCount++
+						return true
+					})
+					fmt.Printf("    Sub-page %d has %d entries:\n", subPageIdx, entryCount)
+
+					entryIdx := 0
+					db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
+						entrySuffix := leafPage.data[suffixOffset:suffixOffset+suffixLen]
 						fmt.Printf("      Entry %d: suffix='%s' (bytes: %v), dataOffset=%d\n",
-							i, string(entrySuffix), entrySuffix, entry.DataOffset)
-					}
+							entryIdx, string(entrySuffix), entrySuffix, dataOffset)
+						entryIdx++
+						return true
+					})
 				}
 			}
 			return
@@ -2898,9 +2910,14 @@ func TestLeafPageToRadixPageConversion(t *testing.T) {
 
 				// Calculate total entries across all sub-pages
 				totalEntries := 0
-				for _, sp := range leafPage.SubPages {
+				for subPageIdx, sp := range leafPage.SubPages {
 					if sp != nil {
-						totalEntries += len(sp.Entries)
+						entryCount := 0
+						db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
+							entryCount++
+							return true
+						})
+						totalEntries += entryCount
 					}
 				}
 
@@ -3177,9 +3194,14 @@ func TestLeafPageToRadixPageConversionSimilarKeys(t *testing.T) {
 
 				// Calculate total entries across all sub-pages
 				totalEntries := 0
-				for _, sp := range leafPage.SubPages {
+				for subPageIdx, sp := range leafPage.SubPages {
 					if sp != nil {
-						totalEntries += len(sp.Entries)
+						entryCount := 0
+						db.iterateLeafSubPageEntries(leafPage, uint8(subPageIdx), func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
+							entryCount++
+							return true
+						})
+						totalEntries += entryCount
 					}
 				}
 
