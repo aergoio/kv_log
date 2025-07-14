@@ -4035,108 +4035,6 @@ func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryOffset int, en
 	return nil
 }
 
-// updateLeafPage updates a leaf page by removing a sub-page and optionally adding a new sub-page
-// Parameters:
-// - leafPage: the leaf page to update
-// - removeSubPageIdx: index of sub-page to remove (use -1 if no removal needed)
-// - newSubPageData: data for the new sub-page to add (nil if no addition needed)
-// Returns the index of the newly added sub-page (or -1 if no sub-page was added)
-func (db *DB) updateLeafPage(leafPage *LeafPage, removeSubPageIdx int, newSubPageData []byte) (int, error) {
-	// Get a writable version of the page
-	leafPage, err := db.getWritablePage(leafPage)
-	if err != nil {
-		return -1, fmt.Errorf("failed to get writable page: %w", err)
-	}
-
-	newSubPageIdx := -1 // Will be set if we add a new sub-page
-
-	// Handle removal of a sub-page
-	if removeSubPageIdx != -1 && removeSubPageIdx < len(leafPage.SubPages) && leafPage.SubPages[removeSubPageIdx] != nil {
-		removedSubPage := leafPage.SubPages[removeSubPageIdx]
-		removedStart := int(removedSubPage.Offset)
-		removedSize := LeafSubPageHeaderSize + int(removedSubPage.Size)
-		removedEnd := removedStart + removedSize
-
-		// Move all data after the removed sub-page to fill the gap
-		remainingDataStart := removedEnd
-		remainingDataEnd := int(leafPage.ContentSize)
-		if remainingDataStart < remainingDataEnd {
-			copy(leafPage.data[removedStart:], leafPage.data[remainingDataStart:remainingDataEnd])
-		}
-
-		// Update offsets for sub-pages that come after the removed one
-		for i := 0; i < len(leafPage.SubPages); i++ {
-			if leafPage.SubPages[i] != nil && leafPage.SubPages[i].Offset > removedSubPage.Offset {
-				leafPage.SubPages[i].Offset -= uint16(removedSize)
-			}
-		}
-
-		// Remove the sub-page from the array
-		leafPage.SubPages[removeSubPageIdx] = nil
-
-		// Update content size
-		leafPage.ContentSize -= removedSize
-	}
-
-	// Add new sub-page if provided
-	if newSubPageData != nil {
-		subPageSize := uint16(len(newSubPageData))
-		totalSubPageSize := LeafSubPageHeaderSize + int(subPageSize)
-
-		// Check if there's enough space
-		if leafPage.ContentSize + totalSubPageSize > PageSize {
-			return -1, fmt.Errorf("not enough space in leaf page for new sub-page")
-		}
-
-		// Find the first available sub-page ID
-		for i := 0; i < len(leafPage.SubPages); i++ {
-			if leafPage.SubPages[i] == nil {
-				newSubPageIdx = i
-				break
-			}
-		}
-
-		// If no available slot found, expand the array
-		if newSubPageIdx == -1 {
-			if len(leafPage.SubPages) >= 256 {
-				return -1, fmt.Errorf("no available sub-page IDs")
-			}
-			newSubPageIdx = len(leafPage.SubPages)
-			// Expand the SubPages array
-			newSubPages := make([]*LeafSubPageInfo, len(leafPage.SubPages)+1)
-			copy(newSubPages, leafPage.SubPages)
-			leafPage.SubPages = newSubPages
-		}
-
-		// Add the new sub-page at the end of the current content
-		pos := int(leafPage.ContentSize)
-
-		// Write sub-page header
-		leafPage.data[pos] = uint8(newSubPageIdx)                                // Sub-page ID
-		binary.LittleEndian.PutUint16(leafPage.data[pos+1:pos+3], subPageSize)   // Sub-page size
-
-		// Copy sub-page data
-		copy(leafPage.data[pos+3:], newSubPageData)
-
-		// Add to sub-pages array at the found index
-		leafPage.SubPages[newSubPageIdx] = &LeafSubPageInfo{
-			Offset:  uint16(pos),
-			Size:    subPageSize,
-		}
-
-		// Update content size
-		leafPage.ContentSize += totalSubPageSize
-	}
-
-	// Mark the page as dirty
-	db.markPageDirty(leafPage)
-
-	// Add the leaf page to the free list if it has reasonable free space
-	db.addToFreeLeafPagesList(leafPage, 0)
-
-	return newSubPageIdx, nil
-}
-
 // ------------------------------------------------------------------------------------------------
 // Radix entries (on sub-pages)
 // ------------------------------------------------------------------------------------------------
@@ -4375,10 +4273,7 @@ func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix [
 	}
 
 	// Remove the old sub-page from the leaf page
-	_, err = db.updateLeafPage(leafPage, int(subPageIdx), nil)
-	if err != nil {
-		return fmt.Errorf("failed to remove sub-page from original leaf page: %w", err)
-	}
+	db.removeSubPageFromLeafPage(leafPage, subPageIdx)
 
 	// Update the sub-page to point to the new radix sub-page
 	subPage.Page = newRadixSubPage.Page
@@ -4463,16 +4358,51 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	db.markPageDirty(newLeafPage)
 
 	// Remove the sub-page from the original leaf page
-	_, err = db.updateLeafPage(leafPage, int(subPageIdx), nil)
-	if err != nil {
-		return fmt.Errorf("failed to remove sub-page from original leaf page: %w", err)
-	}
+	db.removeSubPageFromLeafPage(leafPage, subPageIdx)
 
 	// Update the subPage reference to point to the new leaf page
 	subPage.Page = newLeafPage
 	subPage.SubPageIdx = newSubPageID
 
 	return nil
+}
+
+// removeSubPageFromLeafPage removes a sub-page from a leaf page
+func (db *DB) removeSubPageFromLeafPage(leafPage *LeafPage, subPageIdx uint8) {
+	// Get the sub-page info
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+		return // Sub-page doesn't exist, nothing to remove
+	}
+	subPageInfo := leafPage.SubPages[subPageIdx]
+
+	// Calculate the sub-page boundaries
+	subPageStart := int(subPageInfo.Offset)
+	subPageSize := LeafSubPageHeaderSize + int(subPageInfo.Size)
+	subPageEnd := subPageStart + subPageSize
+
+	// Move all data after this sub-page to fill the gap
+	if subPageEnd < leafPage.ContentSize {
+		copy(leafPage.data[subPageStart:], leafPage.data[subPageEnd:leafPage.ContentSize])
+	}
+
+	// Update offsets for sub-pages that come after this one
+	for i := 0; i < len(leafPage.SubPages); i++ {
+		if leafPage.SubPages[i] != nil && leafPage.SubPages[i].Offset > subPageInfo.Offset {
+			leafPage.SubPages[i].Offset -= uint16(subPageSize)
+		}
+	}
+
+	// Remove the sub-page from the array
+	leafPage.SubPages[subPageIdx] = nil
+
+	// Update content size
+	leafPage.ContentSize -= subPageSize
+
+	// Mark the page as dirty
+	db.markPageDirty(leafPage)
+
+	// Add the leaf page to the free list if it has reasonable free space
+	db.addToFreeLeafPagesList(leafPage, 0)
 }
 
 // ------------------------------------------------------------------------------------------------
