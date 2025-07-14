@@ -3861,6 +3861,14 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 	leafPage := subPage.Page
 	subPageIdx := subPage.SubPageIdx
 
+	// Get a writable version of the page
+	leafPage, err := db.getWritablePage(leafPage)
+	if err != nil {
+		return fmt.Errorf("failed to get writable page: %w", err)
+	}
+	// Update the subPage reference to point to the writable page
+	subPage.Page = leafPage
+
 	// Get the sub-page info
 	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
@@ -3898,16 +3906,6 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 		// Update the parent radix sub-page to point to the new radix sub-page
 		return db.setRadixEntry(parentSubPage, parentByteValue, subPage.Page.pageNumber, subPage.SubPageIdx)
 	}
-
-	// Get a writable version of the page
-	leafPage, err := db.getWritablePage(leafPage)
-	if err != nil {
-		return fmt.Errorf("failed to get writable page: %w", err)
-	}
-	// Update the subPage reference to point to the writable page
-	subPage.Page = leafPage
-	// Update subPageInfo to point to the new page's SubPages array
-	subPageInfo = leafPage.SubPages[subPageIdx]
 
 	// There's enough space in the current page, proceed with the update
 	// Step 1: Get the offset of the current sub-page (end of existing entries)
@@ -4210,14 +4208,6 @@ func (db *DB) initializeRadixLevels() error {
 // It allocates a new radix sub-page and redistributes all entries from the leaf sub-page
 // Returns the page number and sub-page index of the new radix sub-page
 func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix []byte, newDataOffset int64) (error) {
-	// Get a writable version of the leaf page
-	writableLeafPage, err := db.getWritablePage(subPage.Page)
-	if err != nil {
-		return fmt.Errorf("failed to get writable leaf page: %w", err)
-	}
-	// Update the subPage reference to point to the writable page
-	subPage.Page = writableLeafPage
-
 	leafPage := subPage.Page
 	subPageIdx := subPage.SubPageIdx
 
@@ -4285,14 +4275,6 @@ func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix [
 // moveSubPageToNewLeafPage moves a leaf sub-page to a new leaf page when it doesn't fit in the current page
 // but is still small enough to fit in a new empty leaf page
 func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, newDataOffset int64) error {
-	// Get a writable version of the leaf page
-	writableLeafPage, err := db.getWritablePage(subPage.Page)
-	if err != nil {
-		return fmt.Errorf("failed to get writable leaf page: %w", err)
-	}
-	// Update the subPage reference to point to the writable page
-	subPage.Page = writableLeafPage
-
 	leafPage := subPage.Page
 	subPageIdx := subPage.SubPageIdx
 
