@@ -3867,8 +3867,7 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 	}
 	subPageInfo := leafPage.SubPages[subPageIdx]
 
-	// Create a new sub-page data buffer with the existing entries plus the new one
-	// First, calculate the size needed for the new entry
+	// Calculate the size needed for the new entry
 	suffixLenSize := varint.Size(uint64(len(suffix)))
 	newEntrySize := suffixLenSize + len(suffix) + 8 // suffix length + suffix + data offset
 
@@ -3876,7 +3875,7 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 	newSubPageSize := int(subPageInfo.Size) + newEntrySize
 
 	// Check if there's enough space in the current page for the updated sub-page
-	if leafPage.ContentSize + newSubPageSize > PageSize {
+	if leafPage.ContentSize + newEntrySize > PageSize {
 		// Current leaf page doesn't have enough space for the expanded sub-page
 		// Check if the sub-page (with new entry) can fit in a new empty leaf page
 		subPageWithHeaderSize := LeafSubPageHeaderSize + newSubPageSize
@@ -3900,44 +3899,64 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 		return db.setRadixEntry(parentSubPage, parentByteValue, subPage.Page.pageNumber, subPage.SubPageIdx)
 	}
 
-	// There's enough space in the current page, proceed with the update
-	// Create the new sub-page data buffer
-	newSubPageData := make([]byte, newSubPageSize)
-	pos := 0
-
-	// Copy existing entries from the original sub-page
-	originalStart := int(subPageInfo.Offset) + 3 // Skip header
-	copy(newSubPageData[pos:], leafPage.data[originalStart:originalStart+int(subPageInfo.Size)])
-	pos += int(subPageInfo.Size)
-
-	// Add the new entry
-	suffixLenWritten := varint.Write(newSubPageData[pos:], uint64(len(suffix)))
-	pos += suffixLenWritten
-
-	copy(newSubPageData[pos:], suffix)
-	pos += len(suffix)
-
-	binary.LittleEndian.PutUint64(newSubPageData[pos:], uint64(dataOffset))
-	pos += 8
-
-	// Use the helper function to update the leaf page
-	newSubPageIdx, err := db.updateLeafPage(leafPage, int(subPageIdx), newSubPageData)
+	// Get a writable version of the page
+	leafPage, err := db.getWritablePage(leafPage)
 	if err != nil {
-		return fmt.Errorf("failed to update leaf sub-page: %w", err)
+		return fmt.Errorf("failed to get writable page: %w", err)
 	}
-
-	// Update the subPage reference to point to the updated page and new sub-page index
+	// Update the subPage reference to point to the writable page
 	subPage.Page = leafPage
-	subPage.SubPageIdx = uint8(newSubPageIdx)
+	// Update subPageInfo to point to the new page's SubPages array
+	subPageInfo = leafPage.SubPages[subPageIdx]
 
-	// If the sub-page ID changed, update the parent radix entry
-	if uint8(newSubPageIdx) != subPageIdx {
-		// Update the subPage pointer, because the above function
-		// could have cloned the same radix page used on this subPage
-		parentSubPage.Page, _ = db.getRadixPage(parentSubPage.Page.pageNumber)
-		// Update the parent radix sub-page to point to the new sub-page
-		return db.setRadixEntry(parentSubPage, parentByteValue, leafPage.pageNumber, uint8(newSubPageIdx))
+	// There's enough space in the current page, proceed with the update
+	// Step 1: Get the offset of the current sub-page (end of existing entries)
+	currentSubPageStart := int(subPageInfo.Offset) + 3 // Skip header
+	currentSubPageEnd := currentSubPageStart + int(subPageInfo.Size)
+
+	// Step 2: Move data (all subsequent sub-pages after the current) to open space for the new entry
+	if currentSubPageEnd < leafPage.ContentSize {
+		// Move all data after this sub-page to make room for the new entry
+		copy(leafPage.data[currentSubPageEnd+newEntrySize:], leafPage.data[currentSubPageEnd:leafPage.ContentSize])
 	}
+
+	// Step 3: Serialize the new entry directly in the opened space
+	entryPos := currentSubPageEnd
+
+	// Write suffix length directly
+	suffixLenWritten := varint.Write(leafPage.data[entryPos:], uint64(len(suffix)))
+	entryPos += suffixLenWritten
+
+	// Write suffix directly
+	copy(leafPage.data[entryPos:], suffix)
+	entryPos += len(suffix)
+
+	// Write data offset directly
+	binary.LittleEndian.PutUint64(leafPage.data[entryPos:], uint64(dataOffset))
+
+	// Step 4: Update metadata
+	// Update the sub-page size in the header
+	newSubPageSizeUint16 := uint16(newSubPageSize)
+	binary.LittleEndian.PutUint16(leafPage.data[subPageInfo.Offset+1:subPageInfo.Offset+3], newSubPageSizeUint16)
+
+	// Update the sub-page info
+	subPageInfo.Size = newSubPageSizeUint16
+
+	// Update offsets for sub-pages that come after this one
+	for i := 0; i < len(leafPage.SubPages); i++ {
+		if leafPage.SubPages[i] != nil && leafPage.SubPages[i].Offset > subPageInfo.Offset {
+			leafPage.SubPages[i].Offset += uint16(newEntrySize)
+		}
+	}
+
+	// Update the leaf page content size
+	leafPage.ContentSize += newEntrySize
+
+	// Mark the page as dirty
+	db.markPageDirty(leafPage)
+
+	// Add the leaf page to the free list if it has reasonable free space
+	db.addToFreeLeafPagesList(leafPage, 0)
 
 	return nil
 }
