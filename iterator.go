@@ -360,23 +360,23 @@ func (it *Iterator) loadAndSortLeafEntries(pos *radixIterPos) bool {
 	// Load entries from the specific sub-page - construct keys from prefix + suffix
 	subPageInfo := leafPage.SubPages[pos.subPageIdx]
 	if subPageInfo != nil {
-		for _, entry := range subPageInfo.Entries {
+		// Iterate through entries in the sub-page
+		it.db.iterateLeafSubPageEntries(leafPage, pos.subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
 			// Get the suffix from the leaf page data
-			subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
-			suffixOffset := subPageDataStart + entry.SuffixOffset
-			suffix := leafPage.data[suffixOffset:suffixOffset+entry.SuffixLen]
+			suffix := leafPage.data[suffixOffset:suffixOffset+suffixLen]
 
 			// Construct the full key from key prefix + suffix
-			fullKey := make([]byte, len(it.keyPrefix)+entry.SuffixLen)
+			fullKey := make([]byte, len(it.keyPrefix)+suffixLen)
 			copy(fullKey, it.keyPrefix)
 			copy(fullKey[len(it.keyPrefix):], suffix)
 
 			// Add to our list with the constructed key and data offset
 			it.leafEntries = append(it.leafEntries, leafEntry{
 				key:        fullKey,
-				dataOffset: entry.DataOffset,
+				dataOffset: dataOffset,
 			})
-		}
+			return true // Continue iteration
+		})
 	}
 
 	// Sort entries by key (ascending or descending based on reverse flag)

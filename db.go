@@ -207,11 +207,10 @@ type LeafSubPage struct {
 	SubPageIdx uint8     // Index of the sub-page within the parent page
 }
 
-// LeafSubPageInfo stores metadata and entries for a leaf sub-page
+// LeafSubPageInfo stores metadata for a leaf sub-page
 type LeafSubPageInfo struct {
 	Offset  uint16      // Offset in the page data where the sub-page starts
 	Size    uint16      // Size of the sub-page data (excluding header)
-	Entries []LeafEntry // Entries in this sub-page
 }
 
 // LeafEntry represents an entry in a leaf page
@@ -1041,71 +1040,68 @@ func (db *DB) setOnLeafSubPage(parentSubPage *RadixSubPage, subPage *LeafSubPage
 	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := leafPage.SubPages[subPageIdx]
 
 	// Search for the suffix in this sub-page
-	for entryIdx, entry := range subPageInfo.Entries {
-		// Get the suffix from the entry (using sub-page base + relative offset)
-		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
-		suffixOffset := subPageDataStart + entry.SuffixOffset
-		entrySuffix := leafPage.data[suffixOffset:suffixOffset+entry.SuffixLen]
-		// Compare it with the given suffix
-		if bytes.Equal(entrySuffix, suffix) {
-			// Found the entry
-			var content *Content
+	entryOffset, entrySize, existingDataOffset, err := db.findEntryInLeafSubPage(leafPage, subPageIdx, suffix)
+	if err != nil {
+		return fmt.Errorf("failed to search entries in sub-page: %w", err)
+	}
 
-			// If we're setting a new key-value pair
-			if dataOffset == 0 {
-				// Read the content from the main file
-				content, err = db.readContent(entry.DataOffset)
-				if err != nil {
-					return fmt.Errorf("failed to read content: %w", err)
-				}
+	if entryOffset >= 0 {
+		// Found the entry
+		var content *Content
 
-				// Verify that the key matches
-				if !equal(content.key, key) {
-					return fmt.Errorf("invalid indexed key")
-				}
-			}
-
-			// If we're deleting
-			if isDelete {
-				// If there is an existing value
-				if dataOffset == 0 && content != nil && len(content.value) > 0 {
-					// Log the deletion to the main file
-					dataOffset, err = db.appendData(key, nil)
-					if err != nil {
-						return fmt.Errorf("failed to append deletion: %w", err)
-					}
-				}
-
-				// Remove this entry from the sub-page
-				return db.removeEntryFromLeafSubPage(subPage, entryIdx)
-			}
-
-			// If we're setting a new key-value pair
-			if dataOffset == 0 {
-				// Check if value is the same
-				if equal(content.value, value) {
-					// Value is the same, nothing to do
-					return nil
-				}
-
-				// Value is different, append new data
-				dataOffset, err = db.appendData(key, value)
-				if err != nil {
-					return fmt.Errorf("failed to append data: %w", err)
-				}
-			}
-
-			// Update the entry's data offset in the sub-page
-			err = db.updateEntryInLeafSubPage(subPage, entryIdx, dataOffset)
+		// If we're setting a new key-value pair
+		if dataOffset == 0 {
+			// Read the content from the main file
+			content, err = db.readContent(existingDataOffset)
 			if err != nil {
-				return fmt.Errorf("failed to update entry in sub-page: %w", err)
+				return fmt.Errorf("failed to read content: %w", err)
 			}
 
-			return nil
+			// Verify that the key matches
+			if !equal(content.key, key) {
+				return fmt.Errorf("invalid indexed key")
+			}
 		}
+
+		// If we're deleting
+		if isDelete {
+			// If there is an existing value
+			if dataOffset == 0 && content != nil && len(content.value) > 0 {
+				// Log the deletion to the main file
+				dataOffset, err = db.appendData(key, nil)
+				if err != nil {
+					return fmt.Errorf("failed to append deletion: %w", err)
+				}
+			}
+
+			// Remove this entry from the sub-page
+			return db.removeEntryFromLeafSubPage(subPage, entryOffset, entrySize)
+		}
+
+		// If we're setting a new key-value pair
+		if dataOffset == 0 {
+			// Check if value is the same
+			if equal(content.value, value) {
+				// Value is the same, nothing to do
+				return nil
+			}
+
+			// Value is different, append new data
+			dataOffset, err = db.appendData(key, value)
+			if err != nil {
+				return fmt.Errorf("failed to append data: %w", err)
+			}
+		}
+
+		// Update the entry's data offset in the sub-page
+		err = db.updateEntryInLeafSubPage(subPage, entryOffset, entrySize, dataOffset)
+		if err != nil {
+			return fmt.Errorf("failed to update entry in sub-page: %w", err)
+		}
+
+		return nil
 	}
 
 	// If we're deleting and didn't find the key, nothing to do
@@ -1284,30 +1280,25 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 			}
 
 			// Search for the suffix in this sub-page's entries
-			for _, entry := range subPageInfo.Entries {
-				// Get the suffix from the entry (using sub-page base + relative offset)
-				subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
-				suffixOffset := subPageDataStart + entry.SuffixOffset
-				entrySuffix := leafPage.data[suffixOffset:suffixOffset+entry.SuffixLen]
-				// Compare it with the given suffix
-				if bytes.Equal(entrySuffix, suffix) {
-					// Found the entry, read the content from the main file
-					contentOffset := entry.DataOffset
+			entryOffset, _, dataOffset, err := db.findEntryInLeafSubPage(leafPage, leafSubPage.SubPageIdx, suffix)
+			if err != nil {
+				return nil, fmt.Errorf("failed to search entries in sub-page: %w", err)
+			}
 
-					// Read the content at the offset
-					content, err := db.readContent(contentOffset)
-					if err != nil {
-						return nil, fmt.Errorf("failed to read content: %w", err)
-					}
-
-					// Verify that the key matches
-					if !equal(content.key, key) {
-						return nil, fmt.Errorf("invalid indexed key")
-					}
-
-					// Return the value
-					return content.value, nil
+			if entryOffset >= 0 {
+				// Found the entry, read the content from the main file
+				content, err := db.readContent(dataOffset)
+				if err != nil {
+					return nil, fmt.Errorf("failed to read content: %w", err)
 				}
+
+				// Verify that the key matches
+				if !equal(content.key, key) {
+					return nil, fmt.Errorf("invalid indexed key")
+				}
+
+				// Return the value
+				return content.value, nil
 			}
 
 			// If we get here, the suffix wasn't found
@@ -2121,7 +2112,7 @@ func (db *DB) parseLeafPage(data []byte, pageNumber uint32) (*LeafPage, error) {
 	return leafPage, nil
 }
 
-// parseLeafSubPages parses the sub-pages in a leaf page
+// parseLeafSubPages parses the sub-pages in a leaf page (metadata only, not entries)
 func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 	// Start at header size
 	pos := LeafHeaderSize
@@ -2152,17 +2143,10 @@ func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 			return fmt.Errorf("sub-page end %d exceeds content size %d", subPageEnd, leafPage.ContentSize)
 		}
 
-		// Parse entries in this sub-page
-		subPageEntries, err := db.parseLeafSubPageEntries(leafPage, pos, subPageEnd)
-		if err != nil {
-			return fmt.Errorf("failed to parse sub-page %d entries: %w", subPageID, err)
-		}
-
 		// Create and store the sub-page info at the index corresponding to its ID
 		leafPage.SubPages[subPageID] = &LeafSubPageInfo{
 			Offset:  uint16(pos - 3), // Include the header in the offset
 			Size:    subPageSize,
-			Entries: subPageEntries,
 		}
 
 		// Move to the next sub-page
@@ -2172,43 +2156,81 @@ func (db *DB) parseLeafSubPages(leafPage *LeafPage) error {
 	return nil
 }
 
-// parseLeafSubPageEntries parses the entries in a leaf sub-page
-func (db *DB) parseLeafSubPageEntries(leafPage *LeafPage, start, end int) ([]LeafEntry, error) {
-	var entries []LeafEntry
-	pos := start
+// iterateLeafSubPageEntries iterates through entries in a leaf sub-page, calling the callback for each entry
+// The callback receives the entry offset (relative to leaf page data), entry size, and entry data
+// Returns true to continue or false to stop
+func (db *DB) iterateLeafSubPageEntries(leafPage *LeafPage, subPageIdx uint8, callback func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool) error {
+	// Get the sub-page info
+	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
+		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
+	}
+	subPageInfo := leafPage.SubPages[subPageIdx]
+
+	// Calculate the start and end positions for this sub-page's data
+	subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
+	subPageDataEnd := subPageDataStart + int(subPageInfo.Size)
+
+	pos := subPageDataStart
 
 	// Read entries until we reach the end of the sub-page
-	for pos < end {
+	for pos < subPageDataEnd {
+		// Store the entry offset relative to the leaf page data
+		entryOffset := pos
+
 		// Read suffix length
 		suffixLen64, bytesRead := varint.Read(leafPage.data[pos:])
 		if bytesRead == 0 {
-			return nil, fmt.Errorf("failed to read suffix length")
+			return fmt.Errorf("failed to read suffix length")
 		}
 		suffixLen := int(suffixLen64)
 		pos += bytesRead
 
-		// Store the suffix offset relative to the sub-page data start
-		suffixOffset := pos - start
+		// Store the suffix offset relative to the leaf page data
+		suffixOffset := pos
 		pos += suffixLen
 
 		// Check if we have enough space for the data offset
-		if pos+8 > end {
-			return nil, fmt.Errorf("insufficient space for data offset")
+		if pos+8 > subPageDataEnd {
+			return fmt.Errorf("insufficient space for data offset")
 		}
 
 		// Read data offset
 		dataOffset := int64(binary.LittleEndian.Uint64(leafPage.data[pos:]))
 		pos += 8
 
-		// Add entry to list
-		entries = append(entries, LeafEntry{
-			SuffixOffset: suffixOffset, // Relative to sub-page data start
-			SuffixLen:    suffixLen,
-			DataOffset:   dataOffset,
-		})
+		// Calculate entry size
+		entrySize := bytesRead + suffixLen + 8 // varint + suffix + data offset
+
+		// Call the callback with the entry information
+		if !callback(entryOffset, entrySize, suffixOffset, suffixLen, dataOffset) {
+			break
+		}
 	}
 
-	return entries, nil
+	return nil
+}
+
+// findEntryInLeafSubPage finds an entry in a leaf sub-page that matches the given suffix
+// Returns the entry offset (relative to leaf page data), entry size, and data offset if found
+// Returns -1, 0, 0 if not found
+func (db *DB) findEntryInLeafSubPage(leafPage *LeafPage, subPageIdx uint8, targetSuffix []byte) (int, int, int64, error) {
+	var foundEntryOffset int = -1
+	var foundEntrySize int = 0
+	var foundDataOffset int64 = 0
+
+	err := db.iterateLeafSubPageEntries(leafPage, subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
+		// Compare directly with target suffix (no copy needed)
+		if suffixLen == len(targetSuffix) && bytes.Equal(leafPage.data[suffixOffset:suffixOffset+suffixLen], targetSuffix) {
+			foundEntryOffset = entryOffset
+			foundEntrySize   = entrySize
+			foundDataOffset  = dataOffset
+			return false // Stop iteration
+		}
+
+		return true // Continue iteration
+	})
+
+	return foundEntryOffset, foundEntrySize, foundDataOffset, err
 }
 
 // writeLeafPage writes a leaf page to the database file
@@ -3676,21 +3698,14 @@ func (db *DB) cloneLeafPage(page *LeafPage) (*LeafPage, error) {
 	// Copy the data
 	copy(newPage.data, page.data)
 
-	// Deep copy the sub-pages with their entries
+	// Deep copy the sub-pages (without entries, since we parse them on-demand)
 	for i := 0; i < 256; i++ {
 		if page.SubPages[i] != nil {
 			subPage := page.SubPages[i]
-			// Create a new slice for entries
-			entries := make([]LeafEntry, len(subPage.Entries))
-
-			// Copy each entry
-			copy(entries, subPage.Entries)
-
-			// Store the sub-page with copied entries
+			// Store the sub-page without entries
 			newPage.SubPages[i] = &LeafSubPageInfo{
 				Offset:  subPage.Offset,
 				Size:    subPage.Size,
-				Entries: entries,
 			}
 		}
 	}
@@ -3771,44 +3786,6 @@ func (db *DB) getRadixSubPage(pageNumber uint32, subPageIdx uint8, maxReadSeq ..
 // Leaf sub-page entries
 // ------------------------------------------------------------------------------------------------
 
-/*
-// parseLeafEntries parses the entries in a leaf page
-func (db *DB) parseLeafEntries(leafPage *LeafPage) ([]LeafEntry, error) {
-	var entries []LeafEntry
-
-	// Start at header size
-	pos := int(LeafHeaderSize)
-
-	// Read entries until we reach content size
-	for pos < leafPage.ContentSize {
-		// Read suffix length
-		suffixLen64, bytesRead := varint.Read(leafPage.data[pos:])
-		if bytesRead == 0 {
-			return nil, fmt.Errorf("failed to read suffix length")
-		}
-		suffixLen := int(suffixLen64)
-		pos += bytesRead
-
-		// Store the suffix offset and length
-		suffixOffset := pos
-		pos += suffixLen
-
-		// Read data offset
-		dataOffset := int64(binary.LittleEndian.Uint64(leafPage.data[pos:]))
-		pos += 8
-
-		// Add entry to list
-		entries = append(entries, LeafEntry{
-			SuffixOffset: suffixOffset,
-			SuffixLen:    suffixLen,
-			DataOffset:   dataOffset,
-		})
-	}
-
-	return entries, nil
-}
-*/
-
 // addEntryToNewLeafSubPage creates a new sub-page, adds an entry to it, then search for a leaf page with enough space to insert the sub-page into
 func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSubPage, error) {
 	// Step 1: Create a new leaf sub-page data buffer and serialize the entry
@@ -3824,7 +3801,6 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	suffixLenWritten := varint.Write(subPageData[pos:], uint64(len(suffix)))
 	pos += suffixLenWritten
 
-	suffixPos := pos
 	copy(subPageData[pos:], suffix)
 	pos += len(suffix)
 
@@ -3869,16 +3845,9 @@ func (db *DB) addEntryToNewLeafSubPage(suffix []byte, dataOffset int64) (*LeafSu
 	leafPage.ContentSize += totalSubPageSize
 
 	// Create the LeafSubPageInfo and add it to the leaf page
-	leafEntry := LeafEntry{
-		SuffixOffset: suffixPos, // Relative to sub-page data start (after 3-byte header)
-		SuffixLen:    len(suffix),
-		DataOffset:   dataOffset,
-	}
-
 	subPageInfo := LeafSubPageInfo{
 		Offset:  uint16(offset),
 		Size:    subPageSize,
-		Entries: []LeafEntry{leafEntry},
 	}
 
 	// Store the sub-page at the index corresponding to its ID
@@ -3962,26 +3931,14 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 	suffixLenWritten := varint.Write(newSubPageData[pos:], uint64(len(suffix)))
 	pos += suffixLenWritten
 
-	suffixPos := pos
 	copy(newSubPageData[pos:], suffix)
 	pos += len(suffix)
 
 	binary.LittleEndian.PutUint64(newSubPageData[pos:], uint64(dataOffset))
 	pos += 8
 
-	// Create the new entries list
-	newEntries := make([]LeafEntry, len(subPageInfo.Entries)+1)
-	copy(newEntries, subPageInfo.Entries)
-
-	// Add the new entry
-	newEntries[len(subPageInfo.Entries)] = LeafEntry{
-		SuffixOffset: suffixPos, // Relative to sub-page data start
-		SuffixLen:    len(suffix),
-		DataOffset:   dataOffset,
-	}
-
 	// Use the helper function to update the leaf page
-	newSubPageIdx, err := db.updateLeafPage(leafPage, int(subPageIdx), newSubPageData, newEntries)
+	newSubPageIdx, err := db.updateLeafPage(leafPage, int(subPageIdx), newSubPageData)
 	if err != nil {
 		return fmt.Errorf("failed to update leaf sub-page: %w", err)
 	}
@@ -4002,8 +3959,8 @@ func (db *DB) addEntryToLeafSubPage(parentSubPage *RadixSubPage, parentByteValue
 	return nil
 }
 
-// removeEntryFromLeafSubPage removes an entry from a leaf sub-page at the given index
-func (db *DB) removeEntryFromLeafSubPage(subPage *LeafSubPage, entryIdx int) error {
+// removeEntryFromLeafSubPage removes an entry from a leaf sub-page at the given offset
+func (db *DB) removeEntryFromLeafSubPage(subPage *LeafSubPage, entryOffset int, entrySize int) error {
 	// Get a writable version of the page
 	leafPage, err := db.getWritablePage(subPage.Page)
 	if err != nil {
@@ -4019,71 +3976,43 @@ func (db *DB) removeEntryFromLeafSubPage(subPage *LeafSubPage, entryIdx int) err
 	}
 	subPageInfo := leafPage.SubPages[subPageIdx]
 
-	// Validate the entry index
-	if entryIdx < 0 || entryIdx >= len(subPageInfo.Entries) {
-		return fmt.Errorf("entry index %d out of bounds (0-%d)", entryIdx, len(subPageInfo.Entries)-1)
+	// Calculate positions (entryOffset is already relative to leaf page data)
+	entryEnd := entryOffset + entrySize
+
+	// Single copy: move all data after the removed entry to fill the gap
+	// This includes both data within the sub-page and all data after the sub-page
+	if entryEnd < leafPage.ContentSize {
+		copy(leafPage.data[entryOffset:], leafPage.data[entryEnd:leafPage.ContentSize])
 	}
 
-	// Create a new entries list without this entry
-	newEntries := make([]LeafEntry, 0, len(subPageInfo.Entries)-1)
-	newEntries = append(newEntries, subPageInfo.Entries[:entryIdx]...)
-	newEntries = append(newEntries, subPageInfo.Entries[entryIdx+1:]...)
+	// Update the sub-page size
+	newSubPageSize := int(subPageInfo.Size) - entrySize
+	subPageInfo.Size = uint16(newSubPageSize)
 
-	// If there are no more entries, remove the entire sub-page
-	if len(newEntries) == 0 {
-		_, err := db.updateLeafPage(leafPage, int(subPageIdx), nil, nil)
-		if err != nil {
-			return fmt.Errorf("failed to remove empty sub-page: %w", err)
+	// Update the sub-page size in the header
+	binary.LittleEndian.PutUint16(leafPage.data[int(subPageInfo.Offset)+1:int(subPageInfo.Offset)+3], uint16(newSubPageSize))
+
+	// Update offsets for sub-pages that come after this one
+	for i := 0; i < len(leafPage.SubPages); i++ {
+		if leafPage.SubPages[i] != nil && leafPage.SubPages[i].Offset > uint16(entryOffset) {
+			leafPage.SubPages[i].Offset -= uint16(entrySize)
 		}
-		return nil
 	}
 
-	// Rebuild the sub-page data without the removed entry
-	subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
-	newSubPageData := make([]byte, 0)
-	for i, newEntry := range newEntries {
-		// Get the suffix from the original entry
-		origSuffixOffset := subPageDataStart + newEntry.SuffixOffset
-		origSuffix := leafPage.data[origSuffixOffset:origSuffixOffset+newEntry.SuffixLen]
+	// Update the leaf page content size
+	leafPage.ContentSize -= entrySize
 
-		// Calculate size needed for this entry
-		suffixLenSize := varint.Size(uint64(len(origSuffix)))
-		entrySize := suffixLenSize + len(origSuffix) + 8
+	// Mark the page as dirty
+	db.markPageDirty(leafPage)
 
-		// Create buffer for this entry
-		entryBuffer := make([]byte, entrySize)
-		pos := 0
-
-		// Write suffix length
-		suffixLenWritten := varint.Write(entryBuffer[pos:], uint64(len(origSuffix)))
-		pos += suffixLenWritten
-
-		// Write suffix
-		suffixPosInNewData := len(newSubPageData) + pos
-		copy(entryBuffer[pos:], origSuffix)
-		pos += len(origSuffix)
-
-		// Write data offset
-		binary.LittleEndian.PutUint64(entryBuffer[pos:], uint64(newEntry.DataOffset))
-
-		// Update the entry's suffix offset to be relative to the new sub-page data
-		newEntries[i].SuffixOffset = suffixPosInNewData
-
-		// Append to sub-page data
-		newSubPageData = append(newSubPageData, entryBuffer...)
-	}
-
-	// Update the leaf page with the new sub-page data
-	_, err = db.updateLeafPage(leafPage, int(subPageIdx), newSubPageData, newEntries)
-	if err != nil {
-		return fmt.Errorf("failed to update sub-page after deletion: %w", err)
-	}
+	// Add the leaf page to the free list if it has reasonable free space
+	db.addToFreeLeafPagesList(leafPage, 0)
 
 	return nil
 }
 
 // updateEntryInLeafSubPage updates the data offset of an entry in a leaf sub-page
-func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryIdx int, dataOffset int64) error {
+func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryOffset int, entrySize int, dataOffset int64) error {
 	// Get a writable version of the page
 	leafPage, err := db.getWritablePage(subPage.Page)
 	if err != nil {
@@ -4092,63 +4021,14 @@ func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryIdx int, dataO
 	// Update the subPage reference to point to the writable page
 	subPage.Page = leafPage
 
-	// Get the sub-page info
-	subPageIdx := subPage.SubPageIdx
-	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
-		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
-	}
-	subPageInfo := leafPage.SubPages[subPageIdx]
+	// Calculate the position where the data offset is stored (last 8 bytes of the entry)
+	dataOffsetPosition := entryOffset + entrySize - 8
 
-	// Validate the entry index
-	if entryIdx < 0 || entryIdx >= len(subPageInfo.Entries) {
-		return fmt.Errorf("entry index %d out of bounds (0-%d)", entryIdx, len(subPageInfo.Entries)-1)
-	}
+	// Update the data offset in-place
+	binary.LittleEndian.PutUint64(leafPage.data[dataOffsetPosition:], uint64(dataOffset))
 
-	// Create a new entries list with the updated entry
-	newEntries := make([]LeafEntry, len(subPageInfo.Entries))
-	copy(newEntries, subPageInfo.Entries)
-	newEntries[entryIdx].DataOffset = dataOffset
-
-	// Rebuild the sub-page data with the updated entry
-	subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
-	newSubPageData := make([]byte, 0)
-	for i, newEntry := range newEntries {
-		// Get the suffix from the original entry
-		origSuffixOffset := subPageDataStart + newEntry.SuffixOffset
-		origSuffix := leafPage.data[origSuffixOffset:origSuffixOffset+newEntry.SuffixLen]
-
-		// Calculate size needed for this entry
-		suffixLenSize := varint.Size(uint64(len(origSuffix)))
-		entrySize := suffixLenSize + len(origSuffix) + 8
-
-		// Create buffer for this entry
-		entryBuffer := make([]byte, entrySize)
-		pos := 0
-
-		// Write suffix length
-		suffixLenWritten := varint.Write(entryBuffer[pos:], uint64(len(origSuffix)))
-		pos += suffixLenWritten
-
-		// Write suffix
-		suffixPosInNewData := len(newSubPageData) + pos
-		copy(entryBuffer[pos:], origSuffix)
-		pos += len(origSuffix)
-
-		// Write data offset (use the updated offset for the modified entry)
-		binary.LittleEndian.PutUint64(entryBuffer[pos:], uint64(newEntry.DataOffset))
-
-		// Update the entry's suffix offset to be relative to the new sub-page data
-		newEntries[i].SuffixOffset = suffixPosInNewData
-
-		// Append to sub-page data
-		newSubPageData = append(newSubPageData, entryBuffer...)
-	}
-
-	// Update the leaf page with the new sub-page data
-	_, err = db.updateLeafPage(leafPage, int(subPageIdx), newSubPageData, newEntries)
-	if err != nil {
-		return fmt.Errorf("failed to update sub-page after offset update: %w", err)
-	}
+	// Mark the page as dirty
+	db.markPageDirty(leafPage)
 
 	return nil
 }
@@ -4158,9 +4038,8 @@ func (db *DB) updateEntryInLeafSubPage(subPage *LeafSubPage, entryIdx int, dataO
 // - leafPage: the leaf page to update
 // - removeSubPageIdx: index of sub-page to remove (use -1 if no removal needed)
 // - newSubPageData: data for the new sub-page to add (nil if no addition needed)
-// - newSubPageEntries: entries for the new sub-page (nil if no addition needed)
 // Returns the index of the newly added sub-page (or -1 if no sub-page was added)
-func (db *DB) updateLeafPage(leafPage *LeafPage, removeSubPageIdx int, newSubPageData []byte, newSubPageEntries []LeafEntry) (int, error) {
+func (db *DB) updateLeafPage(leafPage *LeafPage, removeSubPageIdx int, newSubPageData []byte) (int, error) {
 	// Get a writable version of the page
 	leafPage, err := db.getWritablePage(leafPage)
 	if err != nil {
@@ -4198,7 +4077,7 @@ func (db *DB) updateLeafPage(leafPage *LeafPage, removeSubPageIdx int, newSubPag
 	}
 
 	// Add new sub-page if provided
-	if newSubPageData != nil && newSubPageEntries != nil {
+	if newSubPageData != nil {
 		subPageSize := uint16(len(newSubPageData))
 		totalSubPageSize := LeafSubPageHeaderSize + int(subPageSize)
 
@@ -4241,7 +4120,6 @@ func (db *DB) updateLeafPage(leafPage *LeafPage, removeSubPageIdx int, newSubPag
 		leafPage.SubPages[newSubPageIdx] = &LeafSubPageInfo{
 			Offset:  uint16(pos),
 			Size:    subPageSize,
-			Entries: newSubPageEntries,
 		}
 
 		// Update content size
@@ -4445,11 +4323,10 @@ func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix [
 
 	debugPrint("Converting leaf sub-page %d on page %d to radix sub-page\n", subPageIdx, leafPage.pageNumber)
 
-	// Get the sub-page info
+	// Check if the sub-page exists
 	if int(subPageIdx) >= len(leafPage.SubPages) || leafPage.SubPages[subPageIdx] == nil {
 		return fmt.Errorf("sub-page with index %d not found", subPageIdx)
 	}
-	subPageInfo := leafPage.SubPages[subPageIdx]
 
 	// Allocate a new radix sub-page
 	newRadixSubPage, err := db.allocateRadixSubPage()
@@ -4463,26 +4340,22 @@ func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix [
 		dataOffset int64
 	}
 
-	for _, entry := range subPageInfo.Entries {
-		// Get the suffix from the entry (using sub-page base + relative offset)
-		subPageDataStart := int(subPageInfo.Offset) + 3 // Skip 3-byte header
-		suffixOffset := subPageDataStart + entry.SuffixOffset
-		suffix := make([]byte, entry.SuffixLen)
-		copy(suffix, leafPage.data[suffixOffset:suffixOffset+entry.SuffixLen])
+	err = db.iterateLeafSubPageEntries(leafPage, subPageIdx, func(entryOffset int, entrySize int, suffixOffset int, suffixLen int, dataOffset int64) bool {
+		// Get the suffix from the entry (suffixOffset is already relative to leaf page data)
+		suffix := make([]byte, suffixLen)
+		copy(suffix, leafPage.data[suffixOffset:suffixOffset+suffixLen])
 
 		existingEntries = append(existingEntries, struct {
 			suffix []byte
 			dataOffset int64
 		}{
 			suffix: suffix,
-			dataOffset: entry.DataOffset,
+			dataOffset: dataOffset,
 		})
-	}
-
-	// Remove the old sub-page from the leaf page
-	_, err = db.updateLeafPage(leafPage, int(subPageIdx), nil, nil)
+		return true // Continue iteration
+	})
 	if err != nil {
-		return fmt.Errorf("failed to remove sub-page from original leaf page: %w", err)
+		return fmt.Errorf("failed to iterate existing entries: %w", err)
 	}
 
 	// Process all existing entries and add them to the newly created radix sub-page
@@ -4497,6 +4370,12 @@ func (db *DB) convertLeafSubPageToRadixSubPage(subPage *LeafSubPage, newSuffix [
 	// Process the new entry separately
 	if err := db.setContentOnIndex(newRadixSubPage, newSuffix, 0, newDataOffset); err != nil {
 		return fmt.Errorf("failed to add new entry to radix sub-page: %w", err)
+	}
+
+	// Remove the old sub-page from the leaf page
+	_, err = db.updateLeafPage(leafPage, int(subPageIdx), nil)
+	if err != nil {
+		return fmt.Errorf("failed to remove sub-page from original leaf page: %w", err)
 	}
 
 	// Update the sub-page to point to the new radix sub-page
@@ -4548,23 +4427,11 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	suffixLenWritten := varint.Write(newSubPageData[pos:], uint64(len(newSuffix)))
 	pos += suffixLenWritten
 
-	suffixPos := pos
 	copy(newSubPageData[pos:], newSuffix)
 	pos += len(newSuffix)
 
 	binary.LittleEndian.PutUint64(newSubPageData[pos:], uint64(newDataOffset))
 	pos += 8
-
-	// Create the new entries list
-	newEntries := make([]LeafEntry, len(subPageInfo.Entries)+1)
-	copy(newEntries, subPageInfo.Entries)
-
-	// Add the new entry
-	newEntries[len(subPageInfo.Entries)] = LeafEntry{
-		SuffixOffset: suffixPos, // Relative to sub-page data start
-		SuffixLen:    len(newSuffix),
-		DataOffset:   newDataOffset,
-	}
 
 	// Allocate a leaf page with enough space for this sub-page
 	totalSubPageSize := LeafSubPageHeaderSize + newSubPageSize
@@ -4593,7 +4460,6 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	newLeafPage.SubPages[newSubPageID] = &LeafSubPageInfo{
 		Offset:  uint16(offset),
 		Size:    uint16(newSubPageSize),
-		Entries: newEntries,
 	}
 
 	// Mark the new page as dirty
@@ -4603,7 +4469,7 @@ func (db *DB) moveSubPageToNewLeafPage(subPage *LeafSubPage, newSuffix []byte, n
 	//db.addToFreeLeafPagesList(newLeafPage, 0)
 
 	// Remove the sub-page from the original leaf page
-	_, err = db.updateLeafPage(leafPage, int(subPageIdx), nil, nil)
+	_, err = db.updateLeafPage(leafPage, int(subPageIdx), nil)
 	if err != nil {
 		return fmt.Errorf("failed to remove sub-page from original leaf page: %w", err)
 	}
