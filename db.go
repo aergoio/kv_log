@@ -188,7 +188,7 @@ type Page struct {
 	ContentSize  int                // Total size of content on this page
 	SubPages     []LeafSubPageInfo  // Information about sub-pages in this leaf page (allocated only for leaf pages)
 	// Fields for HeaderPage (only used when pageNumber == 0)
-	freeLeafSpaceArray []FreeSpaceEntry // Array of leaf pages with free space, sorted by free space (descending)
+	freeLeafSpaceArray []FreeSpaceEntry // Array of leaf pages with free space (allocated only for header page)
 }
 
 // RadixPage is an alias for Page
@@ -4612,6 +4612,13 @@ func (db *DB) recoverUnindexedContent() error {
 
 func (db *DB) reindexContent(lastIndexedOffset int64) error {
 
+	// If the last indexed offset is before the header page, set it to the header page
+	if lastIndexedOffset < int64(PageSize) {
+		lastIndexedOffset = int64(PageSize)
+	}
+
+	debugPrint("Reindexing content from offset %d to %d\n", lastIndexedOffset, db.mainFileSize)
+
 	// Get the root radix sub-page
 	rootSubPage, err := db.getRootRadixSubPage()
 	if err != nil {
@@ -4632,6 +4639,7 @@ func (db *DB) reindexContent(lastIndexedOffset int64) error {
 		}
 
 		if content.data[0] == ContentTypeData {
+			debugPrint("Reindexing data at offset %d - key: %s, value: %s\n", currentOffset, content.key, content.value)
 			// Set the key-value pair on the index
 			err := db.setKvOnIndex(rootSubPage, content.key, content.value, currentOffset)
 			if err != nil {
