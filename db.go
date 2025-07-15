@@ -120,6 +120,7 @@ type DB struct {
 	indexFileSize  int64 // Track index file size to avoid frequent stat calls
 	prevFileSize   int64 // Track main file size before the current transaction started
 	flushFileSize  int64 // Track main file size for flush operations
+	cloningFileSize int64 // Track main file size when a cloning mark was created
 	fileLocked     bool  // Track if the files are locked
 	lockType       int   // Type of lock currently held
 	readOnly       bool  // Track if the database is opened in read-only mode
@@ -140,6 +141,8 @@ type DB struct {
 	flushSequence  int64  // Current flush up to this transaction sequence number
 	maxReadSequence int64 // Maximum transaction sequence number that can be read
 	pruningSequence int64 // Last transaction sequence number when cache pruning was performed
+	cloningSequence int64 // Cloning mark sequence number
+	fastRollback   bool   // Whether to use fast rollback (clone every transaction) or fast write (clone every 1000 transactions)
 	txnChecksum    uint32 // Running CRC32 checksum for current transaction
 	accessCounter  uint64 // Counter for page access times
 	dirtyPageCount int    // Count of dirty pages in cache
@@ -270,6 +273,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	cacheSizeThreshold := calculateDefaultCacheSize()  // Calculate based on system memory
 	dirtyPageThreshold := cacheSizeThreshold / 2       // Default to 50% of cache size
 	checkpointThreshold := int64(1024 * 1024)          // Default to 1MB
+	fastRollback := false                              // Default to fast writes, slower rollback
 
 	// Parse options
 	var opts Options
@@ -315,6 +319,11 @@ func Open(path string, options ...Options) (*DB, error) {
 				checkpointThreshold = cpt
 			} else if cpt, ok := val.(int); ok && cpt > 0 {
 				checkpointThreshold = int64(cpt)
+			}
+		}
+		if val, ok := opts["FastRollback"]; ok {
+			if fr, ok := val.(bool); ok {
+				fastRollback = fr
 			}
 		}
 	}
@@ -378,6 +387,7 @@ func Open(path string, options ...Options) (*DB, error) {
 		dirtyPageThreshold: dirtyPageThreshold,
 		cacheSizeThreshold: cacheSizeThreshold,
 		checkpointThreshold: checkpointThreshold,
+		fastRollback:       fastRollback,
 		workerChannel:      make(chan string, 10), // Buffer size of 10 for commands
 		pendingCommands:    make(map[string]bool), // Initialize the pending commands map
 	}
@@ -533,6 +543,14 @@ func (db *DB) SetOption(name string, value interface{}) error {
 			return fmt.Errorf("CheckpointThreshold must be greater than 0")
 		}
 		return fmt.Errorf("CheckpointThreshold value must be an integer")
+	/*
+	case "FastRollback":
+		if fr, ok := value.(bool); ok {
+			db.fastRollback = fr
+			return nil
+		}
+		return fmt.Errorf("FastRollback value must be a boolean")
+		*/
 	default:
 		return fmt.Errorf("unknown or immutable option: %s", name)
 	}
@@ -1216,7 +1234,13 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	if db.calledByTransaction || !db.inTransaction {
 		maxReadSequence = db.txnSequence
 	} else {
-		maxReadSequence = db.txnSequence - 1
+		// When FastRollback=false, db.Get() should see transaction changes
+		// When FastRollback=true, db.Get() should not see transaction changes
+		if db.fastRollback {
+			maxReadSequence = db.txnSequence - 1
+		} else {
+			maxReadSequence = db.txnSequence
+		}
 	}
 	db.seqMutex.Unlock()
 
@@ -2539,6 +2563,21 @@ func (db *DB) beginTransaction() {
 	// Increment the transaction sequence number (to track the pages used in the transaction)
 	db.txnSequence++
 
+	// For fast rollback and slower writes, clone pages at every transaction
+	if db.fastRollback {
+		db.cloningSequence = db.txnSequence - 1
+	// For fast writes and slow rollback, clone pages at every 1000 transactions
+	} else {
+		// If the page is marked to be flushed, we cannot modify its data (force cloning)
+		if db.cloningSequence < db.flushSequence {
+			db.cloningSequence = db.flushSequence
+		}
+		if db.txnSequence > db.cloningSequence + 1000 {
+			db.cloningSequence = db.txnSequence - 1
+			db.cloningFileSize = db.mainFileSize
+		}
+	}
+
 	// Store the current main file size to enable rollback (to truncate the main file)
 	db.prevFileSize = db.mainFileSize
 
@@ -2622,8 +2661,24 @@ func (db *DB) rollbackTransaction() {
 		db.mainFileSize = db.prevFileSize
 	}
 
-	// Discard pages from this transaction (they should be reloaded from the index file)
-	db.discardNewerPages(db.txnSequence)
+	if db.fastRollback {
+		// Fast rollback: discard pages from this transaction only
+		db.discardNewerPages(db.txnSequence)
+	} else {
+		// Slow rollback: discard pages newer than the cloning mark and reindex
+		db.discardNewerPages(db.cloningSequence + 1)
+
+		// Get the last indexed offset
+		lastIndexedOffset := db.cloningFileSize
+
+		// Reindex the new content from the main file (incremental reindexing)
+		if lastIndexedOffset < db.mainFileSize {
+			err := db.reindexContent(lastIndexedOffset)
+			if err != nil {
+				debugPrint("Failed to reindex content during rollback: %v\n", err)
+			}
+		}
+	}
 
 	// Release transaction lock if it was acquired for this transaction
 	if db.lockAcquiredForTransaction {
@@ -2636,14 +2691,6 @@ func (db *DB) rollbackTransaction() {
 	db.seqMutex.Lock()
 	db.inTransaction = false
 	db.seqMutex.Unlock()
-
-	// It could use an optimistic approach:
-	// - do not clone pages for new transactions, only if there is a flush happening
-	// on rollback:
-	// - truncate the main db file to the stored size before the transaction started
-	// - discard all dirty pages
-	// - rebuild the index pages from the main db file (incremental reindexing)
-
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -2723,12 +2770,8 @@ func (db *DB) iteratePages(callback func(*cacheBucket, uint32, *Page)) {
 func (db *DB) getWritablePage(page *Page) (*Page, error) {
 	// We cannot write to a page that is part of the WAL
 	needsClone := page.isWAL
-	// If the page is marked to be flushed, we cannot modify its data
-	if db.flushSequence != 0 && page.txnSequence <= db.flushSequence {
-		needsClone = true
-	}
-	// If the page is not part of the current transaction, we need to clone it
-	if page.txnSequence != db.txnSequence {
+	// If the page is below the cloning mark, we need to clone it
+	if page.txnSequence <= db.cloningSequence {
 		needsClone = true
 	}
 
@@ -2804,25 +2847,38 @@ func (db *DB) checkPageCache(isWrite bool) {
 
 	// If the amount of dirty pages is above the threshold, flush them to disk
 	if isWrite && db.dirtyPageCount >= db.dirtyPageThreshold {
-		// If already flushed up to the current transaction, skip
-		if db.inTransaction && db.flushSequence == db.txnSequence - 1 {
+		shouldFlush := true
+
+		db.seqMutex.Lock()
+		if db.fastRollback {
+			// If already flushed up to the previous transaction, skip
+			if db.inTransaction && db.flushSequence == db.txnSequence - 1 {
+				shouldFlush = false
+			}
+		} else {
+			// If already flushed up to the cloning mark, skip
+			if db.inTransaction && db.flushSequence == db.cloningSequence {
+				shouldFlush = false
+			}
+		}
+		db.seqMutex.Unlock()
+
+		if shouldFlush {
+			// Check which thread should flush the pages
+			if db.commitMode == CallerThread {
+				// Write the pages to the WAL file
+				db.flushIndexToDisk()
+			} else {
+				// Signal the worker thread to flush the pages, if not already signaled
+				db.seqMutex.Lock()
+				if !db.pendingCommands["flush"] {
+					db.pendingCommands["flush"] = true
+					db.workerChannel <- "flush"
+				}
+				db.seqMutex.Unlock()
+			}
 			return
 		}
-
-		// Check which thread should flush the pages
-		if db.commitMode == CallerThread {
-			// Write the pages to the WAL file
-			db.flushIndexToDisk()
-		} else {
-			// Signal the worker thread to flush the pages, if not already signaled
-			db.seqMutex.Lock()
-			if !db.pendingCommands["flush"] {
-				db.pendingCommands["flush"] = true
-				db.workerChannel <- "flush"
-			}
-			db.seqMutex.Unlock()
-		}
-		return
 	}
 
 	// If the size of the page cache is above the threshold, remove old pages
@@ -2862,6 +2918,7 @@ func (db *DB) checkPageCache(isWrite bool) {
 // discardNewerPages removes pages from the current transaction from the cache
 // This function is called by the main thread when a transaction is rolled back
 func (db *DB) discardNewerPages(currentSeq int64) {
+	debugPrint("Discarding pages from transaction %d and above\n", currentSeq)
 	// Iterate through all pages in the cache
 	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
 		// Skip pages from the current transaction
@@ -2869,7 +2926,8 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 		var newHead *Page = page
 		var removedCount int64 = 0
 
-		for newHead != nil && newHead.txnSequence == currentSeq {
+		for newHead != nil && newHead.txnSequence >= currentSeq {
+			debugPrint("Discarding page %d from transaction %d\n", newHead.pageNumber, newHead.txnSequence)
 			// Only decrement the dirty page counter if the current page is dirty
 			// and the next one isn't (to avoid incorrect counter decrements)
 			if newHead.dirty && (newHead.next == nil || !newHead.next.dirty) {
@@ -2882,8 +2940,10 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 
 		// Update the cache with the new head (or delete if no valid entries remain)
 		if newHead != nil {
+			debugPrint("Keeping page %d from transaction %d\n", newHead.pageNumber, newHead.txnSequence)
 			bucket.pages[pageNumber] = newHead
 		} else {
+			debugPrint("No pages left for page %d\n", pageNumber)
 			delete(bucket.pages, pageNumber)
 		}
 		// Decrement the total pages counter by the number of versions removed
@@ -2897,15 +2957,21 @@ func (db *DB) discardNewerPages(currentSeq int64) {
 // keepWAL: if true, keep the first WAL page, otherwise clear the isWAL flag
 // returns the number of pages kept
 func (db *DB) discardOldPageVersions(keepWAL bool) int {
+
 	db.seqMutex.Lock()
-	var currentTxnSeq int64
-	// If the main thread is in a transaction
-	if db.inTransaction {
-		// Keep pages from the previous transaction (because the current one can be rolled back)
-		currentTxnSeq = db.txnSequence - 1
+	var limitSequence int64
+	if db.fastRollback {
+		// If the main thread is in a transaction
+		if db.inTransaction {
+			// Keep pages from the previous transaction (because the current one can be rolled back)
+			limitSequence = db.txnSequence - 1
+		} else {
+			// Otherwise, keep pages from the last committed transaction
+			limitSequence = db.txnSequence
+		}
 	} else {
-		// Otherwise, keep pages from the last committed transaction
-		currentTxnSeq = db.txnSequence
+		// Keep pages below the cloning mark (because all pages after this mark can be rolled back)
+		limitSequence = db.cloningSequence + 1
 	}
 	db.seqMutex.Unlock()
 
@@ -2920,8 +2986,8 @@ func (db *DB) discardOldPageVersions(keepWAL bool) int {
 		for current != nil {
 			totalPages++
 
-			// Skip pages from current transaction or higher - they should not be touched
-			if current.txnSequence >= currentTxnSeq {
+			// Skip pages above the limit sequence - they should not be touched
+			if current.txnSequence >= limitSequence {
 				// If we are not keeping WAL pages, clear the isWAL flag
 				if !keepWAL && current.isWAL {
 					current.isWAL = false
@@ -3011,22 +3077,27 @@ func (db *DB) removeOldPagesFromCache() {
 	var candidates []pageInfo
 
 	db.seqMutex.Lock()
-	var currentTxnSeq int64
-	// If the main thread is in a transaction
-	if db.inTransaction {
-		// Keep pages from the previous transaction (because the current one can be rolled back)
-		currentTxnSeq = db.txnSequence - 1
+	var limitSequence int64
+	if db.fastRollback {
+		// If the main thread is in a transaction
+		if db.inTransaction {
+			// Keep pages from the previous transaction (because the current one can be rolled back)
+			limitSequence = db.txnSequence - 1
+		} else {
+			// Otherwise, keep pages from the last committed transaction
+			limitSequence = db.txnSequence
+		}
 	} else {
-		// Otherwise, keep pages from the last committed transaction
-		currentTxnSeq = db.txnSequence
+		// Keep pages below the cloning mark (because all pages after this mark can be rolled back)
+		limitSequence = db.cloningSequence + 1
 	}
 	lastAccessTime := db.accessCounter
 	db.seqMutex.Unlock()
 
 	// Collect removable pages from each bucket
 	db.iteratePages(func(bucket *cacheBucket, pageNumber uint32, page *Page) {
-		// Skip dirty pages, WAL pages, and pages from the current transaction
-		if page.dirty || page.isWAL || page.txnSequence >= currentTxnSeq {
+		// Skip dirty pages, WAL pages, and pages above the limit sequence
+		if page.dirty || page.isWAL || page.txnSequence >= limitSequence {
 			return
 		}
 
@@ -3058,7 +3129,7 @@ func (db *DB) removeOldPagesFromCache() {
 		// Double-check the page still exists and is still removable
 		if page, exists := bucket.pages[pageNumber]; exists {
 			// Skip if the page is dirty, WAL, or from the current transaction
-			if page.dirty || page.isWAL || page.txnSequence >= currentTxnSeq {
+			if page.dirty || page.isWAL || page.txnSequence >= limitSequence {
 				bucket.mutex.Unlock()
 				continue
 			}
@@ -3235,16 +3306,29 @@ func (db *DB) flushIndexToDisk() error {
 		return fmt.Errorf("cannot flush index to disk: database opened in read-only mode")
 	}
 
-	db.seqMutex.Lock()
 	// Set flush sequence number limit and determine the appropriate main file size for this flush
+	db.seqMutex.Lock()
+	// If a transaction is in progress
 	if db.inTransaction {
-		db.flushSequence = db.txnSequence - 1
-		// For worker thread flushes during transactions, use the file size from before the current transaction
-		// This ensures we only index content that has been committed
-		db.flushFileSize = db.prevFileSize
+		// When fast rollback is enabled
+		if db.fastRollback {
+			// Flush pages from the previous transaction
+			db.flushSequence = db.txnSequence - 1
+			// For worker thread flushes during transactions, use the file size from before the current transaction
+			// This ensures we only index content that has been committed
+			db.flushFileSize = db.prevFileSize
+		// When fast rollback is disabled
+		} else {
+			// Flush at the cloning sequence number
+			db.flushSequence = db.cloningSequence
+			// Use the file size from when the cloning mark was set
+			db.flushFileSize = db.cloningFileSize
+		}
+	// When no transaction is in progress
 	} else {
+		// Flush at the current transaction sequence number
 		db.flushSequence = db.txnSequence
-		// When not in transaction, use current main file size
+		// Use the current main file size
 		db.flushFileSize = db.mainFileSize
 	}
 	db.seqMutex.Unlock()
@@ -3274,41 +3358,6 @@ func (db *DB) flushIndexToDisk() error {
 
 	return nil
 }
-
-/*
-// flushAllIndexPages writes all cached pages to disk
-func (db *DB) flushAllIndexPages() error {
-	db.cacheMutex.RLock()
-	defer db.cacheMutex.RUnlock()
-
-	// Get all page numbers and sort them
-	pageNumbers := make([]uint32, 0, len(db.pageCache))
-	for pageNumber := range db.pageCache {
-		pageNumbers = append(pageNumbers, pageNumber)
-	}
-
-	// Sort page numbers in ascending order
-	sort.Slice(pageNumbers, func(i, j int) bool {
-		return pageNumbers[i] < pageNumbers[j]
-	})
-
-	// Process pages in order
-	for _, pageNumber := range pageNumbers {
-		page := db.pageCache[pageNumber]
-		if page.pageType == ContentTypeRadix {
-			if err := db.writeRadixPage(page); err != nil {
-				return err
-			}
-		} else if page.pageType == ContentTypeLeaf {
-			if err := db.writeLeafPage(page); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-*/
 
 // flushDirtyIndexPages writes all dirty pages to disk
 // Returns the number of dirty pages that were written to disk
@@ -3569,6 +3618,7 @@ func (db *DB) allocateLeafPageWithSpace(spaceNeeded int) (*LeafSubPage, error) {
 		// Get the page
 		leafPage, err := db.getLeafPage(pageNumber)
 		if err != nil {
+			debugPrint("Failed to get leaf page %d: %v\n", pageNumber, err)
 			// Page not found, remove from array and try again
 			db.removeFromFreeSpaceArray(position, pageNumber)
 			return db.allocateLeafPageWithSpace(spaceNeeded)

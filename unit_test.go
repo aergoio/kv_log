@@ -270,7 +270,9 @@ func ExampleCalculateDefaultCacheSize() {
 func TestDiscardOldPageVersions(t *testing.T) {
 	// Setup a test DB with sharded cache
 	db := &DB{
-		txnSequence: 100, // Current transaction sequence
+		txnSequence:     100, // Current transaction sequence
+		cloningSequence: 98,  // Cloning sequence for non-fast rollback mode
+		fastRollback:    true,
 	}
 
 	// Initialize the page cache buckets
@@ -1597,6 +1599,243 @@ func TestDiscardOldPageVersions(t *testing.T) {
 			if totalPages < len(tc.initialChain) {
 				t.Errorf("Case %d: Expected totalPages to be at least %d, got %d",
 					i+1, len(tc.initialChain), totalPages)
+			}
+		})
+	}
+}
+
+// TestDiscardOldPageVersionsSlowRollback tests the discardOldPageVersions function
+// with fastRollback=false (slow rollback mode using cloningSequence)
+func TestDiscardOldPageVersionsSlowRollback(t *testing.T) {
+	// Setup a test DB with slow rollback mode
+	db := &DB{
+		txnSequence:     100, // Current transaction sequence
+		cloningSequence: 95,  // Cloning sequence set to 95
+		fastRollback:    false, // Use slow rollback mode
+	}
+
+	// Initialize the page cache buckets
+	for i := range db.pageCache {
+		db.pageCache[i].pages = make(map[uint32]*Page)
+	}
+
+	// Helper function to create a page with specific properties
+	createPage := func(pageNum uint32, txnSeq int64, dirty bool, isWAL bool) *Page {
+		return &Page{
+			pageNumber:  pageNum,
+			pageType:    ContentTypeRadix,
+			txnSequence: txnSeq,
+			dirty:       dirty,
+			isWAL:       isWAL,
+		}
+	}
+
+	// Helper function to create a linked list of pages
+	createPageChain := func(pageNum uint32, specs []struct {
+		txnSeq int64
+		dirty  bool
+		isWAL  bool
+	}) {
+		var firstPage *Page
+		var prevPage *Page
+
+		for i, spec := range specs {
+			page := createPage(pageNum, spec.txnSeq, spec.dirty, spec.isWAL)
+
+			if i == 0 {
+				firstPage = page
+				bucketIdx := pageNum & 1023
+				db.pageCache[bucketIdx].pages[pageNum] = firstPage
+			} else {
+				prevPage.next = page
+			}
+
+			prevPage = page
+		}
+	}
+
+	// Helper function to verify page chain state after discardOldPageVersions
+	verifyPageChain := func(t *testing.T, testCase int, pageNum uint32, expectedChain []struct {
+		txnSeq int64
+		dirty  bool
+		isWAL  bool
+	}) {
+		bucketIdx := pageNum & 1023
+		page := db.pageCache[bucketIdx].pages[pageNum]
+
+		if page == nil && len(expectedChain) > 0 {
+			t.Errorf("Case %d: Expected page %d to exist but it was nil", testCase, pageNum)
+			return
+		}
+
+		if page == nil && len(expectedChain) == 0 {
+			return // Correctly nil
+		}
+
+		for i, expected := range expectedChain {
+			if page == nil {
+				t.Errorf("Case %d: Expected %d pages in chain for page %d, but found only %d",
+					testCase, len(expectedChain), pageNum, i)
+				return
+			}
+
+			if page.txnSequence != expected.txnSeq {
+				t.Errorf("Case %d: Page %d (position %d): Expected txnSequence=%d, got %d",
+					testCase, pageNum, i, expected.txnSeq, page.txnSequence)
+			}
+
+			if page.dirty != expected.dirty {
+				t.Errorf("Case %d: Page %d (position %d): Expected dirty=%v, got %v",
+					testCase, pageNum, i, expected.dirty, page.dirty)
+			}
+
+			if page.isWAL != expected.isWAL {
+				t.Errorf("Case %d: Page %d (position %d): Expected isWAL=%v, got %v",
+					testCase, pageNum, i, expected.isWAL, page.isWAL)
+			}
+
+			page = page.next
+		}
+
+		if page != nil {
+			t.Errorf("Case %d: Page %d chain is longer than expected", testCase, pageNum)
+		}
+	}
+
+	// Test cases specific to slow rollback mode
+	// With cloningSequence=95, limitSequence will be 96
+	// Pages with txnSequence >= 96 will be kept as-is
+	// Pages with txnSequence < 96 will be processed for removal
+	testCases := []struct {
+		name           string
+		pageNum        uint32
+		inTransaction  bool
+		keepWAL        bool
+		initialChain   []struct {
+			txnSeq int64
+			dirty  bool
+			isWAL  bool
+		}
+		expectedChain []struct {
+			txnSeq int64
+			dirty  bool
+			isWAL  bool
+		}
+	}{
+		{
+			name:          "Pages above cloning sequence kept",
+			pageNum:       1,
+			inTransaction: false,
+			keepWAL:       true,
+			initialChain: []struct {
+				txnSeq int64
+				dirty  bool
+				isWAL  bool
+			}{
+				{99, true, false},  // Above limitSequence (96) - should be kept
+				{97, false, false}, // Above limitSequence (96) - should be kept
+				{94, true, false},  // Below limitSequence (96) - should be processed
+			},
+			expectedChain: []struct {
+				txnSeq int64
+				dirty  bool
+				isWAL  bool
+			}{
+				{99, true, false},  // Kept as-is
+				{97, false, false}, // Kept as-is
+				{94, true, false},  // Kept as first non-WAL page below limit
+			},
+		},
+		{
+			name:          "WAL pages with keepWAL=true",
+			pageNum:       2,
+			inTransaction: false,
+			keepWAL:       true,
+			initialChain: []struct {
+				txnSeq int64
+				dirty  bool
+				isWAL  bool
+			}{
+				{98, false, false}, // Above limitSequence - kept as-is
+				{94, false, true},  // Below limitSequence, WAL - should be kept
+				{93, true, false},  // Below limitSequence, non-WAL - should be discarded
+			},
+			expectedChain: []struct {
+				txnSeq int64
+				dirty  bool
+				isWAL  bool
+			}{
+				{98, false, false}, // Kept as-is
+				{94, false, true},  // Kept as first WAL page below limit
+			},
+		},
+		{
+			name:          "WAL pages with keepWAL=false",
+			pageNum:       3,
+			inTransaction: false,
+			keepWAL:       false,
+			initialChain: []struct {
+				txnSeq int64
+				dirty  bool
+				isWAL  bool
+			}{
+				{98, false, false}, // Above limitSequence - kept as-is
+				{94, false, true},  // Below limitSequence, WAL - isWAL cleared, kept as first non-WAL
+				{93, true, false},  // Below limitSequence, non-WAL - should be discarded
+			},
+			expectedChain: []struct {
+				txnSeq int64
+				dirty  bool
+				isWAL  bool
+			}{
+				{98, false, false}, // Kept as-is
+				{94, false, false}, // Kept as first non-WAL page (isWAL cleared)
+			},
+		},
+		{
+			name:          "Only pages below cloning sequence",
+			pageNum:       4,
+			inTransaction: false,
+			keepWAL:       true,
+			initialChain: []struct {
+				txnSeq int64
+				dirty  bool
+				isWAL  bool
+			}{
+				{94, true, false},  // Below limitSequence - first non-WAL, should be kept
+				{93, false, false}, // Below limitSequence - should be discarded
+				{92, true, true},   // Below limitSequence, WAL - should be kept as first WAL page
+			},
+			expectedChain: []struct {
+				txnSeq int64
+				dirty  bool
+				isWAL  bool
+			}{
+				{94, true, false}, // Kept as first non-WAL page below limit
+				{92, true, true},  // Kept as first WAL page below limit
+			},
+		},
+	}
+
+	// Run the test cases
+	for i, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Setup the DB state
+			db.inTransaction = tc.inTransaction
+
+			// Create the page chain for this test
+			createPageChain(tc.pageNum, tc.initialChain)
+
+			// Call the function being tested
+			totalPages := db.discardOldPageVersions(tc.keepWAL)
+
+			// Verify the result
+			verifyPageChain(t, i+1, tc.pageNum, tc.expectedChain)
+
+			// Verify totalPages is reasonable
+			if totalPages < len(tc.expectedChain) {
+				t.Errorf("Case %d: Expected totalPages to be at least %d, got %d",
+					i+1, len(tc.expectedChain), totalPages)
 			}
 		})
 	}
@@ -6358,15 +6597,15 @@ func TestGetWritablePage(t *testing.T) {
 		}
 	})
 
-	t.Run("OldTransactionRequiresClone", func(t *testing.T) {
+	t.Run("OldCloningSequenceRequiresClone", func(t *testing.T) {
 		// Create a new page
 		radixPage, err := db.allocateRadixPage()
 		if err != nil {
 			t.Fatalf("Failed to allocate radix page: %v", err)
 		}
 
-		// Set an old transaction sequence
-		radixPage.txnSequence = db.txnSequence - 1
+		// Set transaction sequence to be at or below the cloning sequence
+		radixPage.txnSequence = db.cloningSequence
 
 		// Get a writable version - should clone the page
 		writablePage, err := db.getWritablePage(radixPage)
@@ -6376,7 +6615,7 @@ func TestGetWritablePage(t *testing.T) {
 
 		// Verify it's a different page instance (cloned)
 		if writablePage == radixPage {
-			t.Error("Expected different page instance for page from older transaction")
+			t.Error("Expected different page instance for page at or below cloning sequence")
 		}
 
 		// Verify the page number remains the same
@@ -6404,28 +6643,25 @@ func TestGetWritablePage(t *testing.T) {
 		}
 	})
 
-	t.Run("FlushSequenceRequiresClone", func(t *testing.T) {
-		// Set a flush sequence
-		db.flushSequence = db.txnSequence - 1
-
+	t.Run("NewerThanCloningSequenceNoClone", func(t *testing.T) {
 		// Create a new page
 		radixPage, err := db.allocateRadixPage()
 		if err != nil {
 			t.Fatalf("Failed to allocate radix page: %v", err)
 		}
 
-		// Set transaction sequence to be <= flush sequence
-		radixPage.txnSequence = db.flushSequence
+		// Set transaction sequence to be newer than the cloning sequence
+		radixPage.txnSequence = db.cloningSequence + 1
 
-		// Get a writable version - should clone the page
+		// Get a writable version - should NOT clone the page
 		writablePage, err := db.getWritablePage(radixPage)
 		if err != nil {
 			t.Fatalf("Failed to get writable page: %v", err)
 		}
 
-		// Verify it's a different page instance (cloned)
-		if writablePage == radixPage {
-			t.Error("Expected different page instance for page marked for flush")
+		// Verify it's the same page instance (no cloning)
+		if writablePage != radixPage {
+			t.Error("Expected same page instance for page newer than cloning sequence")
 		}
 
 		// Verify the page number remains the same
@@ -6437,18 +6673,6 @@ func TestGetWritablePage(t *testing.T) {
 		if writablePage.txnSequence != db.txnSequence {
 			t.Errorf("Transaction sequence not updated: expected %d, got %d", db.txnSequence, writablePage.txnSequence)
 		}
-
-		// Verify both pages are in cache
-		cachedPage, exists := db.getFromCache(radixPage.pageNumber)
-		if !exists {
-			t.Error("Page should exist in cache")
-		}
-		if cachedPage != writablePage {
-			t.Error("Most recent page in cache should be the cloned page")
-		}
-
-		// Reset flush sequence for other tests
-		db.flushSequence = 0
 	})
 }
 
