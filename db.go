@@ -273,7 +273,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	cacheSizeThreshold := calculateDefaultCacheSize()  // Calculate based on system memory
 	dirtyPageThreshold := cacheSizeThreshold / 2       // Default to 50% of cache size
 	checkpointThreshold := int64(1024 * 1024)          // Default to 1MB
-	fastRollback := false                              // Default to fast writes, slower rollback
+	fastRollback := true                               // Default to slower transaction, faster rollback
 
 	// Parse options
 	var opts Options
