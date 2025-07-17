@@ -4975,15 +4975,30 @@ func TestCreatePathForByte(t *testing.T) {
 			t.Error("Expected radix entry to be created for the byte")
 		}
 
-		// Verify the child is a radix sub-page with empty suffix offset set
-		childRadixSubPage, err := db.getRadixSubPage(childPageNumber, childSubPageIdx)
+		// Verify the child is a leaf sub-page
+		childLeafSubPage, err := db.getLeafSubPage(childPageNumber, childSubPageIdx)
 		if err != nil {
-			t.Fatalf("Failed to get child radix sub-page: %v", err)
+			t.Fatalf("Failed to get child leaf sub-page: %v", err)
 		}
 
-		emptySuffixOffset := db.getEmptySuffixOffset(childRadixSubPage)
-		if emptySuffixOffset != dataOffset {
-			t.Errorf("Expected empty suffix offset %d, got %d", dataOffset, emptySuffixOffset)
+		// Verify the leaf sub-page has exactly one entry
+		entryCount := countSubPageEntries(db, childLeafSubPage.Page, childLeafSubPage.SubPageIdx)
+		if entryCount != 1 {
+			t.Fatalf("Expected 1 entry in leaf sub-page, got %d", entryCount)
+		}
+
+		// Verify the entry is correct
+		entryDataOffset, entrySuffix, found := getSubPageEntry(db, childLeafSubPage.Page, childLeafSubPage.SubPageIdx, 0)
+		if !found {
+			t.Errorf("Expected to find entry at index 0")
+		}
+		if entryDataOffset != dataOffset {
+			t.Errorf("Expected data offset %d, got %d", dataOffset, entryDataOffset)
+		}
+
+		// Verify the suffix is empty
+		if len(entrySuffix) != 0 {
+			t.Errorf("Expected empty suffix, got %v", entrySuffix)
 		}
 	})
 

@@ -982,50 +982,23 @@ func (db *DB) createPathForByte(subPage *RadixSubPage, key []byte, keyPos int, d
 	// Get the current byte from the key
 	byteValue := key[keyPos]
 
-	// The remaining part of the key is the suffix
+	// The remaining part of the key is the suffix. It can be empty
 	suffix := key[keyPos+1:]
 
-	// Handle based on whether we have an empty suffix or not
-	if len(suffix) == 0 {
-		// For empty suffix, create a new radix sub-page and set the empty suffix offset
-		childSubPage, err := db.allocateRadixSubPage()
-		if err != nil {
-			return fmt.Errorf("failed to allocate radix sub-page: %w", err)
-		}
+	// Add the entry with the suffix to a new leaf sub-page
+	leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffset)
+	if err != nil {
+		return fmt.Errorf("failed to add leaf entry: %w", err)
+	}
 
-		// Set the empty suffix offset
-		err = db.setEmptySuffixOffset(childSubPage, dataOffset)
-		if err != nil {
-			return fmt.Errorf("failed to set empty suffix offset: %w", err)
-		}
+	// Update the subPage pointer, because the above function
+	// could have cloned the same radix page used on this subPage
+	subPage.Page, _ = db.getRadixPage(subPage.Page.pageNumber)
 
-		// If the above function cloned the page, update the subPage pointer
-		if childSubPage.Page.pageNumber == subPage.Page.pageNumber {
-			subPage.Page = childSubPage.Page
-		}
-
-		// Update the radix entry to point to the new radix page
-		err = db.setRadixEntry(subPage, byteValue, childSubPage.Page.pageNumber, childSubPage.SubPageIdx)
-		if err != nil {
-			return fmt.Errorf("failed to set radix entry for byte %d: %w", byteValue, err)
-		}
-	} else {
-		// Non-empty suffix
-		// Add the entry with the suffix to a new leaf sub-page
-		leafSubPage, err := db.addEntryToNewLeafSubPage(suffix, dataOffset)
-		if err != nil {
-			return fmt.Errorf("failed to add leaf entry: %w", err)
-		}
-
-		// Update the subPage pointer, because the above function
-		// could have cloned the same radix page used on this subPage
-		subPage.Page, _ = db.getRadixPage(subPage.Page.pageNumber)
-
-		// Update the radix entry to point to the new leaf page and sub-page
-		err = db.setRadixEntry(subPage, byteValue, leafSubPage.Page.pageNumber, leafSubPage.SubPageIdx)
-		if err != nil {
-			return fmt.Errorf("failed to set radix entry for byte %d: %w", byteValue, err)
-		}
+	// Update the radix entry to point to the new leaf page and sub-page
+	err = db.setRadixEntry(subPage, byteValue, leafSubPage.Page.pageNumber, leafSubPage.SubPageIdx)
+	if err != nil {
+		return fmt.Errorf("failed to set radix entry for byte %d: %w", byteValue, err)
 	}
 
 	// Don't write to disk, just keep pages in cache
