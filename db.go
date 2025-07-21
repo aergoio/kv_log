@@ -2837,11 +2837,9 @@ func (db *DB) checkPageCache(isWrite bool) {
 		db.seqMutex.Unlock()
 
 		if shouldFlush {
-			// Check which thread should flush the pages
-			if db.commitMode == CallerThread {
-				// Write the pages to the WAL file
-				db.flushIndexToDisk()
-			} else {
+			// When the commit mode is caller thread it flushes on every commit
+			// When it is worker thread, it flushes here
+			if db.commitMode == WorkerThread {
 				// Signal the worker thread to flush the pages, if not already signaled
 				db.seqMutex.Lock()
 				if !db.pendingCommands["flush"] {
@@ -2849,8 +2847,8 @@ func (db *DB) checkPageCache(isWrite bool) {
 					db.workerChannel <- "flush"
 				}
 				db.seqMutex.Unlock()
+				return
 			}
-			return
 		}
 	}
 
