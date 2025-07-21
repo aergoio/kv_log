@@ -563,6 +563,11 @@ func (db *DB) walRollback() error {
 
 // shouldCheckpoint checks if the WAL file should be checkpointed
 func (db *DB) shouldCheckpoint() bool {
+	// If the database is closing, don't checkpoint
+	if db.isClosing {
+		return false
+	}
+
 	// Checkpoint if WAL file exceeds size threshold
 	if db.walInfo.nextWritePosition > db.checkpointThreshold {
 		return true
@@ -575,6 +580,8 @@ func (db *DB) checkpointWAL() error {
 	if db.walInfo == nil {
 		return nil
 	}
+
+	debugPrint("Checkpoint WAL. Last commit sequence: %d\n", db.walInfo.lastCommitSequence)
 
 	// Lock the cache during checkpoint
 	//db.walInfo.cacheMutex.Lock()
