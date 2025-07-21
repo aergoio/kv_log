@@ -244,7 +244,7 @@ func Open(path string, options ...Options) (*DB, error) {
 	writeMode := WorkerThread_WAL // Default to use WAL in a background thread
 	cacheSizeThreshold := calculateDefaultCacheSize()  // Calculate based on system memory
 	dirtyPageThreshold := cacheSizeThreshold / 2       // Default to 50% of cache size
-	checkpointThreshold := int64(1024 * 1024)          // Default to 1MB
+	checkpointThreshold := int64(1024 * 1024 * 100)    // Default to 100MB
 
 	// Parse options
 	var opts Options
@@ -264,7 +264,6 @@ func Open(path string, options ...Options) (*DB, error) {
 				readOnly = ro
 			}
 		}
-		/*
 		if val, ok := opts["WriteMode"]; ok {
 			if jm, ok := val.(string); ok {
 				if jm == CallerThread_WAL_Sync || jm == CallerThread_WAL_NoSync || jm == WorkerThread_WAL || jm == WorkerThread_NoWAL || jm == WorkerThread_NoWAL_NoSync {
@@ -274,7 +273,6 @@ func Open(path string, options ...Options) (*DB, error) {
 				}
 			}
 		}
-		*/
 		if val, ok := opts["CacheSizeThreshold"]; ok {
 			if cst, ok := val.(int); ok && cst > 0 {
 				cacheSizeThreshold = cst
@@ -2304,8 +2302,8 @@ func (db *DB) commitTransaction() {
 	db.inTransaction = false
 	db.seqMutex.Unlock()
 
-	// If using WAL and in caller thread mode, flush to disk
-	if db.useWAL && db.commitMode == CallerThread {
+	// If in caller thread mode, flush to disk
+	if db.commitMode == CallerThread {
 		db.flushIndexToDisk()
 	}
 }
@@ -2951,6 +2949,8 @@ func (db *DB) flushIndexToDisk() error {
 		db.flushFileSize = db.mainFileSize
 	}
 	db.seqMutex.Unlock()
+
+	debugPrint("Flushing index to disk. Flush sequence: %d, Transaction sequence: %d\n", db.flushSequence, db.txnSequence)
 
 	// Flush all dirty pages
 	pagesWritten, err := db.flushDirtyIndexPages()
