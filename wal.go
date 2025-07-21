@@ -298,6 +298,8 @@ func (db *DB) scanWAL() error {
 		return nil
 	}
 
+	debugPrint("Scanning WAL file\n")
+
 	// Read WAL header first
 	headerBuf := make([]byte, WalHeaderSize)
 	if _, err := db.walInfo.file.ReadAt(headerBuf, 0); err != nil {
@@ -356,6 +358,7 @@ func (db *DB) scanWAL() error {
 		frameSalt2 := binary.BigEndian.Uint32(frameHeader[12:16])
 		if frameSalt1 != db.walInfo.salt1 || frameSalt2 != db.walInfo.salt2 {
 			// Salt mismatch, stop scanning
+			debugPrint("Salt mismatch: %d vs %d, %d vs %d\n", frameSalt1, db.walInfo.salt1, frameSalt2, db.walInfo.salt2)
 			break
 		}
 
@@ -373,10 +376,12 @@ func (db *DB) scanWAL() error {
 		if isCommit {
 			// This is a commit record, update lastCommitOffset
 			// Commit records have no page data, just the header
+			debugPrint("Processing commit record for transaction %d\n", commitSequence)
 
 			// Verify checksum
 			if frameChecksum != runningChecksum {
 				// Checksum mismatch, stop scanning
+				debugPrint("Commit checksum mismatch: %d vs %d\n", frameChecksum, runningChecksum)
 				break
 			}
 
@@ -389,6 +394,7 @@ func (db *DB) scanWAL() error {
 			// Clean up old page versions after commit
 			localCache.discardOldPageVersions()
 
+			// Checkpoint the content of this commit
 			if !db.readOnly {
 				// Copy these pages to the index file
 				db.copyPagesToIndexFile(localCache, commitSequence)
@@ -406,6 +412,7 @@ func (db *DB) scanWAL() error {
 		// Ensure we don't read past the end of the file
 		pageSize := int64(PageSize)
 		if offset+WalFrameHeaderSize+pageSize > walFileInfo.Size() {
+			debugPrint("Page frame past end of file: %d vs %d\n", offset+WalFrameHeaderSize+pageSize, walFileInfo.Size())
 			break
 		}
 
@@ -416,6 +423,7 @@ func (db *DB) scanWAL() error {
 		pageData := make([]byte, pageSize)
 		if _, err := db.walInfo.file.ReadAt(pageData, offset+WalFrameHeaderSize); err != nil {
 			// Error reading page data, stop scanning
+			debugPrint("Error reading page data: %v\n", err)
 			break
 		}
 
@@ -425,8 +433,11 @@ func (db *DB) scanWAL() error {
 		// Verify checksum
 		if frameChecksum != runningChecksum {
 			// Checksum mismatch, stop scanning
+			debugPrint("Page checksum mismatch: %d vs %d\n", frameChecksum, runningChecksum)
 			break
 		}
+
+		debugPrint("Loading page %d from WAL to cache\n", pageNumber)
 
 		// For pages from the current transaction, we need to handle them specially
 		// If we already have this page in the cache from the current transaction, the new version should replace it
