@@ -2721,24 +2721,24 @@ func (db *DB) getFromCache(pageNumber uint32) (*Page, bool) {
 // getPageAndCall gets a page from the cache and calls a callback/lambda function with the page while the lock is held
 func (db *DB) getPageAndCall(pageNumber uint32, callback func(*cacheBucket, uint32, *Page)) {
 	bucket := &db.pageCache[pageNumber & 1023]
-	bucket.mutex.RLock()
+	bucket.mutex.Lock()
 	page, exists := bucket.pages[pageNumber]
 	if exists {
 		callback(bucket, pageNumber, page)
 	}
-	bucket.mutex.RUnlock()
+	bucket.mutex.Unlock()
 }
 
 // iteratePages iterates through all pages in the cache and calls a callback/lambda function with the page while the lock is held
 func (db *DB) iteratePages(callback func(*cacheBucket, uint32, *Page)) {
 	for bucketIdx := 0; bucketIdx < 1024; bucketIdx++ {
 		bucket := &db.pageCache[bucketIdx]
-		bucket.mutex.RLock()
+		bucket.mutex.Lock()
 		// Iterate through all pages in this bucket
 		for pageNumber, page := range bucket.pages {
 			callback(bucket, pageNumber, page)
 		}
-		bucket.mutex.RUnlock()
+		bucket.mutex.Unlock()
 	}
 }
 
