@@ -520,9 +520,6 @@ func (db *DB) walCommit() error {
 		}
 	}
 
-	// Clean up old page versions from cache after successful commit
-	db.discardOldPageVersions(true)
-
 	// Update sequence number after successful commit
 	db.walInfo.lastCommitSequence = db.txnSequence
 
@@ -538,6 +535,7 @@ func (db *DB) walCommit() error {
 	return nil
 }
 
+/*
 // walRollback rolls back the current transaction
 func (db *DB) walRollback() error {
 	if db.walInfo == nil {
@@ -561,6 +559,7 @@ func (db *DB) walRollback() error {
 
 	return nil
 }
+*/
 
 // shouldCheckpoint checks if the WAL file should be checkpointed
 func (db *DB) shouldCheckpoint() bool {
