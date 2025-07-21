@@ -155,12 +155,9 @@ type DB struct {
 	originalLockType int // Original lock type before transaction
 	lockAcquiredForTransaction bool // Whether lock was acquired for transaction
 	headerPageForTransaction *Page // Pointer to the header page for transaction
-
-	// Add a condition variable for transaction waiting
-	transactionCond *sync.Cond
-
-	// Timer-based flush management
+	transactionCond *sync.Cond // Condition variable for transaction waiting
 	lastFlushTime time.Time // Time of the last flush operation
+	isClosing bool // Whether the database is closing
 }
 
 // Transaction represents a database transaction
@@ -684,6 +681,11 @@ func (db *DB) Close() error {
 	if db.mainFile == nil && db.indexFile == nil {
 		return nil // Already closed
 	}
+
+	if db.isClosing {
+		return nil // Already closing
+	}
+	db.isClosing = true
 
 	if !db.readOnly {
 		// If there's an open transaction, rollback before closing
