@@ -129,31 +129,35 @@ The database automatically recovers from crashes by:
 - Single connection per database file: Only one process can open the database in write mode at a time
 - Concurrent access model: Supports one writer thread or multiple reader threads simultaneously
 
-## Pros and Cons
-
-- **Pro:** It is extremely fast on reads for a disk-based database engine
-- **Con:** The index uses A LOT of disk space for bigger databases
-
-The index does not always grow linearly but in phases.
-
-Example case: The index file reaches ~25GB when the main db grows above ~4GB
-
-But it is more than 3.5x faster than BadgerDB on reads
-
 ## Performance
 
 | Metric | LevelDB | BadgerDB | ForestDB | KV_Log |
 |--------|---------|----------|----------|--------|
-| Set 2M values | 2m 44.45s | 13.81s | 18.95s | 6.98s |
-| 20K txns (10 items each) | 1m 0.09s | 1.32s | 2.78s | 1.70s |
+| Set 2M values | 2m 44.45s | 13.81s | 18.95s | 8.30s |
+| 20K txns (10 items each) | 1m 0.09s | 1.32s | 2.78s | 1.80s |
 | Space after write | 1052.08 MB | 2002.38 MB | 1715.76 MB | 1501.09 MB |
 | Space after close | 1158.78 MB | 1203.11 MB | 2223.16 MB | 1899.50 MB |
-| Read 2M values (fresh) | 1m 26.87s | 35.14s | 17.21s | 11.20s |
-| Read 2M values (cold) | 1m 34.46s | 38.36s | 16.84s | 10.81s |
+| Read 2M values (fresh) | 1m 26.87s | 35.14s | 17.21s | 12.80s |
+| Read 2M values (cold) | 1m 34.46s | 38.36s | 16.84s | 11.33s |
 
-Benchmark writting 2 million records (key: 33 random bytes, value: 750 random bytes) in a single transaction and then reading them in non-sequential order
+Benchmark writting 2 million records (key: 33 random bytes, value: 750 random bytes) in a single transaction and then reading them in non-sequential order. Also insertion using 20 thousand transactions
 
-Also insertion using 20 thousand transactions
+kv_log is very fast on reads for a disk-based database engine. It is more than 3.3x faster than BadgerDB on reads
+
+There is a faster version of kv_log on the `fastest` branch, with slightly faster performance but using a lot of disk space for bigger databases (the index does not always grow linearly but in phases)
+
+Here is a comparison where `1` is this main branch and `2` is the `fastest` branch:
+
+| Metric | KV_Log (1) | KV_Log (2) | LMDB |
+|--------|------------|------------|------|
+| Set 2M values | 8.30s | 6.98s | 29.32s |
+| 20K txns (10 items each) | 1.80s | 1.70s | 4m 9.68s |
+| Space after write | 1501.09 MB | 1501.09 MB | 2352.35 MB |
+| Space after close | 1899.31 MB | 1899.50 MB | 2586.98 MB |
+| Read 2M values (fresh) | 12.80s | 11.20s | 4.88s |
+| Read 2M values (cold) | 11.33s | 10.81s | 5.58s |
+
+LMDB is the fastest on reads, but way slower on writes and using more disk space
 
 ## License
 
