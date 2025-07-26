@@ -475,7 +475,9 @@ func Open(path string, options ...Options) (*DB, error) {
 	}
 
 	// Ensure txnSequence starts at 1
-	db.txnSequence = 1
+	if db.txnSequence == 0 {
+		db.txnSequence = 1
+	}
 
 	// Start the background worker if not in read-only mode and using worker thread mode
 	if !db.readOnly && db.commitMode == WorkerThread {
