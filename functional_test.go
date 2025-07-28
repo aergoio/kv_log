@@ -12,6 +12,13 @@ import (
 	"path/filepath"
 )
 
+// cleanupTestFiles removes test database files (main, index, and wal)
+func cleanupTestFiles(dbPath string) {
+        os.Remove(dbPath)
+        os.Remove(dbPath + "-index")
+        os.Remove(dbPath + "-wal")
+}
+
 func TestDatabaseBasicOperations(t *testing.T) {
 	// Create a test database
 	dbPath := "test_basic.db"
