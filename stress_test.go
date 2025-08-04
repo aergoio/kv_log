@@ -148,8 +148,8 @@ func testFuzzyRandomOperations(t *testing.T, seed int64) {
 		for {
 			// Pick an operation
 			operation = rand.Intn(8)
-			// Decrease probability of rollback, reopen and delete operations
-			if operation == 5 || operation == 6 || operation == 3 {
+			// Decrease probability of rollback, reopen, delete and get operations
+			if operation == 5 || operation == 6 || operation == 3 || operation == 7 {
 				// Pick another operation
 				newOperation := rand.Intn(8)
 				// only execute if it matches the previous random value
